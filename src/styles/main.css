@@ -1,0 +1,205 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Dark theme (Default): "La table" is slightly lighter than "la discussion" */
+:root[data-theme="dark"],
+:root {
+  --table-bg: #171b24;
+  --discussion-bg: #0b0d13;
+  --surface-elevated: #121621;
+  --hover-bg: rgba(255, 255, 255, 0.055);
+  --active-bg: rgba(129, 140, 248, 0.14);
+  --text-main: #eef2ff;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --accent: #818cf8;
+  --accent-2: #38bdf8;
+  --border-subtle: rgba(148, 163, 184, 0.14);
+
+  --font-response: 'Ubuntu', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-code: 'Ubuntu Sans Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Non-uniform luminous fine border + halo */
+  --halo-bright: rgba(129, 140, 248, 0.52);
+  --halo-mid: rgba(56, 189, 248, 0.30);
+  --halo-soft: rgba(148, 163, 184, 0.11);
+  --halo-glow: rgba(99, 102, 241, 0.22);
+  --panel-shadow: 0 12px 32px -8px rgba(0, 0, 0, 0.65);
+
+  /* Diff highlight scheme: Blue modified, Green added, Red deleted */
+  --diff-mod-bg: rgba(59, 130, 246, 0.22);
+  --diff-mod-bar: #3b82f6;
+  --diff-add-bg: rgba(16, 185, 129, 0.20);
+  --diff-add-bar: #10b981;
+  --diff-del-bg: rgba(239, 68, 68, 0.22);
+  --diff-del-bar: #ef4444;
+}
+
+/* Light theme */
+:root[data-theme="light"] {
+  --table-bg: #f4f6fa;
+  --discussion-bg: #e7ecf5;
+  --surface-elevated: #ffffff;
+  --hover-bg: rgba(15, 23, 42, 0.05);
+  --active-bg: rgba(79, 70, 229, 0.10);
+  --text-main: #0f172a;
+  --text-muted: #475569;
+  --text-dim: #64748b;
+  --accent: #4f46e5;
+  --accent-2: #0284c7;
+  --border-subtle: rgba(15, 23, 42, 0.12);
+
+  --halo-bright: rgba(79, 70, 229, 0.42);
+  --halo-mid: rgba(2, 132, 199, 0.26);
+  --halo-soft: rgba(15, 23, 42, 0.09);
+  --halo-glow: rgba(79, 70, 229, 0.14);
+  --panel-shadow: 0 10px 26px -10px rgba(15, 23, 42, 0.16);
+
+  --diff-mod-bg: rgba(59, 130, 246, 0.16);
+  --diff-mod-bar: #2563eb;
+  --diff-add-bg: rgba(16, 185, 129, 0.16);
+  --diff-add-bar: #059669;
+  --diff-del-bg: rgba(239, 68, 68, 0.16);
+  --diff-del-bar: #dc2626;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--table-bg);
+  color: var(--text-main);
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+  color: inherit;
+}
+
+/* Fine non-uniform border + subtle halo for "la discussion" and "le code" */
+.halo-surface {
+  border-radius: 16px;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--discussion-bg), var(--discussion-bg)) padding-box,
+    linear-gradient(
+      135deg,
+      var(--halo-bright) 0%,
+      var(--halo-soft) 36%,
+      var(--halo-mid) 72%,
+      var(--halo-soft) 100%
+    )
+      border-box;
+  box-shadow: 0 0 20px -4px var(--halo-glow), var(--panel-shadow);
+}
+
+/* "Le HUD" matches "le menu" / table background with fine halo border */
+.halo-hud {
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--table-bg), var(--table-bg)) padding-box,
+    linear-gradient(
+      135deg,
+      var(--halo-bright) 0%,
+      var(--halo-soft) 45%,
+      var(--halo-mid) 100%
+    )
+      border-box;
+  box-shadow: 0 0 18px -4px var(--halo-glow), 0 8px 22px -6px rgba(0, 0, 0, 0.32);
+}
+
+.halo-input {
+  border-radius: 14px;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--surface-elevated), var(--surface-elevated)) padding-box,
+    linear-gradient(
+      120deg,
+      var(--halo-mid) 0%,
+      var(--halo-soft) 50%,
+      var(--halo-bright) 100%
+    )
+      border-box;
+  box-shadow: 0 0 16px -6px var(--halo-glow);
+}
+
+.resizer-bar {
+  width: 8px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+
+.resizer-bar::after {
+  content: "";
+  width: 2px;
+  height: 36px;
+  border-radius: 999px;
+  background: var(--border-subtle);
+  transition: background-color 0.15s ease, height 0.15s ease;
+}
+
+.resizer-bar:hover::after {
+  background: var(--accent);
+  height: 52px;
+}
+
+.custom-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.custom-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: 999px;
+}
+
+.custom-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Assistant responses typography: Ubuntu */
+.assistant-article,
+.assistant-article p,
+.assistant-article li,
+.assistant-article h1,
+.assistant-article h2,
+.assistant-article h3,
+.md-content,
+.md-p,
+.md-ul,
+.md-ol,
+.live-content {
+  font-family: var(--font-response);
+}
+
+/* Code typography: Turret Road */
+code,
+pre,
+.msg-code-block,
+.code-pre,
+.md-inline-code,
+.artifact-code,
+.diff-viewer,
+.ln-code {
+  font-family: var(--font-code) !important;
+}
