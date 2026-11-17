@@ -880,6 +880,7 @@ async fn execute_aider_cli(
             "--yes-always",
             "--no-pretty",
             "--no-auto-commits",
+            "--architect",
             "--chat-language",
             "fr",
             "--message",
