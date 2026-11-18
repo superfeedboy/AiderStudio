@@ -143,9 +143,30 @@ export const useStudioStore = defineStore("studio", () => {
     }
     if (activeConversation.value) {
       totalChars += (activeConversation.value.conversationContext || "").length;
-      for (const msg of activeConversation.value.messages) {
-        totalChars += (msg.content || "").length;
-      }
+
+      const msgs = activeConversation.value.messages;
+      const count = msgs.length;
+
+      msgs.forEach((msg, idx) => {
+        const isRecent = idx >= count - 2;
+        let content = msg.content || "";
+
+        if (msg.role === "assistant") {
+          // Exclude bulky generated code blocks from past messages:
+          // The code is already written on the hard drive and tracked by Git/Aider.
+          // Including hundreds of lines of past code in session tokens is a pure duplicate.
+          if (!isRecent) {
+            content = content.replace(/```[^\n]*\n[\s\S]*?```/g, "[Code sur disque]");
+          } else {
+            content = content.replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => {
+              const lines = code.trim().split("\n").length;
+              return `[Code: ${lines}l]`;
+            });
+          }
+        }
+
+        totalChars += content.length;
+      });
     }
     return Math.ceil(totalChars / 3.8);
   });
@@ -811,6 +832,26 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
+  async function updateConversationContext(
+    conversationId: string,
+    conversationContext: string
+  ) {
+    const idx = conversations.value.findIndex((c) => c.id === conversationId);
+    if (idx !== -1) {
+      conversations.value[idx].conversationContext = conversationContext;
+      if (isTauri()) {
+        const updated = await invoke<Conversation>(
+          "update_conversation_context",
+          {
+            conversationId,
+            conversationContext,
+          }
+        );
+        conversations.value[idx] = updated;
+      }
+    }
+  }
+
   async function saveMcpServer(server: McpServerConfig): Promise<McpServerConfig[]> {
     if (isTauri()) {
       mcpServers.value = await invoke<McpServerConfig[]>("save_mcp_server", { server });
@@ -947,6 +988,7 @@ export const useStudioStore = defineStore("studio", () => {
     executeMcpTool,
     clearGlobalContext,
     clearConversationContext,
+    updateConversationContext,
     conversationTokenUsage,
     lastCallTokens,
     activeCallTokens,

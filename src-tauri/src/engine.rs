@@ -340,6 +340,14 @@ pub fn extract_clean_replace_code(patch: &str) -> String {
         .join("\n")
 }
 
+pub fn strip_code_blocks(text: &str) -> String {
+    if let Ok(re) = Regex::new(r"```[^\n]*\n[\s\S]*?```") {
+        re.replace_all(text, "").to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 pub async fn execute_local_tool_internal(
     project_root: &Path,
     name: &str,
@@ -963,7 +971,7 @@ fn build_augmented_prompt(
         ));
     }
     if !conv_ctx.trim().is_empty() {
-        parts.push(format!("[Contexte de la conversation]\n{}", conv_ctx.trim()));
+        parts.push(format!("[Objectif & Contexte spécifique de cette discussion]\n{}", conv_ctx.trim()));
     }
 
     if let Some(att_list) = attachments {
@@ -1697,8 +1705,9 @@ pub async fn run_prompt_pipeline(
         guard.conversations[conv_idx].lines_removed = lines_removed;
         guard.conversations[conv_idx].updated_at = now.clone();
 
-        // Update conversation rolling context (prompt and brief summary)
-        let summary_snippet = truncate_chars(synthesized_text.replace('\n', " ").trim(), 220);
+        // Update conversation rolling context (prompt and brief summary without raw code blocks)
+        let text_without_code = strip_code_blocks(&synthesized_text);
+        let summary_snippet = truncate_chars(text_without_code.replace('\n', " ").trim(), 200);
         let conv_entry = format!(
             "• [{}] Demande: {} → Résumé: {}",
             user_msg_time.get(..16).unwrap_or(&user_msg_time),
@@ -1709,7 +1718,7 @@ pub async fn run_prompt_pipeline(
         guard.conversations[conv_idx].conversation_context = if prev_conv_ctx.trim().is_empty() {
             conv_entry
         } else {
-            truncate_chars(&format!("{prev_conv_ctx}\n{conv_entry}"), 2000)
+            truncate_chars(&format!("{prev_conv_ctx}\n{conv_entry}"), 2500)
         };
 
         let proj_id = guard.conversations[conv_idx].project_id.clone();

@@ -4,22 +4,32 @@ import { useStudioStore } from "../stores/studio";
 
 const store = useStudioStore();
 const globalContextDraft = ref("");
+const convContextDraft = ref("");
 
 watch(
   () => store.contextModalOpen,
   (open) => {
-    if (open && store.activeProject) {
-      globalContextDraft.value = store.activeProject.globalContext;
+    if (open) {
+      globalContextDraft.value = store.activeProject?.globalContext || "";
+      convContextDraft.value =
+        store.activeConversation?.conversationContext || "";
     }
   }
 );
 
 async function save() {
-  if (!store.activeProject) return;
-  await store.updateProjectContext(
-    store.activeProject.id,
-    globalContextDraft.value
-  );
+  if (store.activeProject) {
+    await store.updateProjectContext(
+      store.activeProject.id,
+      globalContextDraft.value
+    );
+  }
+  if (store.activeConversation) {
+    await store.updateConversationContext(
+      store.activeConversation.id,
+      convContextDraft.value
+    );
+  }
   store.contextModalOpen = false;
 }
 
@@ -31,6 +41,7 @@ async function clearGlobal() {
 
 async function clearConv() {
   if (!store.activeConversation) return;
+  convContextDraft.value = "";
   await store.clearConversationContext(store.activeConversation.id);
 }
 </script>
@@ -50,37 +61,45 @@ async function clearConv() {
       <div class="ctx-grid">
         <div class="field">
           <div class="field-header">
-            <label>Contexte global du projet (partagé entre toutes les conversations)</label>
+            <label>Contexte global du projet (permanent & partagé)</label>
             <button class="clear-btn" title="Vider le contexte global" @click="clearGlobal">
               Vider
             </button>
           </div>
           <textarea
             v-model="globalContextDraft"
-            rows="6"
-            placeholder="Définissez les règles, objectifs ou spécifications architecturales..."
+            rows="5"
+            placeholder="Règles globales, conventions architecturales, stack technique du projet..."
             class="custom-scroll"
           />
+          <span class="field-hint">
+            Injecté au début de tous les prompts de toutes les discussions de ce projet.
+          </span>
         </div>
 
         <div class="field">
           <div class="field-header">
             <label>
-              Mémoire de la conversation active ({{ store.activeConversation?.title }})
+              Objectif & Mémoire de la discussion ({{ store.activeConversation?.title }})
             </label>
             <button
-              v-if="store.activeConversation?.conversationContext"
+              v-if="convContextDraft || store.activeConversation?.conversationContext"
               class="clear-btn"
-              title="Vider la mémoire de cette conversation"
+              title="Vider la mémoire de cette discussion"
               @click="clearConv"
             >
               Vider
             </button>
           </div>
-          <pre class="conv-ctx-box custom-scroll">{{
-            store.activeConversation?.conversationContext ||
-            "La mémoire se construira automatiquement au fil de vos prompts."
-          }}</pre>
+          <textarea
+            v-model="convContextDraft"
+            rows="5"
+            placeholder="Définissez l'objectif précis de cette session (ex: Implémenter le composant X sans modifier le router). Les résumés de vos étapes s'ajoutent à la suite..."
+            class="custom-scroll"
+          />
+          <span class="field-hint">
+            Spécifique à cette session. Permet d'orienter l'IA sans avoir à répéter vos consignes à chaque prompt.
+          </span>
         </div>
       </div>
 
@@ -89,7 +108,7 @@ async function clearConv() {
           Fermer
         </button>
         <button class="btn-primary" @click="save">
-          Enregistrer le contexte global
+          Enregistrer les contextes
         </button>
       </div>
     </div>
@@ -189,6 +208,12 @@ async function clearConv() {
 
 .field textarea:focus {
   border-color: var(--accent);
+}
+
+.field-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.35;
 }
 
 .conv-ctx-box {

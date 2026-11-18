@@ -236,6 +236,27 @@ async fn clear_conversation_context(
 }
 
 #[tauri::command]
+async fn update_conversation_context(
+    state: State<'_, ManagedState>,
+    conversation_id: String,
+    conversation_context: String,
+) -> Result<Conversation, String> {
+    let mut guard = state.0.lock().await;
+    let idx = guard
+        .conversations
+        .iter()
+        .position(|c| c.id == conversation_id)
+        .ok_or_else(|| "Conversation introuvable".to_string())?;
+    guard.conversations[idx].conversation_context = conversation_context;
+    guard.conversations[idx].updated_at = Utc::now().to_rfc3339();
+    let updated = guard.conversations[idx].clone();
+    storage::save_state(&guard)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
+#[tauri::command]
 async fn send_prompt(
     app: AppHandle,
     state: State<'_, ManagedState>,
@@ -644,6 +665,7 @@ pub fn run() {
             select_conversation,
             delete_conversation,
             clear_conversation_context,
+            update_conversation_context,
             send_prompt,
             refresh_project_diff,
             undo_file_modification,
