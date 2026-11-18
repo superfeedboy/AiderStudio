@@ -336,3 +336,70 @@ pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
 
     files
 }
+
+/// Undoes modifications to a single file:
+/// - Reverts tracked changes from HEAD (works for modified or deleted files)
+/// - Deletes untracked newly-created files
+pub async fn undo_file_modification(project_root: &str, file_path: &str) -> Result<(), String> {
+    let root = Path::new(project_root);
+    let target = root.join(file_path);
+
+    // 1. Try checkout from HEAD for tracked files
+    let checkout_out = Command::new("git")
+        .args(["-C", project_root, "checkout", "HEAD", "--", file_path])
+        .output()
+        .await;
+
+    if let Ok(output) = checkout_out {
+        if output.status.success() {
+            // Also unstage just in case it was staged
+            let _ = Command::new("git")
+                .args(["-C", project_root, "restore", "--staged", "--", file_path])
+                .output()
+                .await;
+            return Ok(());
+        }
+    }
+
+    // 2. Also unstage if staged as a new file
+    let _ = Command::new("git")
+        .args(["-C", project_root, "rm", "-f", "--cached", "--", file_path])
+        .output()
+        .await;
+
+    // 3. If file exists on disk and wasn't in HEAD, remove it
+    if target.exists() {
+        if target.is_file() {
+            let _ = tokio::fs::remove_file(&target).await;
+        } else if target.is_dir() {
+            let _ = tokio::fs::remove_dir_all(&target).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Undoes all uncommitted modifications across the entire project repository:
+/// - Restores tracked files to HEAD
+/// - Cleans untracked files and directories (respects .gitignore and .aiderignore)
+pub async fn undo_all_modifications(project_root: &str) -> Result<(), String> {
+    // 1. Unstage any staged files
+    let _ = Command::new("git")
+        .args(["-C", project_root, "restore", "--staged", "--worktree", "."])
+        .output()
+        .await;
+
+    // 2. Revert tracked files to HEAD
+    let _ = Command::new("git")
+        .args(["-C", project_root, "checkout", "HEAD", "--", "."])
+        .output()
+        .await;
+
+    // 3. Remove untracked files & directories (clean -fd respects .gitignore)
+    let _ = Command::new("git")
+        .args(["-C", project_root, "clean", "-fd"])
+        .output()
+        .await;
+
+    Ok(())
+}

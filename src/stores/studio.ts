@@ -700,6 +700,77 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
+  async function undoFile(filePath: string, conversationId?: string): Promise<boolean> {
+    const cid = conversationId || activeConversationId.value;
+    if (!cid) return false;
+    if (!isTauri()) {
+      // Mock for browser dev mode
+      const idx = conversations.value.findIndex((c) => c.id === cid);
+      if (idx !== -1) {
+        conversations.value[idx].modifiedFiles = conversations.value[idx].modifiedFiles.filter(
+          (f) => f.path !== filePath
+        );
+        conversations.value[idx].linesAdded = conversations.value[idx].modifiedFiles.reduce(
+          (sum, f) => sum + f.added + f.modified,
+          0
+        );
+        conversations.value[idx].linesRemoved = conversations.value[idx].modifiedFiles.reduce(
+          (sum, f) => sum + f.removed + f.modified,
+          0
+        );
+      }
+      if (activeDiffFilePath.value === filePath) {
+        activeDiffFilePath.value = activeConversation.value?.modifiedFiles[0]?.path ?? null;
+      }
+      return true;
+    }
+
+    try {
+      const updated = await invoke<Conversation>("undo_file_modification", {
+        conversationId: cid,
+        filePath,
+      });
+      const idx = conversations.value.findIndex((c) => c.id === updated.id);
+      if (idx !== -1) conversations.value[idx] = updated;
+      if (activeDiffFilePath.value === filePath) {
+        activeDiffFilePath.value = updated.modifiedFiles[0]?.path ?? null;
+      }
+      return true;
+    } catch (err) {
+      console.error("Erreur lors de l'annulation du fichier:", err);
+      return false;
+    }
+  }
+
+  async function undoAll(conversationId?: string): Promise<boolean> {
+    const cid = conversationId || activeConversationId.value;
+    if (!cid) return false;
+    if (!isTauri()) {
+      // Mock for browser dev mode
+      const idx = conversations.value.findIndex((c) => c.id === cid);
+      if (idx !== -1) {
+        conversations.value[idx].modifiedFiles = [];
+        conversations.value[idx].linesAdded = 0;
+        conversations.value[idx].linesRemoved = 0;
+      }
+      activeDiffFilePath.value = null;
+      return true;
+    }
+
+    try {
+      const updated = await invoke<Conversation>("undo_all_modifications", {
+        conversationId: cid,
+      });
+      const idx = conversations.value.findIndex((c) => c.id === updated.id);
+      if (idx !== -1) conversations.value[idx] = updated;
+      activeDiffFilePath.value = null;
+      return true;
+    } catch (err) {
+      console.error("Erreur lors de l'annulation complète:", err);
+      return false;
+    }
+  }
+
   function openReview(filePath?: string) {
     codeMode.value = "review";
     if (filePath) {
@@ -865,6 +936,8 @@ export const useStudioStore = defineStore("studio", () => {
     checkAiderignore,
     ensureAiderignore,
     refreshDiff,
+    undoFile,
+    undoAll,
     openReview,
     openArtifact,
     closeCode,

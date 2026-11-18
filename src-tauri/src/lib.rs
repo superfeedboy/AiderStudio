@@ -335,6 +335,87 @@ async fn refresh_project_diff(
 }
 
 #[tauri::command]
+async fn undo_file_modification(
+    state: State<'_, ManagedState>,
+    conversation_id: String,
+    file_path: String,
+) -> Result<Conversation, String> {
+    let project_root = {
+        let guard = state.0.lock().await;
+        let conv = guard
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .ok_or_else(|| "Conversation introuvable".to_string())?;
+        let proj = guard
+            .projects
+            .iter()
+            .find(|p| p.id == conv.project_id)
+            .ok_or_else(|| "Projet introuvable".to_string())?;
+        proj.root_path.clone()
+    };
+
+    git_diff::undo_file_modification(&project_root, &file_path).await?;
+    let (modified_files, lines_added, lines_removed) =
+        git_diff::collect_project_diffs(&project_root).await;
+
+    let mut guard = state.0.lock().await;
+    let idx = guard
+        .conversations
+        .iter()
+        .position(|c| c.id == conversation_id)
+        .ok_or_else(|| "Conversation introuvable".to_string())?;
+    guard.conversations[idx].modified_files = modified_files;
+    guard.conversations[idx].lines_added = lines_added;
+    guard.conversations[idx].lines_removed = lines_removed;
+    let updated = guard.conversations[idx].clone();
+    storage::save_state(&guard)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn undo_all_modifications(
+    state: State<'_, ManagedState>,
+    conversation_id: String,
+) -> Result<Conversation, String> {
+    let project_root = {
+        let guard = state.0.lock().await;
+        let conv = guard
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .ok_or_else(|| "Conversation introuvable".to_string())?;
+        let proj = guard
+            .projects
+            .iter()
+            .find(|p| p.id == conv.project_id)
+            .ok_or_else(|| "Projet introuvable".to_string())?;
+        proj.root_path.clone()
+    };
+
+    git_diff::undo_all_modifications(&project_root).await?;
+    let (modified_files, lines_added, lines_removed) =
+        git_diff::collect_project_diffs(&project_root).await;
+
+    let mut guard = state.0.lock().await;
+    let idx = guard
+        .conversations
+        .iter()
+        .position(|c| c.id == conversation_id)
+        .ok_or_else(|| "Conversation introuvable".to_string())?;
+    guard.conversations[idx].modified_files = modified_files;
+    guard.conversations[idx].lines_added = lines_added;
+    guard.conversations[idx].lines_removed = lines_removed;
+    let updated = guard.conversations[idx].clone();
+    storage::save_state(&guard)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
+#[tauri::command]
 async fn get_hardware_telemetry() -> HardwareTelemetry {
     telemetry::collect_hardware_telemetry().await
 }
@@ -565,6 +646,8 @@ pub fn run() {
             clear_conversation_context,
             send_prompt,
             refresh_project_diff,
+            undo_file_modification,
+            undo_all_modifications,
             get_hardware_telemetry,
             check_stack_status,
             start_ollama_service,

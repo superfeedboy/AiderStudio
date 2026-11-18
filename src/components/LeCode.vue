@@ -102,6 +102,23 @@ async function copyArtifact() {
   copied.value = true;
   setTimeout(() => (copied.value = false), 1500);
 }
+
+async function confirmUndoFile(filePath: string) {
+  const ok = window.confirm(
+    `Voulez-vous annuler toutes les modifications apportées au fichier "${filePath}" et le restaurer dans son état d'origine ?`
+  );
+  if (!ok) return;
+  await store.undoFile(filePath);
+}
+
+async function confirmUndoAll() {
+  const count = modifiedFiles.value.length;
+  const ok = window.confirm(
+    `Voulez-vous annuler TOUTES les modifications (${count} fichier${count > 1 ? "s" : ""}) et restaurer le projet dans son état d'origine ?\nCette action est irréversible.`
+  );
+  if (!ok) return;
+  await store.undoAll();
+}
 </script>
 
 <template>
@@ -129,6 +146,17 @@ async function copyArtifact() {
       </div>
 
       <div class="code-header-actions">
+        <button
+          v-if="store.codeMode === 'review' && modifiedFiles.length > 0"
+          class="undo-all-header-btn"
+          title="Tout défaire : annuler toutes les modifications apportées aux fichiers"
+          @click="confirmUndoAll"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M5.82843 7.00005L8.36396 9.53558L6.94975 10.9498L2 6.00005L6.94975 1.05031L8.36396 2.46452L5.82843 5.00005H13C16.866 5.00005 20 8.13406 20 12C20 15.866 16.866 19 13 19H4V17H13C15.7614 17 18 14.7615 18 12C18 9.23862 15.7614 7.00005 13 7.00005H5.82843Z"/>
+          </svg>
+          <span class="undo-label">Tout défaire</span>
+        </button>
         <button
           v-if="store.codeMode === 'review'"
           class="refresh-btn"
@@ -167,11 +195,22 @@ async function copyArtifact() {
             @click="store.activeDiffFilePath = file.path"
           >
             <span class="file-path">{{ file.path }}</span>
-            <span class="file-counts">
-              <span v-if="file.modified" class="c-mod">~{{ file.modified }}</span>
-              <span class="c-add">+{{ file.added }}</span>
-              <span class="c-del">-{{ file.removed }}</span>
-            </span>
+            <div class="file-row-actions">
+              <span class="file-counts">
+                <span v-if="file.modified" class="c-mod">~{{ file.modified }}</span>
+                <span class="c-add">+{{ file.added }}</span>
+                <span class="c-del">-{{ file.removed }}</span>
+              </span>
+              <button
+                class="file-row-undo-btn"
+                :title="`Annuler les modifications de ${file.path}`"
+                @click.stop="confirmUndoFile(file.path)"
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M5.82843 7.00005L8.36396 9.53558L6.94975 10.9498L2 6.00005L6.94975 1.05031L8.36396 2.46452L5.82843 5.00005H13C16.866 5.00005 20 8.13406 20 12C20 15.866 16.866 19 13 19H4V17H13C15.7614 17 18 14.7615 18 12C18 9.23862 15.7614 7.00005 13 7.00005H5.82843Z"/>
+                </svg>
+              </button>
+            </div>
 
             <!-- Tooltip au hover affichant le chemin complet absolu -->
             <div class="custom-file-tooltip">
@@ -182,9 +221,22 @@ async function copyArtifact() {
         </div>
 
         <div class="diff-legend">
-          <span class="leg mod">Modifié</span>
-          <span class="leg add">Ajouté</span>
-          <span class="leg del">Supprimé</span>
+          <div class="legend-tags">
+            <span class="leg mod">Modifié</span>
+            <span class="leg add">Ajouté</span>
+            <span class="leg del">Supprimé</span>
+          </div>
+          <button
+            v-if="selectedFile"
+            class="diff-undo-selected-btn"
+            :title="`Annuler les modifications de ${selectedFile.path}`"
+            @click="confirmUndoFile(selectedFile.path)"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M5.82843 7.00005L8.36396 9.53558L6.94975 10.9498L2 6.00005L6.94975 1.05031L8.36396 2.46452L5.82843 5.00005H13C16.866 5.00005 20 8.13406 20 12C20 15.866 16.866 19 13 19H4V17H13C15.7614 17 18 14.7615 18 12C18 9.23862 15.7614 7.00005 13 7.00005H5.82843Z"/>
+            </svg>
+            <span>Annuler ce fichier</span>
+          </button>
         </div>
 
         <div v-if="selectedFile" class="diff-viewer custom-scroll">
@@ -332,7 +384,33 @@ async function copyArtifact() {
 .code-header-actions {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
+}
+
+.undo-all-header-btn {
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.08);
+  color: #f87171;
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 0.15s ease;
+}
+
+.undo-all-header-btn:hover {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.35);
+}
+
+.undo-label {
+  font-size: 11px;
 }
 
 .refresh-btn,
@@ -466,6 +544,39 @@ async function copyArtifact() {
   white-space: nowrap;
 }
 
+.file-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.file-row-undo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  opacity: 0.45;
+}
+
+.file-row:hover .file-row-undo-btn {
+  opacity: 1;
+}
+
+.file-row-undo-btn:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: #ef4444;
+  color: #ef4444;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.3);
+}
+
 .file-counts {
   display: flex;
   gap: 6px;
@@ -489,12 +600,41 @@ async function copyArtifact() {
 .diff-legend {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--border-subtle);
   font-size: 11.5px;
   color: var(--text-muted);
   flex-shrink: 0;
+}
+
+.legend-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.diff-undo-selected-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.08);
+  color: #f87171;
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.diff-undo-selected-btn:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.3);
 }
 
 .leg {

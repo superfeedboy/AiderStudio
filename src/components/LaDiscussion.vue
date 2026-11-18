@@ -637,6 +637,23 @@ function rerunPrompt(content: string) {
   });
 }
 
+async function confirmUndoFile(filePath: string) {
+  const ok = window.confirm(
+    `Voulez-vous annuler toutes les modifications apportées au fichier "${filePath}" et le restaurer dans son état d'origine ?`
+  );
+  if (!ok) return;
+  await store.undoFile(filePath);
+}
+
+async function confirmUndoAll() {
+  const count = conv.value?.modifiedFiles.length ?? 0;
+  const ok = window.confirm(
+    `Voulez-vous annuler TOUTES les modifications (${count} fichier${count > 1 ? "s" : ""}) et restaurer le projet dans son état d'origine ?\nCette action est irréversible.`
+  );
+  if (!ok) return;
+  await store.undoAll();
+}
+
 function openFilePicker() {
   fileInputRef.value?.click();
 }
@@ -1185,18 +1202,31 @@ async function copyCodeBlock(key: string, code: string) {
               <!-- Menu déroulant Dropdown -->
               <div v-if="openFilesDropdown[msg.id]" class="diff-dropdown-menu halo-hud custom-scroll">
                 <div class="diff-menu-header">
-                  <span class="diff-menu-header-text">Fichiers modifiés</span>
-                  <div class="diff-menu-stats-row">
-                    <span v-if="getFilesBreakdown(msg, msgIdx).created > 0" class="badge-mini-status tag-created">
-                      +{{ getFilesBreakdown(msg, msgIdx).created }} créé{{ getFilesBreakdown(msg, msgIdx).created > 1 ? "s" : "" }}
-                    </span>
-                    <span v-if="getFilesBreakdown(msg, msgIdx).modified > 0" class="badge-mini-status tag-modified">
-                      ~{{ getFilesBreakdown(msg, msgIdx).modified }} modifié{{ getFilesBreakdown(msg, msgIdx).modified > 1 ? "s" : "" }}
-                    </span>
-                    <span v-if="getFilesBreakdown(msg, msgIdx).deleted > 0" class="badge-mini-status tag-deleted">
-                      -{{ getFilesBreakdown(msg, msgIdx).deleted }} supprimé{{ getFilesBreakdown(msg, msgIdx).deleted > 1 ? "s" : "" }}
-                    </span>
+                  <div class="diff-menu-header-left">
+                    <span class="diff-menu-header-text">Fichiers modifiés</span>
+                    <div class="diff-menu-stats-row">
+                      <span v-if="getFilesBreakdown(msg, msgIdx).created > 0" class="badge-mini-status tag-created">
+                        +{{ getFilesBreakdown(msg, msgIdx).created }} créé{{ getFilesBreakdown(msg, msgIdx).created > 1 ? "s" : "" }}
+                      </span>
+                      <span v-if="getFilesBreakdown(msg, msgIdx).modified > 0" class="badge-mini-status tag-modified">
+                        ~{{ getFilesBreakdown(msg, msgIdx).modified }} modifié{{ getFilesBreakdown(msg, msgIdx).modified > 1 ? "s" : "" }}
+                      </span>
+                      <span v-if="getFilesBreakdown(msg, msgIdx).deleted > 0" class="badge-mini-status tag-deleted">
+                        -{{ getFilesBreakdown(msg, msgIdx).deleted }} supprimé{{ getFilesBreakdown(msg, msgIdx).deleted > 1 ? "s" : "" }}
+                      </span>
+                    </div>
                   </div>
+                  <button
+                    v-if="getFileListForMessage(msg, msgIdx).length > 0"
+                    class="diff-undo-all-action-btn"
+                    title="Annuler toutes les modifications apportées aux fichiers du projet"
+                    @click.stop="confirmUndoAll()"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M5.82843 7.00005L8.36396 9.53558L6.94975 10.9498L2 6.00005L6.94975 1.05031L8.36396 2.46452L5.82843 5.00005H13C16.866 5.00005 20 8.13406 20 12C20 15.866 16.866 19 13 19H4V17H13C15.7614 17 18 14.7615 18 12C18 9.23862 15.7614 7.00005 13 7.00005H5.82843Z"/>
+                    </svg>
+                    <span>Tout défaire</span>
+                  </button>
                 </div>
 
                 <div v-if="getFileListForMessage(msg, msgIdx).length === 0" class="diff-menu-empty">
@@ -1214,9 +1244,20 @@ async function copyCodeBlock(key: string, code: string) {
                       {{ getFileStatusLabel(file) }}
                     </span>
                     <span class="menu-file-path">{{ file.path }}</span>
-                    <div class="menu-file-delta">
-                      <span v-if="file.added > 0" class="c-add">+{{ file.added }}</span>
-                      <span v-if="file.removed > 0" class="c-del">-{{ file.removed }}</span>
+                    <div class="menu-file-actions">
+                      <div class="menu-file-delta">
+                        <span v-if="file.added > 0" class="c-add">+{{ file.added }}</span>
+                        <span v-if="file.removed > 0" class="c-del">-{{ file.removed }}</span>
+                      </div>
+                      <button
+                        class="menu-file-undo-btn"
+                        :title="`Annuler les modifications de ${file.path}`"
+                        @click.stop="confirmUndoFile(file.path)"
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M5.82843 7.00005L8.36396 9.53558L6.94975 10.9498L2 6.00005L6.94975 1.05031L8.36396 2.46452L5.82843 5.00005H13C16.866 5.00005 20 8.13406 20 12C20 15.866 16.866 19 13 19H4V17H13C15.7614 17 18 14.7615 18 12C18 9.23862 15.7614 7.00005 13 7.00005H5.82843Z"/>
+                        </svg>
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -2359,8 +2400,39 @@ async function copyCodeBlock(key: string, code: string) {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   border-bottom: 1px solid var(--border-subtle);
   background: rgba(255, 255, 255, 0.02);
+}
+
+.diff-menu-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.diff-undo-all-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.08);
+  color: #f87171;
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.diff-undo-all-action-btn:hover {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.35);
 }
 
 .diff-menu-header-text {
@@ -2441,11 +2513,44 @@ async function copyCodeBlock(key: string, code: string) {
   white-space: nowrap;
 }
 
+.menu-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .menu-file-delta {
   font-family: var(--font-code);
   font-size: 11px;
   display: inline-flex;
   gap: 5px;
+}
+
+.menu-file-undo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  opacity: 0.65;
+}
+
+.diff-menu-row:hover .menu-file-undo-btn {
+  opacity: 1;
+}
+
+.menu-file-undo-btn:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: #ef4444;
+  color: #ef4444;
+  box-shadow: 0 0 6px rgba(239, 68, 68, 0.3);
 }
 
 .diff-menu-empty {
