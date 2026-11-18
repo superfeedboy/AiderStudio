@@ -282,6 +282,64 @@ pub async fn run_test_verifier(project_root: &Path) -> TestVerificationResult {
     }
 }
 
+pub fn apply_search_replace_patch(original: &str, patch: &str) -> Option<String> {
+    let re = Regex::new(r"<<<<<<< SEARCH\r?\n([\s\S]*?)\r?\n=======\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE").ok()?;
+    let mut modified = original.to_string();
+    let mut applied_count = 0;
+
+    for cap in re.captures_iter(patch) {
+        let search = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let replace = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+
+        if search.is_empty() {
+            if modified.is_empty() {
+                modified = replace.to_string();
+                applied_count += 1;
+            }
+        } else if modified.contains(search) {
+            modified = modified.replacen(search, replace, 1);
+            applied_count += 1;
+        } else {
+            let search_trimmed = search.trim();
+            if !search_trimmed.is_empty() && modified.contains(search_trimmed) {
+                modified = modified.replacen(search_trimmed, replace.trim(), 1);
+                applied_count += 1;
+            }
+        }
+    }
+
+    if applied_count > 0 {
+        Some(modified)
+    } else {
+        None
+    }
+}
+
+pub fn extract_clean_replace_code(patch: &str) -> String {
+    if let Ok(re) = Regex::new(r"<<<<<<< SEARCH\r?\n[\s\S]*?\r?\n=======\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE") {
+        let mut parts = Vec::new();
+        for cap in re.captures_iter(patch) {
+            if let Some(m) = cap.get(1) {
+                parts.push(m.as_str().trim_matches('\r'));
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+    }
+
+    patch
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("<<<<<<< SEARCH")
+                && !t.starts_with("=======")
+                && !t.starts_with(">>>>>>> REPLACE")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub async fn execute_local_tool_internal(
     project_root: &Path,
     name: &str,
@@ -307,7 +365,22 @@ pub async fn execute_local_tool_internal(
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            tokio::fs::write(&target_path, content)
+
+            // CRITICAL PROTECTION: Never write raw SEARCH/REPLACE diff markers into files.
+            // If the content is a diff, apply it to the existing file or extract clean replacement code.
+            let final_content = if content.contains("<<<<<<< SEARCH") && content.contains(">>>>>>> REPLACE") {
+                if target_path.exists() {
+                    let orig = tokio::fs::read_to_string(&target_path).await.unwrap_or_default();
+                    apply_search_replace_patch(&orig, content)
+                        .unwrap_or_else(|| extract_clean_replace_code(content))
+                } else {
+                    extract_clean_replace_code(content)
+                }
+            } else {
+                content.to_string()
+            };
+
+            tokio::fs::write(&target_path, &final_content)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(ToolExecutionResult {
@@ -316,7 +389,7 @@ pub async fn execute_local_tool_internal(
                 message: format!(
                     "Fichier '{}' écrit avec succès ({} octets)",
                     clean_path,
-                    content.len()
+                    final_content.len()
                 ),
                 path: Some(clean_path.to_string()),
             })
@@ -412,6 +485,7 @@ pub async fn apply_tools_and_file_blocks(
     project_root: &Path,
     assistant_text: &str,
     user_prompt: &str,
+    aider_ran: bool,
 ) -> Vec<ToolExecutionResult> {
     let mut results = Vec::new();
     let mut processed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -457,120 +531,144 @@ pub async fn apply_tools_and_file_blocks(
         }
     }
 
-    // 3. Robust Code Fence Extractor: matches ANY code fence and identifies its target file
-    let path_re = Regex::new(r#"(?:^|[\s"'\*#`:])([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:[\s"'\*`:]|$)"#)
-        .expect("valid path regex");
-    let any_fence_re = Regex::new(r"```([^\n]*)\n([\s\S]*?)```").expect("valid fence regex");
+    // 3. Heuristic Code Fence Extractor: ONLY executed when Aider CLI did not run.
+    // When Aider runs, Aider already applies the edits directly to files on disk.
+    // Parsing Aider's stdout diffs/explanations and blindly overwriting files would corrupt them with diff syntax!
+    if !aider_ran {
+        let path_re = Regex::new(r#"(?:^|[\s"'\*#`:])([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:[\s"'\*`:]|$)"#)
+            .expect("valid path regex");
+        let any_fence_re = Regex::new(r"```([^\n]*)\n([\s\S]*?)```").expect("valid fence regex");
 
-    for cap in any_fence_re.captures_iter(assistant_text) {
-        let full_match = cap.get(0).unwrap();
-        let info = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        let code = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-        if code.trim().is_empty() {
-            continue;
-        }
-
-        let mut detected_path: Option<String> = None;
-
-        // A) Path in info string: ```html:index.html or ```src/App.vue
-        if info.contains(':') {
-            let candidate = info.split(':').last().unwrap_or("").trim().trim_matches('`').trim_matches('\'').trim_matches('"');
-            if path_re.is_match(candidate) {
-                detected_path = Some(candidate.to_string());
+        for cap in any_fence_re.captures_iter(assistant_text) {
+            let full_match = cap.get(0).unwrap();
+            let info = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+            let code = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            if code.trim().is_empty() {
+                continue;
             }
-        } else if path_re.is_match(info) && info.contains('.') {
-            detected_path = Some(info.trim_matches('`').trim_matches('\'').trim_matches('"').to_string());
-        }
 
-        // B) Path in preceding lines (up to 4 lines back)
-        if detected_path.is_none() {
-            let before_fence = &assistant_text[..full_match.start()];
-            let non_empty_lines: Vec<&str> = before_fence
-                .lines()
-                .rev()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .take(4)
-                .collect();
+            let mut detected_path: Option<String> = None;
 
-            for line in non_empty_lines {
-                // Ignore lines that look like shell commands or markdown headers without path
-                if line.starts_with("$ ") || line.starts_with("npx ") || line.starts_with("npm ") || line.starts_with("cd ") {
-                    continue;
+            // A) Path in info string: ```html:index.html or ```src/App.vue
+            if info.contains(':') {
+                let candidate = info.split(':').last().unwrap_or("").trim().trim_matches('`').trim_matches('\'').trim_matches('"');
+                if path_re.is_match(candidate) {
+                    detected_path = Some(candidate.to_string());
                 }
-                if let Some(p_cap) = path_re.captures(line) {
-                    if let Some(m) = p_cap.get(1) {
-                        let candidate = m.as_str().trim().trim_matches('`').trim_matches('\'').trim_matches('"').to_string();
-                        // Verify candidate has an extension and isn't just a domain or general word
-                        if candidate.contains('.') && !candidate.ends_with('.') && !candidate.starts_with("http") {
-                            detected_path = Some(candidate);
-                            break;
+            } else if path_re.is_match(info) && info.contains('.') {
+                detected_path = Some(info.trim_matches('`').trim_matches('\'').trim_matches('"').to_string());
+            }
+
+            // B) Path in preceding lines (up to 4 lines back)
+            if detected_path.is_none() {
+                let before_fence = &assistant_text[..full_match.start()];
+                let non_empty_lines: Vec<&str> = before_fence
+                    .lines()
+                    .rev()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .take(4)
+                    .collect();
+
+                for line in non_empty_lines {
+                    // Ignore lines that look like shell commands or markdown headers without path
+                    if line.starts_with("$ ") || line.starts_with("npx ") || line.starts_with("npm ") || line.starts_with("cd ") {
+                        continue;
+                    }
+                    if let Some(p_cap) = path_re.captures(line) {
+                        if let Some(m) = p_cap.get(1) {
+                            let candidate = m.as_str().trim().trim_matches('`').trim_matches('\'').trim_matches('"').to_string();
+                            // Verify candidate has an extension and isn't just a domain or general word
+                            if candidate.contains('.') && !candidate.ends_with('.') && !candidate.starts_with("http") {
+                                detected_path = Some(candidate);
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // C) Path in the first line of the code block itself (e.g. `// src/App.js` or `/* styles.css */` or `<!-- index.html -->`)
-        if detected_path.is_none() {
-            let first_line = code.lines().next().unwrap_or("").trim();
-            if first_line.starts_with("//") || first_line.starts_with("/*") || first_line.starts_with('#') || first_line.starts_with("<!--") {
-                if let Some(p_cap) = path_re.captures(first_line) {
-                    if let Some(m) = p_cap.get(1) {
-                        let candidate = m.as_str().trim().trim_matches('`').trim_matches('\'').trim_matches('"').to_string();
-                        if candidate.contains('.') && !candidate.ends_with('.') {
-                            detected_path = Some(candidate);
+            // C) Path in the first line of the code block itself (e.g. `// src/App.js` or `/* styles.css */` or `<!-- index.html -->`)
+            if detected_path.is_none() {
+                let first_line = code.lines().next().unwrap_or("").trim();
+                if first_line.starts_with("//") || first_line.starts_with("/*") || first_line.starts_with('#') || first_line.starts_with("<!--") {
+                    if let Some(p_cap) = path_re.captures(first_line) {
+                        if let Some(m) = p_cap.get(1) {
+                            let candidate = m.as_str().trim().trim_matches('`').trim_matches('\'').trim_matches('"').to_string();
+                            if candidate.contains('.') && !candidate.ends_with('.') {
+                                detected_path = Some(candidate);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // D) Heuristic fallback based on prompt and code content
-        if detected_path.is_none() {
-            let lower_prompt = user_prompt.to_lowercase();
-            let is_html = code.contains("<!DOCTYPE html>") || code.contains("<html");
-            let is_css = (code.contains('{') && code.contains('}')) && (code.contains("margin:") || code.contains("padding:") || code.contains("color:") || code.contains("font-family:"));
-            let is_js = code.contains("function ") || code.contains("const ") || code.contains("let ") || code.contains("import ");
+            // D) Heuristic fallback based on prompt and code content
+            if detected_path.is_none() {
+                let lower_prompt = user_prompt.to_lowercase();
+                let is_html = code.contains("<!DOCTYPE html>") || code.contains("<html");
+                let is_css = (code.contains('{') && code.contains('}')) && (code.contains("margin:") || code.contains("padding:") || code.contains("color:") || code.contains("font-family:"));
+                let is_js = code.contains("function ") || code.contains("const ") || code.contains("let ") || code.contains("import ");
 
-            if is_html && (lower_prompt.contains("index.html") || lower_prompt.contains("site web") || lower_prompt.contains("page html") || lower_prompt.contains("vitrine") || lower_prompt.contains("site")) {
-                if !processed_paths.contains("index.html") {
-                    detected_path = Some("index.html".to_string());
-                }
-            } else if is_css && (lower_prompt.contains("css") || lower_prompt.contains("style")) {
-                if !processed_paths.contains("style.css") && !processed_paths.contains("styles.css") {
-                    detected_path = Some("styles.css".to_string());
-                }
-            } else if is_js && (lower_prompt.contains("script.js") || lower_prompt.contains("app.js")) {
-                if !processed_paths.contains("app.js") && !processed_paths.contains("script.js") {
-                    detected_path = Some("app.js".to_string());
+                if is_html && (lower_prompt.contains("index.html") || lower_prompt.contains("site web") || lower_prompt.contains("page html") || lower_prompt.contains("vitrine") || lower_prompt.contains("site")) {
+                    if !processed_paths.contains("index.html") {
+                        detected_path = Some("index.html".to_string());
+                    }
+                } else if is_css && (lower_prompt.contains("css") || lower_prompt.contains("style")) {
+                    if !processed_paths.contains("style.css") && !processed_paths.contains("styles.css") {
+                        detected_path = Some("styles.css".to_string());
+                    }
+                } else if is_js && (lower_prompt.contains("script.js") || lower_prompt.contains("app.js")) {
+                    if !processed_paths.contains("app.js") && !processed_paths.contains("script.js") {
+                        detected_path = Some("app.js".to_string());
+                    }
                 }
             }
-        }
 
-        // If a path was successfully detected and not already written in this turn:
-        if let Some(raw_path) = detected_path {
-            let clean_path = raw_path
-                .trim()
-                .trim_matches('`')
-                .trim_matches('\'')
-                .trim_matches('"')
-                .trim_start_matches("./")
-                .to_string();
+            // If a path was successfully detected and not already written in this turn:
+            if let Some(raw_path) = detected_path {
+                let clean_path = raw_path
+                    .trim()
+                    .trim_matches('`')
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .trim_start_matches("./")
+                    .to_string();
 
-            // Avoid writing unwanted files like package.json or node_modules or command paths
-            if !clean_path.is_empty()
-                && !clean_path.contains("..")
-                && !clean_path.starts_with("http")
-                && !processed_paths.contains(&clean_path)
-            {
-                let write_args = serde_json::json!({
-                    "path": clean_path,
-                    "content": code,
-                });
-                if let Ok(res) = execute_local_tool_internal(project_root, "write_file", &write_args).await {
-                    processed_paths.insert(clean_path);
-                    results.push(res);
+                // Avoid writing unwanted files like package.json or node_modules or command paths
+                if !clean_path.is_empty()
+                    && !clean_path.contains("..")
+                    && !clean_path.starts_with("http")
+                    && !processed_paths.contains(&clean_path)
+                {
+                    // If code contains SEARCH/REPLACE diff markers, apply as patch or extract clean code, never write raw diff!
+                    let target = project_root.join(&clean_path);
+                    if code.contains("<<<<<<< SEARCH") && code.contains(">>>>>>> REPLACE") {
+                        if target.exists() {
+                            if let Ok(orig) = tokio::fs::read_to_string(&target).await {
+                                if let Some(patched) = apply_search_replace_patch(&orig, code) {
+                                    if tokio::fs::write(&target, patched).await.is_ok() {
+                                        processed_paths.insert(clean_path.clone());
+                                        results.push(ToolExecutionResult {
+                                            tool: "patch_file".to_string(),
+                                            success: true,
+                                            message: format!("Patch appliqué avec succès à '{}'", clean_path),
+                                            path: Some(clean_path),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let write_args = serde_json::json!({
+                            "path": clean_path,
+                            "content": code,
+                        });
+                        if let Ok(res) = execute_local_tool_internal(project_root, "write_file", &write_args).await {
+                            processed_paths.insert(clean_path);
+                            results.push(res);
+                        }
+                    }
                 }
             }
         }
@@ -1424,6 +1522,7 @@ pub async fn run_prompt_pipeline(
         }
     }
 
+    let mut aider_ran = false;
     let (assistant_text, stage_note) = if image_base64_list.is_empty()
         && stack.aider_bin.is_some()
     {
@@ -1438,14 +1537,20 @@ pub async fn run_prompt_pipeline(
         )
         .await
         {
-            Ok(output) if !output.is_empty() => (
-                output,
-                format!("Aider Diff · {}", settings.ollama_model),
-            ),
-            Ok(_) => (
-                "Aider a terminé l'opération sans sortie textuelle supplémentaire.".to_string(),
-                format!("Aider Diff · {}", settings.ollama_model),
-            ),
+            Ok(output) if !output.is_empty() => {
+                aider_ran = true;
+                (
+                    output,
+                    format!("Aider Diff · {}", settings.ollama_model),
+                )
+            }
+            Ok(_) => {
+                aider_ran = true;
+                (
+                    "Aider a terminé l'opération sans sortie textuelle supplémentaire.".to_string(),
+                    format!("Aider Diff · {}", settings.ollama_model),
+                )
+            }
             Err(err) => (
                 format!(
                     "⚠️ Erreur lors de l'exécution d'Aider :\n`{}`\n\nVérifiez qu'Ollama est démarré (`ollama serve`) et que le modèle `{}` est téléchargé.",
@@ -1494,7 +1599,7 @@ pub async fn run_prompt_pipeline(
 
     // Extract thinking and apply local tools directly to create/edit files in local
     let (extracted_thinking, cleaned_content) = extract_thinking_and_content(&assistant_text);
-    let tool_results = apply_tools_and_file_blocks(&project_root_path, &cleaned_content, &user_prompt).await;
+    let tool_results = apply_tools_and_file_blocks(&project_root_path, &cleaned_content, &user_prompt, aider_ran).await;
 
     // SUB-AGENT 4/5: Testeur & Vérifieur
     emit_stage(
