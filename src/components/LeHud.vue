@@ -45,7 +45,10 @@ function selectArtifact(id: string) {
     </div>
 
     <!-- SECTION CONTEXTE -->
-    <div class="hud-context-section" title="Remplissage de la fenêtre de contexte LLM">
+    <div
+      class="hud-context-section"
+      :title="`Charge de l'appel : ${store.activeCallTokens.toLocaleString()} / ${store.contextTokensMax.toLocaleString()} tok (${store.activeContextPercent}%)\nMémoire session cumulée : ${store.contextTokensUsed.toLocaleString()} tok`"
+    >
       <div class="hud-context-header">
         <span class="hud-context-title">
           <svg class="hud-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -58,11 +61,11 @@ function selectArtifact(id: string) {
         <strong
           class="hud-context-percent"
           :class="{
-            'is-warn': store.contextPercent >= 70 && store.contextPercent < 85,
-            'is-danger': store.contextPercent >= 85,
+            'is-warn': store.activeContextPercent >= 70 && store.activeContextPercent < 85,
+            'is-danger': store.activeContextPercent >= 85,
           }"
         >
-          {{ store.contextPercent }}%
+          {{ store.activeContextPercent }}%
         </strong>
       </div>
 
@@ -70,26 +73,36 @@ function selectArtifact(id: string) {
       <div class="context-bar-track">
         <div
           class="context-bar-fill"
-          :style="{ width: `${store.contextPercent}%` }"
+          :style="{ width: `${store.activeContextPercent}%` }"
           :class="{
-            'fill-ok': store.contextPercent < 70,
-            'fill-warn': store.contextPercent >= 70 && store.contextPercent < 85,
-            'fill-danger': store.contextPercent >= 85,
+            'fill-ok': store.activeContextPercent < 70,
+            'fill-warn': store.activeContextPercent >= 70 && store.activeContextPercent < 85,
+            'fill-danger': store.activeContextPercent >= 85,
           }"
         />
       </div>
 
+      <!-- Badge sous-agent actif et tokens par appel -->
+      <div
+        v-if="store.lastCallTokens"
+        class="hud-subagent-tag"
+        :title="`Prompt : ${store.lastCallTokens.promptTokens.toLocaleString()} tok · Réponse : ${store.lastCallTokens.completionTokens.toLocaleString()} tok`"
+      >
+        <span class="subagent-name">{{ store.lastCallTokens.subagent }}</span>
+        <span class="subagent-tokens">{{ store.lastCallTokens.totalTokens.toLocaleString() }} tok</span>
+      </div>
+
       <!-- Bulle de recommandation /compact si >= 70% ou forcée si >= 95% -->
       <div
-        v-if="store.contextPercent >= 70"
+        v-if="store.activeContextPercent >= 70"
         class="compact-alert-bubble"
-        :class="{ 'is-forced': store.contextPercent >= 95 }"
+        :class="{ 'is-forced': store.activeContextPercent >= 95 }"
       >
         <span class="compact-alert-msg">
           {{
-            store.contextPercent >= 95
+            store.activeContextPercent >= 95
               ? "Fenêtre saturée (95%) : /compact forcé !"
-              : store.contextPercent >= 80
+              : store.activeContextPercent >= 80
                 ? "Contexte à 80% : /compact conseillé."
                 : "Contexte à 70% : pensez à /compact."
           }}
@@ -99,7 +112,7 @@ function selectArtifact(id: string) {
           title="Exécuter un /compact pour résumer l'historique et libérer de la mémoire"
           @click="store.compactConversation()"
         >
-          {{ store.contextPercent >= 95 ? "Nettoyer" : "Compacter" }}
+          {{ store.activeContextPercent >= 95 ? "Nettoyer" : "Compacter" }}
         </button>
       </div>
     </div>
@@ -254,7 +267,9 @@ function selectArtifact(id: string) {
   top: 14px;
   right: 14px;
   z-index: 25;
-  width: 236px;
+  width: clamp(230px, calc((100% - 840px) / 2 - 16px), 320px);
+  min-width: 230px;
+  max-width: calc(100% - 28px);
   padding: 8px 10px;
   display: flex;
   flex-direction: column;
@@ -372,6 +387,34 @@ function selectArtifact(id: string) {
 .context-bar-fill.fill-danger {
   background: #ef4444;
   box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
+}
+
+.hud-subagent-tag {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 9.5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  color: var(--text-muted);
+}
+
+.subagent-name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 145px;
+}
+
+.subagent-tokens {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  color: #38bdf8;
+  flex-shrink: 0;
 }
 
 .compact-alert-bubble {

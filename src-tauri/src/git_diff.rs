@@ -94,28 +94,76 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
 
     sanitize_backtick_paths(project_root).await;
 
-    // Check if HEAD exists; fallback to unstaged `git diff` on empty repos
-    let has_head = Command::new("git")
+    // Ensure git repo is initialized with a valid HEAD commit
+    if !root.join(".git").exists() {
+        let _ = Command::new("git")
+            .args(["-C", project_root, "init"])
+            .output()
+            .await;
+    }
+
+    let mut has_head = Command::new("git")
         .args(["-C", project_root, "rev-parse", "--verify", "HEAD"])
         .output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    let diff_args = if has_head {
-        vec!["-C", project_root, "diff", "HEAD", "--unified=3", "--no-color", "--", "."]
+    if !has_head {
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                project_root,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "AiderStudio repo initialization",
+            ])
+            .output()
+            .await;
+        has_head = Command::new("git")
+            .args(["-C", project_root, "rev-parse", "--verify", "HEAD"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    }
+
+    let mut diff_text = if has_head {
+        Command::new("git")
+            .args(["-C", project_root, "diff", "HEAD", "--unified=3", "--no-color", "--", "."])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
     } else {
-        vec!["-C", project_root, "diff", "--unified=3", "--no-color", "--", "."]
+        String::new()
     };
 
-    let diff_text = Command::new("git")
-        .args(&diff_args)
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+    if diff_text.is_empty() {
+        // Fallback: combine unstaged diff + cached staged diff
+        let unstaged = Command::new("git")
+            .args(["-C", project_root, "diff", "--unified=3", "--no-color", "--", "."])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        let staged = Command::new("git")
+            .args(["-C", project_root, "diff", "--cached", "--unified=3", "--no-color", "--", "."])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+
+        diff_text = format!("{}\n{}", unstaged, staged).trim().to_string();
+    }
 
     let mut files = parse_unified_diff(&diff_text);
 

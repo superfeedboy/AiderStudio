@@ -77,7 +77,9 @@ function handleDeleteProject(proj: Project) {
                 title="Nouvelle conversation dans ce projet"
                 @click.stop="store.createConversation(project.id)"
               >
-                +
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
               </button>
             </div>
           </div>
@@ -330,18 +332,19 @@ function handleDeleteProject(proj: Project) {
 }
 
 .mini-pill {
-  border: none;
-  background: var(--surface-elevated);
   border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
   color: var(--text-muted);
   border-radius: 6px;
-  padding: 2px 6px;
-  font-size: 11px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   transition: all 0.12s ease;
+  line-height: 1;
 }
 
 .mini-pill:hover {

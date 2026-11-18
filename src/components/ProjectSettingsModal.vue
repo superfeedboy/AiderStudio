@@ -8,6 +8,7 @@ const draftName = ref("");
 const draftContext = ref("");
 const draftSharedDirs = ref<string[]>([]);
 const activeTab = ref<"general" | "dirs" | "context" | "danger">("general");
+const isConfirmingDelete = ref(false);
 
 watch(
   () => store.projectSettingsModalOpen,
@@ -17,6 +18,7 @@ watch(
       draftContext.value = store.projectToEdit.globalContext || "";
       draftSharedDirs.value = [...(store.projectToEdit.sharedDirectories || [])];
       activeTab.value = "general";
+      isConfirmingDelete.value = false;
     }
   }
 );
@@ -50,11 +52,8 @@ async function handleSave() {
 function handleDeleteProject() {
   if (!store.projectToEdit) return;
   const proj = store.projectToEdit;
-  const confirmMsg = `Êtes-vous sûr de vouloir supprimer définitivement le projet « ${proj.name} » ?\n(Vos fichiers locaux ne seront pas supprimés, seules les sessions associées dans AiderStudio seront retirées).`;
-  if (window.confirm(confirmMsg)) {
-    store.projectSettingsModalOpen = false;
-    void store.deleteProject(proj.id);
-  }
+  store.projectSettingsModalOpen = false;
+  void store.deleteProject(proj.id);
 }
 </script>
 
@@ -148,6 +147,30 @@ function handleDeleteProject() {
             </div>
             <span class="field-hint">Dépôt Git géré par Aider et espace de création de vos fichiers.</span>
           </div>
+
+          <!-- Optimization & .aiderignore status card -->
+          <div class="field aiderignore-card">
+            <div class="aiderignore-header">
+              <div class="aiderignore-info">
+                <span class="card-tag" :class="store.hasAiderignore ? 'tag-ok' : 'tag-warn'">
+                  {{ store.hasAiderignore ? "✓ Protection Contexte Active" : "⚠️ Optimisation Requise" }}
+                </span>
+                <span class="aiderignore-title">Fichier .aiderignore (Protection 8K)</span>
+              </div>
+              <button
+                v-if="!store.hasAiderignore"
+                class="create-ignore-btn"
+                @click="store.ensureAiderignore(store.projectToEdit?.id)"
+              >
+                Générer .aiderignore
+              </button>
+            </div>
+            <p class="aiderignore-desc">
+              {{ store.hasAiderignore
+                ? "Le fichier .aiderignore exclut node_modules, target, dist, lockfiles et logs pour éviter de saturer la fenêtre de contexte de votre modèle local."
+                : "Sans .aiderignore, Aider indexe les dossiers volumineux (node_modules, target, dist) ce qui sature immédiatement la mémoire de 8K tokens." }}
+            </p>
+          </div>
         </div>
 
         <!-- TAB 2: Dossiers partagés -->
@@ -240,12 +263,27 @@ function handleDeleteProject() {
                 </p>
               </div>
             </div>
-            <button
-              class="btn-danger-action"
-              @click="handleDeleteProject"
-            >
-              Supprimer le projet
-            </button>
+            <div v-if="!isConfirmingDelete">
+              <button
+                class="btn-danger-action"
+                @click="isConfirmingDelete = true"
+              >
+                Supprimer le projet
+              </button>
+            </div>
+            <div v-else class="danger-confirm-row">
+              <span class="danger-confirm-warning">
+                ⚠️ Confirmez-vous le retrait définitif de ce projet d'AiderStudio ?
+              </span>
+              <div class="danger-btns">
+                <button class="btn-danger-action" @click="handleDeleteProject">
+                  Oui, supprimer définitivement
+                </button>
+                <button class="btn-secondary" @click="isConfirmingDelete = false">
+                  Annuler
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -502,6 +540,78 @@ function handleDeleteProject() {
   white-space: nowrap;
 }
 
+.aiderignore-card {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 9px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(129, 140, 248, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.aiderignore-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.aiderignore-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.card-tag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+
+.tag-ok {
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.tag-warn {
+  background: rgba(245, 158, 11, 0.2);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.aiderignore-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.aiderignore-desc {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.create-ignore-btn {
+  border: 1px solid var(--accent);
+  background: var(--active-bg);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.create-ignore-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
 .pane-header-row {
   display: flex;
   align-items: flex-start;
@@ -683,6 +793,28 @@ function handleDeleteProject() {
 
 .btn-danger-action:hover {
   opacity: 0.9;
+}
+
+.danger-confirm-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 8px;
+}
+
+.danger-confirm-warning {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ef4444;
+}
+
+.danger-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .modal-footer {

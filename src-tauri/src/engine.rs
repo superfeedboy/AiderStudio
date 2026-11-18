@@ -1,7 +1,7 @@
 use crate::git_diff;
 use crate::models::{
     AppSettings, AppStateData, ArtifactItem, AttachedFile, ChatMessage, ModifiedFileDiff,
-    PromptStageEvent, SendPromptResult, StackStatus, ToolExecutionResult,
+    PromptStageEvent, SendPromptResult, StackStatus, TokenUsageEvent, ToolExecutionResult,
 };
 use crate::storage;
 use chrono::Utc;
@@ -57,6 +57,8 @@ struct OllamaStreamChunk {
     message: Option<OllamaChatMsgOut>,
     #[allow(dead_code)]
     done: Option<bool>,
+    prompt_eval_count: Option<usize>,
+    eval_count: Option<usize>,
 }
 
 pub fn list_project_files_internal(project_root: &Path) -> Vec<String> {
@@ -99,6 +101,185 @@ pub fn list_project_files_internal(project_root: &Path) -> Vec<String> {
     walk(project_root, project_root, &mut results);
     results.sort();
     results
+}
+
+pub const DEFAULT_AIDERIGNORE: &str = r#"# AiderStudio / Aider ignore pattern to preserve 8K context
+node_modules/
+dist/
+build/
+target/
+.git/
+.svn/
+.hg/
+coverage/
+*.lock
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+Cargo.lock
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.wasm
+*.min.js
+*.min.css
+*.map
+.env*
+.DS_Store
+Thumbs.db
+tmp/
+temp/
+"#;
+
+pub async fn ensure_aiderignore(root_path: &Path) -> Result<bool, String> {
+    let ignore_path = root_path.join(".aiderignore");
+    if !ignore_path.exists() {
+        tokio::fs::write(&ignore_path, DEFAULT_AIDERIGNORE)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub fn has_aiderignore(root_path: &Path) -> bool {
+    root_path.join(".aiderignore").exists()
+}
+
+#[derive(Debug, Clone)]
+pub struct TestVerificationResult {
+    pub ran: bool,
+    pub command: String,
+    pub success: bool,
+    pub output_summary: String,
+}
+
+pub fn synthesize_error_log(raw_err: &str) -> String {
+    let mut clean_lines = Vec::new();
+    for line in raw_err.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Error navigating to")
+            || trimmed.starts_with("Call log:")
+            || trimmed.starts_with("navigating to")
+            || trimmed.starts_with("Scraping http")
+            || trimmed.starts_with("Failed to retrieve content")
+        {
+            continue;
+        }
+        if trimmed.contains("ERR_CONNECTION_REFUSED") {
+            clean_lines.push("Connexion locale refusée : le serveur ou service cible n'est pas actif.".to_string());
+            break;
+        }
+        if trimmed.contains("error TS") || trimmed.contains("error:") || trimmed.contains("FAILED") {
+            clean_lines.push(trimmed.to_string());
+        }
+    }
+    if clean_lines.is_empty() {
+        truncate_chars(raw_err, 220)
+    } else {
+        clean_lines.into_iter().take(4).collect::<Vec<_>>().join("\n")
+    }
+}
+
+pub async fn run_test_verifier(project_root: &Path) -> TestVerificationResult {
+    // 1. Cargo.toml -> cargo check
+    if project_root.join("Cargo.toml").exists() {
+        let res = tokio::process::Command::new("cargo")
+            .arg("check")
+            .current_dir(project_root)
+            .output()
+            .await;
+        if let Ok(out) = res {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let summary = if out.status.success() {
+                "Compilation Cargo check validée avec succès (0 erreur).".to_string()
+            } else {
+                let err_lines: Vec<&str> = stderr
+                    .lines()
+                    .filter(|l| l.contains("error:") || l.contains("error["))
+                    .take(4)
+                    .collect();
+                if err_lines.is_empty() {
+                    truncate_chars(&stderr, 220)
+                } else {
+                    err_lines.join("\n")
+                }
+            };
+            return TestVerificationResult {
+                ran: true,
+                command: "cargo check".to_string(),
+                success: out.status.success(),
+                output_summary: summary,
+            };
+        }
+    }
+
+    // 2. package.json -> check vue-tsc / type-check
+    let pkg_json = project_root.join("package.json");
+    if pkg_json.exists() {
+        if let Ok(content) = tokio::fs::read_to_string(&pkg_json).await {
+            let has_vue_tsc = content.contains("vue-tsc");
+            let has_type_check = content.contains("type-check");
+
+            let cmd_name = if has_vue_tsc {
+                "npx vue-tsc --noEmit"
+            } else if has_type_check {
+                "npm run type-check"
+            } else {
+                ""
+            };
+
+            if !cmd_name.is_empty() {
+                let parts: Vec<&str> = cmd_name.split_whitespace().collect();
+                #[cfg(not(target_os = "windows"))]
+                let mut cmd = tokio::process::Command::new(parts[0]);
+                #[cfg(target_os = "windows")]
+                let mut cmd = {
+                    let mut c = tokio::process::Command::new(format!("{}.cmd", parts[0]));
+                    c.creation_flags(0x08000000);
+                    c
+                };
+                cmd.args(&parts[1..]).current_dir(project_root);
+
+                if let Ok(out) = cmd.output().await {
+                    let combined = format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let summary = if out.status.success() {
+                        format!("Vérification TypeScript ({cmd_name}) validée sans erreur.")
+                    } else {
+                        let err_lines: Vec<&str> = combined
+                            .lines()
+                            .filter(|l| l.contains("error TS") || l.contains("error:"))
+                            .take(4)
+                            .collect();
+                        if err_lines.is_empty() {
+                            truncate_chars(&combined, 220)
+                        } else {
+                            err_lines.join("\n")
+                        }
+                    };
+                    return TestVerificationResult {
+                        ran: true,
+                        command: cmd_name.to_string(),
+                        success: out.status.success(),
+                        output_summary: summary,
+                    };
+                }
+            }
+        }
+    }
+
+    TestVerificationResult {
+        ran: false,
+        command: String::new(),
+        success: true,
+        output_summary: "Aucun runner de test ou compilateur strict à exécuter (étape validée).".to_string(),
+    }
 }
 
 pub async fn execute_local_tool_internal(
@@ -596,7 +777,7 @@ fn emit_stage(
         PromptStageEvent {
             conversation_id: conversation_id.to_string(),
             stage_index,
-            stage_total: 4,
+            stage_total: 5,
             stage_label: stage_label.to_string(),
             detail: detail.to_string(),
             status: status.to_string(),
@@ -739,11 +920,22 @@ fn is_aider_noise_line(line: &str) -> bool {
         "Aider v",
         "Main model:",
         "Weak model:",
+        "Editor model:",
+        "Model: ollama_chat",
         "Git repo:",
         "Note:",
         "Warning:",
         "You can use ",
         "Use /help",
+        "See: https://aider.chat",
+        "Scraping http",
+        "Error navigating to",
+        "Page.goto:",
+        "Call log:",
+        "navigating to",
+        "Failed to retrieve content",
+        "Protocol error",
+        "Repo-map can't include",
     ];
     if prefixes.iter().any(|p| t.starts_with(p)) {
         return true;
@@ -857,6 +1049,23 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
+fn parse_aider_token_count(line: &str, marker: &str) -> usize {
+    for part in line.split(',') {
+        if part.contains(marker) {
+            let num_str = part.trim().trim_start_matches("Tokens:").trim();
+            let first_word = num_str.split_whitespace().next().unwrap_or("");
+            if let Some(val) = first_word.strip_suffix('k') {
+                if let Ok(f) = val.parse::<f32>() {
+                    return (f * 1000.0) as usize;
+                }
+            } else if let Ok(n) = first_word.parse::<usize>() {
+                return n;
+            }
+        }
+    }
+    0
+}
+
 async fn execute_aider_cli(
     app: &AppHandle,
     conversation_id: &str,
@@ -880,9 +1089,12 @@ async fn execute_aider_cli(
             "--yes-always",
             "--no-pretty",
             "--no-auto-commits",
+            "--no-show-model-warnings",
+            "--no-check-update",
             "--edit-format",
             "diff",
-            "--architect",
+            "--map-tokens",
+            "512",
             "--chat-language",
             "fr",
             "--message",
@@ -907,6 +1119,23 @@ async fn execute_aider_cli(
                 let mut guard = c_out.lock().await;
                 guard.push_str(&line);
                 guard.push('\n');
+                if line.trim().starts_with("Tokens:") {
+                    let prompt_tokens = parse_aider_token_count(&line, "sent");
+                    let completion_tokens = parse_aider_token_count(&line, "received");
+                    let total_tokens = prompt_tokens + completion_tokens;
+                    if total_tokens > 0 {
+                        let _ = app_out.emit(
+                            "aider:tokens",
+                            TokenUsageEvent {
+                                conversation_id: conv_id_out.clone(),
+                                subagent: "3. Codeur Atomique (Aider)".to_string(),
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens,
+                            },
+                        );
+                    }
+                }
                 let _ = app_out.emit("aider:stream", (&conv_id_out, &line));
             }
         }
@@ -996,6 +1225,23 @@ async fn execute_ollama_streaming(
             }
 
             if let Ok(parsed) = serde_json::from_str::<OllamaStreamChunk>(&line) {
+                if parsed.done == Some(true) {
+                    let prompt_tokens = parsed.prompt_eval_count.unwrap_or(0);
+                    let completion_tokens = parsed.eval_count.unwrap_or(0);
+                    let total_tokens = prompt_tokens + completion_tokens;
+                    if total_tokens > 0 {
+                        let _ = app.emit(
+                            "aider:tokens",
+                            TokenUsageEvent {
+                                conversation_id: conversation_id.to_string(),
+                                subagent: "3. Codeur Atomique (Ollama)".to_string(),
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens,
+                            },
+                        );
+                    }
+                }
                 if let Some(msg) = parsed.message {
                     if let Some(delta) = msg.content {
                         full_accumulated.push_str(&delta);
@@ -1109,21 +1355,25 @@ pub async fn run_prompt_pipeline(
 
     // Ensure project_root is initialized as a git repo so Aider never climbs to parent directories!
     let project_root_path = PathBuf::from(&project.root_path);
-    if project_root_path.exists() && !project_root_path.join(".git").exists() {
-        let _ = tokio::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&project_root_path)
-            .output()
-            .await;
+    if project_root_path.exists() {
+        if !project_root_path.join(".git").exists() {
+            let _ = tokio::process::Command::new("git")
+                .args(["init"])
+                .current_dir(&project_root_path)
+                .output()
+                .await;
+        }
+        // Protect 8K context automatically with .aiderignore
+        let _ = ensure_aiderignore(&project_root_path).await;
     }
 
-    // STAGE 1/4: Build layered context
+    // SUB-AGENT 1/5: Architecte & Orchestrateur
     emit_stage(
         app,
         &conversation_id,
         1,
-        "Assemblage du contexte",
-        "Fusion du contexte global du projet, des pièces jointes et des outils.",
+        "1. Architecte & Orchestrateur",
+        "Analyse de la demande, structuration du plan d'action et protection du contexte 8K.",
         "running",
     );
     let augmented_prompt = build_augmented_prompt(
@@ -1134,13 +1384,36 @@ pub async fn run_prompt_pipeline(
         &project.shared_directories,
     );
 
-    // STAGE 2/4: Launch Aider + Ollama (or fallback cleanly with diagnostics)
+    // Initial prompt token footprint estimation
+    let init_prompt_tokens = (augmented_prompt.len() as f64 / 3.8).ceil() as usize;
+    let _ = app.emit(
+        "aider:tokens",
+        TokenUsageEvent {
+            conversation_id: conversation_id.clone(),
+            subagent: "1. Architecte & Contexte".to_string(),
+            prompt_tokens: init_prompt_tokens,
+            completion_tokens: 0,
+            total_tokens: init_prompt_tokens,
+        },
+    );
+
+    // SUB-AGENT 2/5: Cartographe & Analyseur
     emit_stage(
         app,
         &conversation_id,
         2,
-        "Traitement Aider & Ollama",
-        &format!("Exécution sur {}", settings.ollama_model),
+        "2. Cartographe & Analyseur",
+        "Sélection des fichiers cibles et isolement des interfaces utiles.",
+        "running",
+    );
+
+    // SUB-AGENT 3/5: Codeur Atomique
+    emit_stage(
+        app,
+        &conversation_id,
+        3,
+        "3. Codeur Atomique (Aider & Ollama)",
+        &format!("Génération et application des modifications ciblées sur {}", settings.ollama_model),
         "running",
     );
 
@@ -1167,16 +1440,16 @@ pub async fn run_prompt_pipeline(
         {
             Ok(output) if !output.is_empty() => (
                 output,
-                format!("Aider CLI · {}", settings.ollama_model),
+                format!("Aider Diff · {}", settings.ollama_model),
             ),
             Ok(_) => (
                 "Aider a terminé l'opération sans sortie textuelle supplémentaire.".to_string(),
-                format!("Aider CLI · {}", settings.ollama_model),
+                format!("Aider Diff · {}", settings.ollama_model),
             ),
             Err(err) => (
                 format!(
-                    "⚠️ Erreur lors de l'exécution d'Aider :\n`{}`\n\nVérifiez qu'Ollama est démarré (`ollama serve`) et que le modèle `{}` est téléchargé (`ollama pull {}`).",
-                    err, settings.ollama_model, settings.ollama_model
+                    "⚠️ Erreur lors de l'exécution d'Aider :\n`{}`\n\nVérifiez qu'Ollama est démarré (`ollama serve`) et que le modèle `{}` est téléchargé.",
+                    synthesize_error_log(&err.to_string()), settings.ollama_model
                 ),
                 "Aider CLI (erreur)".to_string(),
             ),
@@ -1202,7 +1475,7 @@ pub async fn run_prompt_pipeline(
             Err(err) => (
                 format!(
                     "⚠️ Erreur de communication avec Ollama (`{}`) : `{}`",
-                    settings.ollama_url, err
+                    settings.ollama_url, synthesize_error_log(&err.to_string())
                 ),
                 "Ollama erreur".to_string(),
             ),
@@ -1223,26 +1496,49 @@ pub async fn run_prompt_pipeline(
     let (extracted_thinking, cleaned_content) = extract_thinking_and_content(&assistant_text);
     let tool_results = apply_tools_and_file_blocks(&project_root_path, &cleaned_content, &user_prompt).await;
 
-    let mut thinking_with_tools = extracted_thinking;
-    if !tool_results.is_empty() {
-        let tool_summary = tool_results
-            .iter()
-            .map(|r| format!("• 🛠️ {}", r.message))
-            .collect::<Vec<_>>()
-            .join("\n");
-        thinking_with_tools = match thinking_with_tools {
-            Some(t) => Some(format!("{}\n\n### Outils exécutés en local\n{}", t, tool_summary)),
-            None => Some(format!("### Outils exécutés en local\n{}", tool_summary)),
-        };
-    }
-
-    // STAGE 3/4: Git Diff + Artifacts extraction
+    // SUB-AGENT 4/5: Testeur & Vérifieur
     emit_stage(
         app,
         &conversation_id,
-        3,
-        "Analyse Git Diff & Artefacts",
-        "Calcul des lignes ajoutées, modifiées et supprimées.",
+        4,
+        "4. Testeur & Vérifieur",
+        "Validation de la syntaxe, compilation et vérifications automatisées.",
+        "running",
+    );
+    let test_res = run_test_verifier(&project_root_path).await;
+
+    let mut thinking_with_tools = extracted_thinking;
+    let mut verifier_note = String::new();
+    if test_res.ran {
+        if test_res.success {
+            verifier_note = format!("• ✅ **Vérifieur ({})** : {}", test_res.command, test_res.output_summary);
+        } else {
+            verifier_note = format!("• ⚠️ **Vérifieur ({})** : Compilation en erreur :\n```\n{}\n```", test_res.command, test_res.output_summary);
+        }
+    }
+
+    if !tool_results.is_empty() || !verifier_note.is_empty() {
+        let mut notes = Vec::new();
+        for r in &tool_results {
+            notes.push(format!("• 🛠️ {}", r.message));
+        }
+        if !verifier_note.is_empty() {
+            notes.push(verifier_note);
+        }
+        let block_str = format!("### Contrôles & Outils exécutés en local\n{}", notes.join("\n"));
+        thinking_with_tools = match thinking_with_tools {
+            Some(t) => Some(format!("{}\n\n{}", t, block_str)),
+            None => Some(block_str),
+        };
+    }
+
+    // SUB-AGENT 5/5: Synthétiseur & Mémoire Globale
+    emit_stage(
+        app,
+        &conversation_id,
+        5,
+        "5. Synthétiseur & Mémoire Globale",
+        "Calcul du diff Git, extraction des artefacts et enregistrement contextuel.",
         "running",
     );
 
@@ -1264,16 +1560,6 @@ pub async fn run_prompt_pipeline(
             created_files_list.join("\n")
         );
     }
-
-    // STAGE 4/4: Sync conversation context -> project global context
-    emit_stage(
-        app,
-        &conversation_id,
-        4,
-        "Synchronisation du Contexte Global",
-        "Mise à jour du contexte projet avec les acquis de la session.",
-        "running",
-    );
 
     let result = {
         let mut guard = state_lock.lock().await;

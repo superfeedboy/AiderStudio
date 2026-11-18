@@ -7,6 +7,7 @@ export interface AppSettings {
   ollamaModel: string;
   aiderPath: string;
   autoStartOllama: boolean;
+  contextWindowTokens?: number;
 }
 
 export interface Project {
@@ -122,6 +123,14 @@ export interface HardwareTelemetry {
   memPercent: number;
   tempCelsius: number | null;
   platform: string;
+}
+
+export interface TokenUsageEvent {
+  conversationId: string;
+  subagent: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
 }
 
 export interface PromptStageEvent {

@@ -16,6 +16,7 @@ import type {
   SendPromptResult,
   StackStatus,
   ThemePreference,
+  TokenUsageEvent,
   ToolExecutionResult,
 } from "../types/studio";
 
@@ -121,7 +122,19 @@ export const useStudioStore = defineStore("studio", () => {
     );
   });
 
-  const contextTokensMax = ref<number>(8192);
+  const contextTokensMax = computed<number>(() => {
+    return settings.value.contextWindowTokens && settings.value.contextWindowTokens > 0
+      ? settings.value.contextWindowTokens
+      : 8192;
+  });
+
+  // Track live token usage per conversation emitted by subagents (Ollama / Aider)
+  const conversationTokenUsage = ref<Record<string, TokenUsageEvent>>({});
+
+  const lastCallTokens = computed<TokenUsageEvent | null>(() => {
+    if (!activeConversationId.value) return null;
+    return conversationTokenUsage.value[activeConversationId.value] ?? null;
+  });
 
   const contextTokensUsed = computed<number>(() => {
     let totalChars = 0;
@@ -137,8 +150,21 @@ export const useStudioStore = defineStore("studio", () => {
     return Math.ceil(totalChars / 3.8);
   });
 
+  // Active call tokens is the peak load of the current sub-agent call,
+  // falling back to rolling session memory if no call has been made yet
+  const activeCallTokens = computed<number>(() => {
+    if (lastCallTokens.value && lastCallTokens.value.totalTokens > 0) {
+      return lastCallTokens.value.totalTokens;
+    }
+    return contextTokensUsed.value;
+  });
+
   const contextPercent = computed<number>(() => {
     return Math.min(100, Math.round((contextTokensUsed.value / contextTokensMax.value) * 100));
+  });
+
+  const activeContextPercent = computed<number>(() => {
+    return Math.min(100, Math.round((activeCallTokens.value / contextTokensMax.value) * 100));
   });
 
   const conversationsForProject = (projectId: string) =>
@@ -158,6 +184,7 @@ export const useStudioStore = defineStore("studio", () => {
     activeConversationId.value = data.activeConversationId;
     mcpServers.value = data.mcpServers ?? [];
     applyThemeToDom();
+    void checkAiderignore();
   }
 
   let initialized = false;
@@ -179,6 +206,16 @@ export const useStudioStore = defineStore("studio", () => {
 
       await listen<PromptStageEvent>("aider:stage", (event) => {
         currentStage.value = event.payload;
+      });
+
+      await listen<TokenUsageEvent>("aider:tokens", (event) => {
+        const payload = event.payload;
+        if (payload && payload.conversationId) {
+          conversationTokenUsage.value = {
+            ...conversationTokenUsage.value,
+            [payload.conversationId]: payload,
+          };
+        }
       });
 
       await listen<[string, string]>("aider:stream", (event) => {
@@ -486,6 +523,41 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
+  const hasAiderignore = ref<boolean>(true);
+
+  async function checkAiderignore(projectId?: string): Promise<boolean> {
+    if (!isTauri()) {
+      hasAiderignore.value = true;
+      return true;
+    }
+    try {
+      const exists = await invoke<boolean>("check_project_aiderignore", {
+        projectId: projectId ?? activeProjectId.value,
+      });
+      hasAiderignore.value = exists;
+      return exists;
+    } catch {
+      hasAiderignore.value = true;
+      return true;
+    }
+  }
+
+  async function ensureAiderignore(projectId?: string): Promise<boolean> {
+    if (!isTauri()) {
+      hasAiderignore.value = true;
+      return true;
+    }
+    try {
+      const created = await invoke<boolean>("ensure_project_aiderignore", {
+        projectId: projectId ?? activeProjectId.value,
+      });
+      hasAiderignore.value = true;
+      return created;
+    } catch {
+      return false;
+    }
+  }
+
   async function executeTool(
     toolName: string,
     args: Record<string, any>,
@@ -558,8 +630,8 @@ export const useStudioStore = defineStore("studio", () => {
       return;
     }
 
-    // Force /compact automatically at 95% threshold to prevent LLM overflow
-    if (contextPercent.value >= 75) {
+    // Force /compact automatically at 90% threshold to prevent LLM overflow
+    if (activeContextPercent.value >= 90) {
       await compactConversation(conv.id);
     }
 
@@ -570,9 +642,9 @@ export const useStudioStore = defineStore("studio", () => {
     currentStage.value = {
       conversationId: conv.id,
       stageIndex: 1,
-      stageTotal: 4,
-      stageLabel: "Démarrage du traitement",
-      detail: "Préparation du contexte...",
+      stageTotal: 5,
+      stageLabel: "1. Architecte & Orchestrateur",
+      detail: "Initialisation du pipeline multi-agents...",
       status: "running",
     };
 
@@ -789,6 +861,9 @@ export const useStudioStore = defineStore("studio", () => {
     promptDeleteConversation,
     confirmDeleteConversation,
     sendPrompt,
+    hasAiderignore,
+    checkAiderignore,
+    ensureAiderignore,
     refreshDiff,
     openReview,
     openArtifact,
@@ -799,9 +874,13 @@ export const useStudioStore = defineStore("studio", () => {
     executeMcpTool,
     clearGlobalContext,
     clearConversationContext,
+    conversationTokenUsage,
+    lastCallTokens,
+    activeCallTokens,
     contextTokensMax,
     contextTokensUsed,
     contextPercent,
+    activeContextPercent,
     compactConversation,
   };
 });

@@ -2,10 +2,21 @@ use crate::models::HardwareTelemetry;
 use regex::Regex;
 use tokio::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 async fn run_cmd_output(program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
     let output = tokio::time::timeout(
         std::time::Duration::from_millis(1200),
-        Command::new(program).args(args).output(),
+        cmd.output(),
     )
     .await
     .ok()?

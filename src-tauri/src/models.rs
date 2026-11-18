@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_context_window() -> usize {
+    8192
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -8,6 +12,8 @@ pub struct AppSettings {
     pub ollama_model: String,
     pub aider_path: String,
     pub auto_start_ollama: bool,
+    #[serde(default = "default_context_window")]
+    pub context_window_tokens: usize,
 }
 
 impl Default for AppSettings {
@@ -18,6 +24,7 @@ impl Default for AppSettings {
             ollama_model: "qwen2.5-coder:3b".to_string(),
             aider_path: "aider".to_string(),
             auto_start_ollama: true,
+            context_window_tokens: 8192,
         }
     }
 }
@@ -172,6 +179,16 @@ pub struct HardwareTelemetry {
     pub mem_percent: f32,
     pub temp_celsius: Option<f32>,
     pub platform: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageEvent {
+    pub conversation_id: String,
+    pub subagent: String,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

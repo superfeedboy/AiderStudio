@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import hljs from "highlight.js";
+import "highlight.js/styles/github-dark.css";
 import { useStudioStore } from "../stores/studio";
-import type { AttachedFile, ChatMessage } from "../types/studio";
+import type { AttachedFile, ChatMessage, ModifiedFileDiff } from "../types/studio";
 import AppLogo from "./AppLogo.vue";
 import LeHud from "./LeHud.vue";
 
@@ -13,8 +15,52 @@ const promptDraft = ref("");
 const showStreamLogs = ref(false);
 const nowTick = ref(Date.now());
 const copiedBlockKey = ref<string | null>(null);
+const copiedPromptId = ref<string | null>(null);
 const previewModalImage = ref<string | null>(null);
 const isDraggingOver = ref(false);
+
+// Files dropdown open state per message ID
+const openFilesDropdown = ref<Record<string, boolean>>({});
+const liveTab = ref<"thinking" | "stream">("thinking");
+
+watch(
+  () => store.isProcessing,
+  (processing) => {
+    if (processing) {
+      liveTab.value = "thinking";
+    }
+  }
+);
+
+async function toggleFilesDropdown(msgId: string) {
+  const willOpen = !openFilesDropdown.value[msgId];
+  openFilesDropdown.value[msgId] = willOpen;
+
+  await nextTick();
+
+  if (scrollRef.value) {
+    const wrapEl = document.getElementById(`diff-dropdown-${msgId}`);
+    if (willOpen) {
+      if (wrapEl) {
+        wrapEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+      // Scroll forcé pour faire remonter le dropdown et éviter qu'il ne soit masqué par le prompt
+      window.setTimeout(() => {
+        if (scrollRef.value) {
+          scrollRef.value.scrollTop = Math.min(
+            scrollRef.value.scrollHeight,
+            scrollRef.value.scrollTop + 180
+          );
+        }
+      }, 90);
+    } else {
+      // Re-scroll pour réajuster le flux dès qu'on le range
+      if (wrapEl) {
+        wrapEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    }
+  }
+}
 
 // Thinking state per message
 const openThinkingIds = ref<Set<string>>(new Set());
@@ -155,18 +201,50 @@ const filteredMentions = computed<MentionItem[]>(() => {
 });
 
 let tickTimer: number | null = null;
+let streamObserver: MutationObserver | null = null;
+
+function scrollToBottom(force = false) {
+  nextTick(() => {
+    if (scrollRef.value) {
+      scrollRef.value.scrollTop = scrollRef.value.scrollHeight;
+      requestAnimationFrame(() => {
+        if (scrollRef.value) {
+          scrollRef.value.scrollTop = scrollRef.value.scrollHeight;
+        }
+      });
+    }
+  });
+}
 
 onMounted(() => {
   void refreshProjectFiles();
   tickTimer = window.setInterval(() => {
     nowTick.value = Date.now();
   }, 30_000);
+
+  // Smooth autoscroll during live LLM streaming
+  if (scrollRef.value) {
+    streamObserver = new MutationObserver(() => {
+      if (store.isProcessing) {
+        scrollToBottom();
+      }
+    });
+    streamObserver.observe(scrollRef.value, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+  }
 });
 
 onBeforeUnmount(() => {
   if (tickTimer !== null) {
     clearInterval(tickTimer);
     tickTimer = null;
+  }
+  if (streamObserver) {
+    streamObserver.disconnect();
+    streamObserver = null;
   }
 });
 
@@ -190,13 +268,16 @@ const lastAssistantIndex = computed(() => {
 
 // Auto-scroll to bottom when messages or live output update
 watch(
-  [() => messages.value.length, () => store.liveContent, () => store.liveThinking],
-  async () => {
-    await nextTick();
-    if (scrollRef.value) {
-      scrollRef.value.scrollTop = scrollRef.value.scrollHeight;
-    }
-  }
+  [
+    () => messages.value.length,
+    () => store.liveContent,
+    () => store.liveThinking,
+    () => store.isProcessing,
+  ],
+  () => {
+    scrollToBottom();
+  },
+  { flush: "post" }
 );
 
 type InlineToken =
@@ -211,7 +292,7 @@ type MarkdownBlock =
   | { kind: "quote"; tokens: InlineToken[] }
   | { kind: "ul"; items: { indent: number; tokens: InlineToken[] }[] }
   | { kind: "ol"; items: InlineToken[][] }
-  | { kind: "code"; lang: string; body: string };
+  | { kind: "code"; lang: string; body: string; filename?: string };
 
 function tokenizeInline(input: string): InlineToken[] {
   const tokens: InlineToken[] = [];
@@ -330,9 +411,86 @@ function parseMarkdownProse(prose: string): MarkdownBlock[] {
   return blocks;
 }
 
+function guessFilename(lang: string, body: string, explicitHint?: string): string {
+  if (explicitHint && explicitHint.trim()) {
+    const clean = explicitHint.trim().replace(/^["':\s]+|["':\s]+$/g, "");
+    if (clean) {
+      const parts = clean.split("/");
+      return parts[parts.length - 1];
+    }
+  }
+
+  // Check first line for comment with filename (e.g. // src/App.vue or # file.py)
+  const firstLine = (body.trim().split("\n")[0] || "").trim();
+  const commentMatch = /^(?:\/\/|#|\/\*|<!--)\s*([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)/.exec(firstLine);
+  if (commentMatch) {
+    const parts = commentMatch[1].split("/");
+    return parts[parts.length - 1];
+  }
+
+  const cleanLang = (lang || "").toLowerCase().trim();
+  const extMap: Record<string, string> = {
+    vue: "Component.vue",
+    ts: "script.ts",
+    typescript: "script.ts",
+    js: "script.js",
+    javascript: "script.js",
+    rs: "main.rs",
+    rust: "main.rs",
+    py: "script.py",
+    python: "script.py",
+    html: "index.html",
+    css: "styles.css",
+    scss: "styles.scss",
+    sql: "query.sql",
+    json: "data.json",
+    yaml: "config.yaml",
+    yml: "config.yaml",
+    toml: "config.toml",
+    sh: "script.sh",
+    bash: "script.sh",
+    zsh: "script.sh",
+    md: "document.md",
+    markdown: "document.md",
+  };
+
+  return extMap[cleanLang] || `code.${cleanLang || "txt"}`;
+}
+
+function renderCodeHtml(code: string, lang: string): string {
+  const cleanLang = (lang || "").trim().toLowerCase();
+  try {
+    if (cleanLang && hljs.getLanguage(cleanLang)) {
+      return hljs.highlight(code, { language: cleanLang, ignoreIllegals: true }).value;
+    }
+    return hljs.highlightAuto(code).value;
+  } catch {
+    return code
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+}
+
+function downloadCodeBlock(code: string, filename: string) {
+  try {
+    const blob = new Blob([code], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  } catch {
+    // Ignore download errors
+  }
+}
+
 function parseMarkdownMessage(content: string): MarkdownBlock[] {
   const blocks: MarkdownBlock[] = [];
-  const fenceRegex = /```([a-zA-Z0-9_\-+]*)\n([\s\S]*?)```/g;
+  const fenceRegex = /```([a-zA-Z0-9_\-+]*)(?:[ :]([^\n]+))?\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -342,8 +500,10 @@ function parseMarkdownMessage(content: string): MarkdownBlock[] {
       blocks.push(...parseMarkdownProse(prose));
     }
     const lang = (match[1] || "code").trim();
-    const body = match[2] ?? "";
-    blocks.push({ kind: "code", lang, body });
+    const hint = (match[2] || "").trim();
+    const body = match[3] ?? "";
+    const filename = guessFilename(lang, body, hint);
+    blocks.push({ kind: "code", lang, body, filename });
     lastIndex = fenceRegex.lastIndex;
   }
 
@@ -413,6 +573,68 @@ function messageDiffStats(
     };
   }
   return null;
+}
+
+function getFileListForMessage(msg: ChatMessage, idx: number): ModifiedFileDiff[] {
+  if (idx === lastAssistantIndex.value && conv.value?.modifiedFiles) {
+    return conv.value.modifiedFiles;
+  }
+  return [];
+}
+
+function getFileStatus(file: ModifiedFileDiff): "created" | "modified" | "deleted" {
+  if (file.removed === 0 && file.added > 0) return "created";
+  if (file.added === 0 && file.removed > 0) return "deleted";
+  return "modified";
+}
+
+function getFileStatusLabel(file: ModifiedFileDiff): string {
+  const status = getFileStatus(file);
+  if (status === "created") return "CRÉÉ";
+  if (status === "deleted") return "SUPPRIMÉ";
+  return "MODIFIÉ";
+}
+
+function getFilesBreakdown(
+  msg: ChatMessage,
+  idx: number
+): { created: number; modified: number; deleted: number } {
+  const files = getFileListForMessage(msg, idx);
+  let created = 0;
+  let modified = 0;
+  let deleted = 0;
+  for (const f of files) {
+    const s = getFileStatus(f);
+    if (s === "created") created++;
+    else if (s === "deleted") deleted++;
+    else modified++;
+  }
+  return { created, modified, deleted };
+}
+
+async function copyPrompt(content: string, msgId: string) {
+  try {
+    await navigator.clipboard.writeText(content);
+    copiedPromptId.value = msgId;
+    window.setTimeout(() => {
+      if (copiedPromptId.value === msgId) {
+        copiedPromptId.value = null;
+      }
+    }, 1600);
+  } catch {
+    // Ignore clipboard failure
+  }
+}
+
+function rerunPrompt(content: string) {
+  promptDraft.value = content;
+  scrollToBottom(true);
+  nextTick(() => {
+    if (textareaRef.value) {
+      textareaRef.value.focus();
+      textareaRef.value.setSelectionRange(content.length, content.length);
+    }
+  });
 }
 
 function openFilePicker() {
@@ -544,7 +766,9 @@ async function handleSubmit() {
   promptDraft.value = "";
   attachedFiles.value = [];
   mentionOpen.value = false;
+  scrollToBottom(true);
   await store.sendPrompt(text, files);
+  scrollToBottom(true);
 }
 
 function handleKeydown(ev: KeyboardEvent) {
@@ -655,44 +879,91 @@ async function copyCodeBlock(key: string, code: string) {
         >
           <!-- USER MESSAGE -->
           <div v-if="msg.role === 'user'" class="user-msg-col">
-            <div class="user-bubble">
-              <!-- Attached images in user message -->
-              <div
-                v-if="msg.attachments && msg.attachments.some((a) => a.isImage)"
-                class="msg-gallery"
-              >
-                <img
-                  v-for="att in msg.attachments.filter((a) => a.isImage)"
-                  :key="att.id"
-                  :src="att.dataUrl"
-                  :alt="att.name"
-                  class="msg-img-thumb"
-                  title="Cliquer pour agrandir"
-                  @click="previewModalImage = att.dataUrl || null"
-                />
-              </div>
-
-              <!-- Attached files chips in user message -->
-              <div
-                v-if="msg.attachments && msg.attachments.some((a) => !a.isImage)"
-                class="msg-files"
-              >
-                <span
-                  v-for="att in msg.attachments.filter((a) => !a.isImage)"
-                  :key="att.id"
-                  class="file-badge"
+            <div class="user-bubble-box">
+              <div class="user-bubble">
+                <!-- Attached images in user message -->
+                <div
+                  v-if="msg.attachments && msg.attachments.some((a) => a.isImage)"
+                  class="msg-gallery"
                 >
-                  <svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                    <polyline points="14 2 14 8 20 8" />
-                  </svg>
-                  <span class="file-name">{{ att.name }}</span>
-                  <span class="file-size">({{ formatFileSize(att.size) }})</span>
-                </span>
+                  <img
+                    v-for="att in msg.attachments.filter((a) => a.isImage)"
+                    :key="att.id"
+                    :src="att.dataUrl"
+                    :alt="att.name"
+                    class="msg-img-thumb"
+                    title="Cliquer pour agrandir"
+                    @click="previewModalImage = att.dataUrl || null"
+                  />
+                </div>
+
+                <!-- Attached files chips in user message -->
+                <div
+                  v-if="msg.attachments && msg.attachments.some((a) => !a.isImage)"
+                  class="msg-files"
+                >
+                  <span
+                    v-for="att in msg.attachments.filter((a) => !a.isImage)"
+                    :key="att.id"
+                    class="file-badge"
+                  >
+                    <svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                    </svg>
+                    <span class="file-name">{{ att.name }}</span>
+                    <span class="file-size">({{ formatFileSize(att.size) }})</span>
+                  </span>
+                </div>
+
+                <p class="msg-text">{{ msg.content }}</p>
               </div>
 
-              <p class="msg-text">{{ msg.content }}</p>
+              <!-- User prompt hover action buttons (copier, relancer) -->
+              <div class="user-hover-actions">
+                <button
+                  class="user-action-pill"
+                  :title="copiedPromptId === msg.id ? 'Prompt copié !' : 'Copier le prompt'"
+                  @click="copyPrompt(msg.content, msg.id)"
+                >
+                  <svg
+                    v-if="copiedPromptId !== msg.id"
+                    class="u-act-icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+                    <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+                  </svg>
+                  <svg
+                    v-else
+                    class="u-act-icon text-success"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.2"
+                  >
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                </button>
+
+                <button
+                  class="user-action-pill"
+                  title="Relancer ce prompt"
+                  @click="rerunPrompt(msg.content)"
+                >
+                  <svg class="u-act-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 2v6h-6" />
+                    <path d="M3 12a9 9 0 0 1 15.5-6.4L21 8" />
+                    <path d="M3 22v-6h6" />
+                    <path d="M21 12a9 9 0 0 1-15.5 6.4L3 16" />
+                  </svg>
+                </button>
+              </div>
             </div>
+
             <div class="msg-timestamp is-right">
               Vous · {{ formatRelativeTime(msg.createdAt) }}
             </div>
@@ -805,42 +1076,58 @@ async function copyCodeBlock(key: string, code: string) {
                   class="msg-code-block halo-hud"
                 >
                   <div class="code-toolbar">
-                    <span class="code-lang">{{ block.lang }}</span>
-                    <button
-                      class="code-copy-btn"
-                      :class="{ copied: copiedBlockKey === `${msg.id}-${bIdx}` }"
-                      title="Copier le code"
-                      @click="copyCodeBlock(`${msg.id}-${bIdx}`, block.body)"
-                    >
-                      <svg
-                        v-if="copiedBlockKey !== `${msg.id}-${bIdx}`"
-                        class="copy-icon"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
+                    <div class="code-toolbar-info">
+                      <span class="code-lang">{{ block.lang }}</span>
+                      <span v-if="block.filename" class="code-filename-pill">{{ block.filename }}</span>
+                    </div>
+                    <div class="code-toolbar-actions">
+                      <!-- Bouton Télécharger le code (icône Remix download) -->
+                      <button
+                        class="code-btn-icon"
+                        title="Télécharger le code"
+                        @click="downloadCodeBlock(block.body, block.filename || guessFilename(block.lang, block.body))"
                       >
-                        <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
-                        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-                      </svg>
-                      <svg
-                        v-else
-                        class="copy-icon"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2.2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
+                        <svg class="code-icon" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M3 19H21V21H3V19ZM13 9H18L12 16L6 9H11V3H13V9Z" />
+                        </svg>
+                      </button>
+
+                      <!-- Bouton Copier le code (icône seule agrandie) -->
+                      <button
+                        class="code-btn-icon"
+                        :class="{ copied: copiedBlockKey === `${msg.id}-${bIdx}` }"
+                        title="Copier le code"
+                        @click="copyCodeBlock(`${msg.id}-${bIdx}`, block.body)"
                       >
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
-                      <span>{{ copiedBlockKey === `${msg.id}-${bIdx}` ? "Copié !" : "Copier" }}</span>
-                    </button>
+                        <svg
+                          v-if="copiedBlockKey !== `${msg.id}-${bIdx}`"
+                          class="code-icon"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+                          <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+                        </svg>
+                        <svg
+                          v-else
+                          class="code-icon text-success"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2.3"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        >
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                      </button>
+                    </div>
                   </div>
-                  <pre class="code-pre custom-scroll"><code>{{ block.body }}</code></pre>
+                  <pre class="code-pre custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
                 </div>
 
                 <p v-else-if="block.kind === 'paragraph'" class="md-p">
@@ -854,22 +1141,97 @@ async function copyCodeBlock(key: string, code: string) {
               </template>
             </div>
 
-            <!-- Clickable files/lines summary -> opens review in "le code" -->
-            <button
+            <!-- Dropdown Sélecteur des fichiers modifiés avec diff -->
+            <div
               v-if="messageDiffStats(msg, msgIdx)"
-              class="review-summary-btn"
-              @click="store.openReview()"
+              :id="'diff-dropdown-' + msg.id"
+              class="diff-dropdown-wrap"
+              :class="{ 'is-open': openFilesDropdown[msg.id] }"
             >
-              <span>
-                {{ messageDiffStats(msg, msgIdx)!.filesChanged }}
-                fichier{{ messageDiffStats(msg, msgIdx)!.filesChanged > 1 ? "s" : "" }}
-                modifié{{ messageDiffStats(msg, msgIdx)!.filesChanged > 1 ? "s" : "" }}
-              </span>
-              <span class="diff-sep">·</span>
-              <span class="c-add">+{{ messageDiffStats(msg, msgIdx)!.linesAdded }}</span>
-              <span class="c-del">-{{ messageDiffStats(msg, msgIdx)!.linesRemoved }}</span>
-              <span class="review-cta">Voir la review →</span>
-            </button>
+              <button
+                class="diff-dropdown-trigger"
+                :title="openFilesDropdown[msg.id] ? 'Masquer la liste des fichiers modifiés' : 'Afficher les fichiers modifiés et leurs modifications'"
+                @click="toggleFilesDropdown(msg.id)"
+              >
+                <div class="diff-trigger-left">
+                  <svg class="diff-git-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="18" cy="18" r="3" />
+                    <circle cx="6" cy="6" r="3" />
+                    <path d="M6 9v12" />
+                    <path d="M18 9a9 9 0 0 1-9 9" />
+                  </svg>
+                  <span class="diff-trigger-title">
+                    {{ messageDiffStats(msg, msgIdx)!.filesChanged }}
+                    fichier{{ messageDiffStats(msg, msgIdx)!.filesChanged > 1 ? "s" : "" }} modifié{{ messageDiffStats(msg, msgIdx)!.filesChanged > 1 ? "s" : "" }}
+                  </span>
+                </div>
+
+                <div class="diff-trigger-right">
+                  <span class="diff-badge-add">+{{ messageDiffStats(msg, msgIdx)!.linesAdded }}</span>
+                  <span class="diff-badge-del">-{{ messageDiffStats(msg, msgIdx)!.linesRemoved }}</span>
+                  <svg
+                    class="diff-chevron-arrow"
+                    :class="{ rotated: openFilesDropdown[msg.id] }"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.2"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </div>
+              </button>
+
+              <!-- Menu déroulant Dropdown -->
+              <div v-if="openFilesDropdown[msg.id]" class="diff-dropdown-menu halo-hud custom-scroll">
+                <div class="diff-menu-header">
+                  <span class="diff-menu-header-text">Fichiers modifiés</span>
+                  <div class="diff-menu-stats-row">
+                    <span v-if="getFilesBreakdown(msg, msgIdx).created > 0" class="badge-mini-status tag-created">
+                      +{{ getFilesBreakdown(msg, msgIdx).created }} créé{{ getFilesBreakdown(msg, msgIdx).created > 1 ? "s" : "" }}
+                    </span>
+                    <span v-if="getFilesBreakdown(msg, msgIdx).modified > 0" class="badge-mini-status tag-modified">
+                      ~{{ getFilesBreakdown(msg, msgIdx).modified }} modifié{{ getFilesBreakdown(msg, msgIdx).modified > 1 ? "s" : "" }}
+                    </span>
+                    <span v-if="getFilesBreakdown(msg, msgIdx).deleted > 0" class="badge-mini-status tag-deleted">
+                      -{{ getFilesBreakdown(msg, msgIdx).deleted }} supprimé{{ getFilesBreakdown(msg, msgIdx).deleted > 1 ? "s" : "" }}
+                    </span>
+                  </div>
+                </div>
+
+                <div v-if="getFileListForMessage(msg, msgIdx).length === 0" class="diff-menu-empty">
+                  Aucun détail de fichier spécifique pour ce message.
+                </div>
+                <div v-else class="diff-menu-list">
+                  <div
+                    v-for="file in getFileListForMessage(msg, msgIdx)"
+                    :key="file.path"
+                    class="diff-menu-row"
+                    title="Cliquer pour afficher la review"
+                    @click="store.openReview(file.path)"
+                  >
+                    <span class="menu-state-badge" :class="getFileStatus(file)">
+                      {{ getFileStatusLabel(file) }}
+                    </span>
+                    <span class="menu-file-path">{{ file.path }}</span>
+                    <div class="menu-file-delta">
+                      <span v-if="file.added > 0" class="c-add">+{{ file.added }}</span>
+                      <span v-if="file.removed > 0" class="c-del">-{{ file.removed }}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="diff-menu-footer">
+                  <button class="diff-full-review-cta" @click="store.openReview()">
+                    <span>Ouvrir l'éditeur de review complet</span>
+                    <svg class="cta-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                      <polyline points="12 5 19 12 12 19" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
 
             <!-- Relative Timestamp -->
             <div class="msg-timestamp">
@@ -881,22 +1243,56 @@ async function copyCodeBlock(key: string, code: string) {
         <!-- LIVE STREAMING CARD (Displayed while IA is processing) -->
         <div v-if="store.isProcessing" class="msg-wrapper is-assistant is-live">
           <article class="assistant-article live-article">
-            <!-- Live Thinking block -->
+            <!-- Live Thinking block avec Flux Aider intégré -->
             <div class="thinking-block live-thinking">
               <div class="thinking-header is-live">
                 <div class="thinking-title">
                   <svg class="brain-icon pulsing" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
                     <path d="M12 2a5 5 0 0 1 5 5c0 .7-.1 1.4-.4 2a5 5 0 0 1 3.4 5.8 4.5 4.5 0 0 1-2 7.2A4.5 4.5 0 0 1 12 22a4.5 4.5 0 0 1-6 0 4.5 4.5 0 0 1-2-7.2A5 5 0 0 1 7.4 9 5 5 0 0 1 12 2z" />
                   </svg>
-                  <span>Réflexion de l'IA</span>
+                  <span>Activité de l'IA</span>
                 </div>
-                <span class="thinking-badge running">
-                  <span class="pulse-dot" />
-                  Réflexion en cours...
-                </span>
+
+                <!-- Onglets Réflexion / Flux Aider intégrés sous le prompt -->
+                <div class="thinking-tabs-group">
+                  <button
+                    type="button"
+                    class="live-tab-pill"
+                    :class="{ active: liveTab === 'thinking' }"
+                    @click="liveTab = 'thinking'"
+                  >
+                    Réflexion
+                  </button>
+                  <button
+                    type="button"
+                    class="live-tab-pill"
+                    :class="{ active: liveTab === 'stream' }"
+                    @click="liveTab = 'stream'"
+                  >
+                    Flux Aider
+                    <span v-if="store.liveStreamLines.length > 0" class="stream-count-dot">
+                      {{ store.liveStreamLines.length }}
+                    </span>
+                  </button>
+                  <span class="thinking-badge running">
+                    <span class="pulse-dot" />
+                    {{ store.currentStage?.stageLabel || "En cours..." }}
+                  </span>
+                </div>
               </div>
+
               <div class="thinking-body live-body custom-scroll">
-                <pre class="thinking-text">{{ store.liveThinking || "Analyse du prompt, sélection des outils et préparation du code..." }}</pre>
+                <!-- Vue Réflexion -->
+                <pre
+                  v-if="liveTab === 'thinking'"
+                  class="thinking-text"
+                >{{ store.liveThinking || "Analyse du prompt, sélection des outils et préparation du code..." }}</pre>
+
+                <!-- Vue Flux Aider intégrée -->
+                <pre
+                  v-else
+                  class="stream-log-live custom-scroll"
+                >{{ store.liveStreamLines.length > 0 ? store.liveStreamLines.join("\n") : "En attente des premières lignes du moteur Aider..." }}</pre>
               </div>
             </div>
 
@@ -915,9 +1311,12 @@ async function copyCodeBlock(key: string, code: string) {
                 </h2>
                 <div v-else-if="block.kind === 'code'" class="msg-code-block halo-hud">
                   <div class="code-toolbar">
-                    <span class="code-lang">{{ block.lang }}</span>
+                    <div class="code-toolbar-info">
+                      <span class="code-lang">{{ block.lang }}</span>
+                      <span v-if="block.filename" class="code-filename-pill">{{ block.filename }}</span>
+                    </div>
                   </div>
-                  <pre class="code-pre custom-scroll"><code>{{ block.body }}</code></pre>
+                  <pre class="code-pre custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
                 </div>
                 <p v-else-if="block.kind === 'paragraph'" class="md-p">
                   <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
@@ -956,40 +1355,9 @@ async function copyCodeBlock(key: string, code: string) {
       @change="onFileInputChange"
     />
 
-    <!-- Bottom: Aider Processing Tracker + Prompt Input -->
+    <!-- Bottom: Prompt Input -->
     <footer class="disc-footer">
       <div class="footer-inner">
-        <!-- Live prompt processing status bar -->
-        <div
-          v-if="store.isProcessing || store.currentStage"
-          class="stage-bar"
-        >
-          <div class="stage-bar-main">
-            <span
-              class="stage-dot"
-              :class="store.currentStage?.status || 'running'"
-            />
-            <span class="stage-title">
-              Étape {{ store.currentStage?.stageIndex ?? 1 }}/{{ store.currentStage?.stageTotal ?? 4 }}
-              · {{ store.currentStage?.stageLabel || "Traitement en cours" }}
-            </span>
-            <span class="stage-detail">{{ store.currentStage?.detail }}</span>
-          </div>
-
-          <button
-            v-if="store.liveStreamLines.length > 0"
-            class="logs-toggle"
-            @click="showStreamLogs = !showStreamLogs"
-          >
-            {{ showStreamLogs ? "Masquer flux" : "Flux Aider" }}
-          </button>
-        </div>
-
-        <pre
-          v-if="showStreamLogs && store.liveStreamLines.length > 0"
-          class="stream-log custom-scroll"
-        >{{ store.liveStreamLines.join("\n") }}</pre>
-
         <!-- Prompt composer with rotating rainbow border during thinking -->
         <div class="composer-wrapper">
           <!-- Mention (@) Autocompletion Popover -->
@@ -1299,7 +1667,7 @@ async function copyCodeBlock(key: string, code: string) {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  padding: 16px 32px;
+  padding: 16px 32px 42px;
 }
 
 .welcome-state {
@@ -1370,6 +1738,13 @@ async function copyCodeBlock(key: string, code: string) {
   gap: 4px;
 }
 
+.user-bubble-box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
 .user-bubble {
   border: 1px solid var(--border-subtle);
   background: var(--surface-elevated);
@@ -1378,6 +1753,54 @@ async function copyCodeBlock(key: string, code: string) {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  font-family: var(--font-response);
+}
+
+.user-hover-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  pointer-events: none;
+}
+
+.user-msg-col:hover .user-hover-actions {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.user-action-pill {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s ease;
+}
+
+.user-action-pill:hover {
+  background: var(--hover-bg);
+  color: var(--text-main);
+  border-color: var(--accent);
+}
+
+.u-act-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.u-act-icon.text-success {
+  color: #10b981;
 }
 
 .msg-gallery {
@@ -1446,6 +1869,7 @@ async function copyCodeBlock(key: string, code: string) {
   flex-direction: column;
   gap: 12px;
   line-height: 1.6;
+  font-family: var(--font-response);
 }
 
 /* Thinking block (Réflexion de l'IA) */
@@ -1497,6 +1921,59 @@ async function copyCodeBlock(key: string, code: string) {
   gap: 8px;
 }
 
+.thinking-tabs-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.live-tab-pill {
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--text-muted);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.live-tab-pill:hover {
+  background: var(--hover-bg);
+  color: var(--text-main);
+  border-color: var(--accent);
+}
+
+.live-tab-pill.active {
+  background: var(--active-bg);
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.stream-count-dot {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  padding: 0 5px;
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+.stream-log-live {
+  margin: 0;
+  font-family: var(--font-code);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .thinking-badge {
   font-size: 10.5px;
   font-weight: 500;
@@ -1546,7 +2023,7 @@ async function copyCodeBlock(key: string, code: string) {
 
 .thinking-text {
   margin: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--text-muted);
@@ -1625,89 +2102,388 @@ async function copyCodeBlock(key: string, code: string) {
   border: 1px solid var(--border-subtle);
   border-radius: 5px;
   padding: 1px 5px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   font-size: 12px;
   color: var(--accent-2);
 }
 
+/* Code Blocks with strong contrast in dark mode */
 .msg-code-block {
   border-radius: 10px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  background: #0d1117;
+  background: #151922;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow: 0 4px 16px -2px rgba(0, 0, 0, 0.4);
+}
+
+:root[data-theme="light"] .msg-code-block {
+  background: #f8fafc;
+  border: 1px solid rgba(15, 23, 42, 0.15);
+  box-shadow: 0 4px 14px -2px rgba(15, 23, 42, 0.08);
 }
 
 .code-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.03);
+  padding: 7px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+:root[data-theme="light"] .code-toolbar {
+  background: rgba(0, 0, 0, 0.03);
+  border-bottom: 1px solid rgba(15, 23, 42, 0.1);
+}
+
+.code-toolbar-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .code-lang {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   font-size: 11px;
-  color: var(--text-dim);
-  text-transform: lowercase;
+  font-weight: 600;
+  color: var(--accent-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
-.code-copy-btn {
+.code-filename-pill {
+  font-family: var(--font-code);
+  font-size: 11px;
+  background: var(--surface-elevated);
   border: 1px solid var(--border-subtle);
-  background: var(--table-bg);
-  color: var(--text-muted);
-  border-radius: 6px;
-  padding: 2px 7px;
-  font-size: 11px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  cursor: pointer;
-}
-
-.code-copy-btn:hover {
-  background: var(--hover-bg);
+  border-radius: 4px;
+  padding: 1px 6px;
   color: var(--text-main);
 }
 
-.code-copy-btn.copied {
+.code-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.code-btn-icon {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--text-muted);
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s ease;
+}
+
+.code-btn-icon:hover {
+  background: var(--hover-bg);
+  color: var(--text-main);
+  border-color: var(--accent);
+}
+
+.code-btn-icon.copied {
   color: #10b981;
   border-color: #10b981;
 }
 
-.copy-icon {
-  width: 12px;
-  height: 12px;
+.code-icon {
+  width: 14.5px;
+  height: 14.5px;
+}
+
+.code-icon.text-success {
+  color: #10b981;
 }
 
 .code-pre {
   margin: 0;
-  padding: 12px;
+  padding: 12px 14px;
   overflow-x: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   font-size: 12.5px;
-  line-height: 1.5;
-  color: #e2e8f0;
+  line-height: 1.55;
+  background: transparent !important;
 }
 
-.review-summary-btn {
+.code-pre code {
+  font-family: var(--font-code) !important;
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+/* Accordéon dropdown des fichiers impactés */
+.files-impact-accordion {
   align-self: flex-start;
+  width: 100%;
+  max-width: 680px;
   margin-top: 4px;
   border: 1px solid var(--border-subtle);
   background: var(--surface-elevated);
-  border-radius: 8px;
-  padding: 6px 11px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 12px;
+  border-radius: 9px;
+  overflow: hidden;
+  transition: border-color 0.15s ease;
 }
 
-.review-summary-btn:hover {
+.files-impact-accordion:hover {
+  border-color: rgba(129, 140, 248, 0.4);
+}
+
+.files-impact-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-main);
+  gap: 10px;
+}
+
+.files-impact-header:hover {
+  background: var(--hover-bg);
+}
+
+.impact-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Vrai Dropdown Sélecteur des fichiers modifiés */
+.diff-dropdown-wrap {
+  position: relative;
+  align-self: flex-start;
+  margin-top: 4px;
+  display: inline-flex;
+  flex-direction: column;
+}
+
+.diff-dropdown-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--text-main);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+}
+
+.diff-dropdown-trigger:hover {
+  background: var(--hover-bg);
   border-color: var(--accent);
+  box-shadow: 0 0 10px var(--halo-soft);
+}
+
+.diff-trigger-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.diff-git-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+
+.diff-trigger-title {
+  font-weight: 600;
+}
+
+.diff-trigger-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-code);
+  font-size: 11px;
+}
+
+.diff-badge-add {
+  color: var(--diff-add-bar);
+  font-weight: 700;
+}
+
+.diff-badge-del {
+  color: var(--diff-del-bar);
+  font-weight: 700;
+}
+
+.diff-chevron-arrow {
+  width: 13px;
+  height: 13px;
+  color: var(--text-muted);
+  transition: transform 0.18s ease;
+}
+
+.diff-chevron-arrow.rotated {
+  transform: rotate(180deg);
+}
+
+/* Menu Dropdown déroulant */
+.diff-dropdown-menu {
+  margin-top: 6px;
+  min-width: 380px;
+  max-width: 540px;
+  max-height: 280px;
+  overflow-y: auto;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--table-bg);
+  box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  z-index: 20;
+}
+
+.diff-menu-header {
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.diff-menu-header-text {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.diff-menu-stats-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.badge-mini-status {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.diff-menu-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.diff-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: background 0.12s ease;
+  font-size: 11.5px;
+}
+
+.diff-menu-row:last-child {
+  border-bottom: none;
+}
+
+.diff-menu-row:hover {
+  background: var(--hover-bg);
+}
+
+.menu-state-badge {
+  font-family: var(--font-code);
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.menu-state-badge.created {
+  background: rgba(16, 185, 129, 0.2);
+  color: #10b981;
+}
+
+.menu-state-badge.modified {
+  background: rgba(59, 130, 246, 0.2);
+  color: #3b82f6;
+}
+
+.menu-state-badge.deleted {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+}
+
+.menu-file-path {
+  flex: 1;
+  font-family: var(--font-code);
+  font-size: 11px;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-file-delta {
+  font-family: var(--font-code);
+  font-size: 11px;
+  display: inline-flex;
+  gap: 5px;
+}
+
+.diff-menu-empty {
+  padding: 12px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.diff-menu-footer {
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.diff-full-review-cta {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+
+.diff-full-review-cta:hover {
+  background: var(--active-bg);
+  text-decoration: underline;
+}
+
+.cta-arrow {
+  width: 12px;
+  height: 12px;
 }
 
 .c-add {

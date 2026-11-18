@@ -76,6 +76,9 @@ async fn create_project(
     guard.active_project_id = Some(project_id);
     guard.active_conversation_id = Some(conv_id);
 
+    // Create recommended .aiderignore automatically to protect 8K context
+    let _ = engine::ensure_aiderignore(std::path::Path::new(&root_path)).await;
+
     storage::save_state(&guard)
         .await
         .map_err(|e| e.to_string())?;
@@ -386,9 +389,12 @@ async fn pick_project_directory() -> Result<Option<String>, String> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let script = "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Sélectionnez le répertoire du projet'; $f.UseDescriptionForTitle = $true; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }";
-        let output = tokio::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+        let mut cmd = tokio::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script]);
+        cmd.creation_flags(0x08000000);
+        let output = cmd
             .output()
             .await
             .map_err(|e| e.to_string())?;
@@ -502,6 +508,40 @@ async fn execute_mcp_tool(
     .await
 }
 
+#[tauri::command]
+async fn check_project_aiderignore(
+    state: State<'_, ManagedState>,
+    project_id: Option<String>,
+) -> Result<bool, String> {
+    let guard = state.0.lock().await;
+    let pid = project_id
+        .or_else(|| guard.active_project_id.clone())
+        .ok_or_else(|| "Aucun projet actif".to_string())?;
+    let proj = guard
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| "Projet introuvable".to_string())?;
+    Ok(engine::has_aiderignore(std::path::Path::new(&proj.root_path)))
+}
+
+#[tauri::command]
+async fn ensure_project_aiderignore(
+    state: State<'_, ManagedState>,
+    project_id: Option<String>,
+) -> Result<bool, String> {
+    let guard = state.0.lock().await;
+    let pid = project_id
+        .or_else(|| guard.active_project_id.clone())
+        .ok_or_else(|| "Aucun projet actif".to_string())?;
+    let proj = guard
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| "Projet introuvable".to_string())?;
+    engine::ensure_aiderignore(std::path::Path::new(&proj.root_path)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -535,7 +575,9 @@ pub fn run() {
             save_mcp_server,
             delete_mcp_server,
             test_mcp_server,
-            execute_mcp_tool
+            execute_mcp_tool,
+            check_project_aiderignore,
+            ensure_project_aiderignore
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
