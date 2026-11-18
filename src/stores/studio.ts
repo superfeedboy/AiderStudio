@@ -93,7 +93,7 @@ export const useStudioStore = defineStore("studio", () => {
   // System dark/light tracking
   const systemPrefersLight = ref<boolean>(
     typeof window !== "undefined" &&
-      window.matchMedia("(prefers-color-scheme: light)").matches
+    window.matchMedia("(prefers-color-scheme: light)").matches
   );
 
   const effectiveTheme = computed<"dark" | "light">(() => {
@@ -559,7 +559,7 @@ export const useStudioStore = defineStore("studio", () => {
     }
 
     // Force /compact automatically at 95% threshold to prevent LLM overflow
-    if (contextPercent.value >= 95) {
+    if (contextPercent.value >= 75) {
       await compactConversation(conv.id);
     }
 
