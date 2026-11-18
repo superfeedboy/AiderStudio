@@ -27,10 +27,22 @@ struct OllamaModelTag {
 }
 
 #[derive(Debug, Serialize)]
+struct OllamaOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
 struct OllamaChatRequest<'a> {
     model: &'a str,
     stream: bool,
     messages: Vec<OllamaChatMsg<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,9 +54,10 @@ struct OllamaChatMsg<'a> {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct OllamaChatResponse {
     message: Option<OllamaChatMsgOut>,
+    prompt_eval_count: Option<usize>,
+    eval_count: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -919,6 +932,10 @@ fn extract_artifacts_from_markdown(text: &str) -> Vec<ArtifactItem> {
         if code.len() < 12 {
             continue;
         }
+        // Exclude raw SEARCH/REPLACE diff blocks from becoming artifacts
+        if code.contains("<<<<<<< SEARCH") || code.contains(">>>>>>> REPLACE") {
+            continue;
+        }
         // Exclude internal tool call JSON strings from becoming artifacts
         if code.starts_with("{\"name\":") && code.contains("\"arguments\":") {
             continue;
@@ -1009,6 +1026,154 @@ fn build_augmented_prompt(
     parts.join("\n\n")
 }
 
+fn effective_num_ctx(settings: &AppSettings) -> usize {
+    let ctx = if settings.context_window_tokens == 0 {
+        8192
+    } else {
+        settings.context_window_tokens
+    };
+    ctx.clamp(2048, 131072)
+}
+
+async fn call_ollama_oneshot(
+    settings: &AppSettings,
+    system_prompt: &str,
+    user_prompt: &str,
+    num_predict: usize,
+    temperature: f32,
+) -> anyhow::Result<(String, usize, usize)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()?;
+    let url = format!("{}/api/chat", settings.ollama_url.trim_end_matches('/'));
+
+    let payload = OllamaChatRequest {
+        model: settings.ollama_model.trim(),
+        stream: false,
+        messages: vec![
+            OllamaChatMsg {
+                role: "system",
+                content: system_prompt,
+                images: None,
+            },
+            OllamaChatMsg {
+                role: "user",
+                content: user_prompt,
+                images: None,
+            },
+        ],
+        options: Some(OllamaOptions {
+            num_ctx: Some(effective_num_ctx(settings)),
+            num_predict: Some(num_predict),
+            temperature: Some(temperature),
+        }),
+    };
+
+    let resp = client.post(url).json(&payload).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Ollama HTTP {}", resp.status());
+    }
+    let parsed: OllamaChatResponse = resp.json().await?;
+    let content = parsed
+        .message
+        .and_then(|m| m.content)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok((
+        content,
+        parsed.prompt_eval_count.unwrap_or(0),
+        parsed.eval_count.unwrap_or(0),
+    ))
+}
+
+fn compact_conv_ctx_for_prompt(
+    conv_ctx: &str,
+    max_custom_chars: usize,
+    max_recent_bullets: usize,
+) -> String {
+    let mut custom_lines = Vec::new();
+    let mut bullet_lines = Vec::new();
+    for raw in conv_ctx.lines() {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("• [") {
+            bullet_lines.push(t.to_string());
+        } else {
+            custom_lines.push(t.to_string());
+        }
+    }
+
+    let mut sections = Vec::new();
+    if !custom_lines.is_empty() {
+        sections.push(truncate_chars(&custom_lines.join("\n"), max_custom_chars));
+    }
+    if !bullet_lines.is_empty() && max_recent_bullets > 0 {
+        let start = bullet_lines.len().saturating_sub(max_recent_bullets);
+        sections.push(bullet_lines[start..].join("\n"));
+    }
+    sections.join("\n")
+}
+
+pub fn update_rolling_conversation_context(
+    prev_conv_ctx: &str,
+    new_entry: &str,
+    max_bullets: usize,
+) -> String {
+    let mut custom_lines = Vec::new();
+    let mut bullets = Vec::new();
+    for raw in prev_conv_ctx.lines() {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("• [") {
+            bullets.push(t.to_string());
+        } else {
+            custom_lines.push(t.to_string());
+        }
+    }
+
+    let trimmed_entry = new_entry.trim();
+    if !trimmed_entry.is_empty() {
+        bullets.push(trimmed_entry.to_string());
+    }
+    if bullets.len() > max_bullets {
+        let excess = bullets.len() - max_bullets;
+        bullets.drain(0..excess);
+    }
+
+    let mut all_lines = custom_lines;
+    all_lines.extend(bullets);
+    let combined = all_lines.join("\n");
+    if combined.chars().count() <= 2500 {
+        return combined;
+    }
+
+    // If still too long, drop oldest bullet lines first while preserving newest entries & user objective
+    let mut final_custom = Vec::new();
+    let mut final_bullets = Vec::new();
+    for raw in combined.lines() {
+        if raw.starts_with("• [") {
+            final_bullets.push(raw.to_string());
+        } else {
+            final_custom.push(raw.to_string());
+        }
+    }
+    while final_bullets.len() > 1 {
+        let test = [final_custom.clone(), final_bullets.clone()]
+            .concat()
+            .join("\n");
+        if test.chars().count() <= 2500 {
+            return test;
+        }
+        final_bullets.remove(0);
+    }
+    truncate_chars(&[final_custom, final_bullets].concat().join("\n"), 2500)
+}
+
 fn build_aider_prompt(
     global_ctx: &str,
     conv_ctx: &str,
@@ -1018,16 +1183,24 @@ fn build_aider_prompt(
 ) -> String {
     let mut parts = Vec::new();
     if !global_ctx.trim().is_empty() {
-        parts.push(format!("[Contexte global du projet]\n{}", global_ctx.trim()));
+        parts.push(format!(
+            "[Contexte global]\n{}",
+            truncate_chars(global_ctx.trim(), 1000)
+        ));
     }
     if !shared_dirs.is_empty() {
         parts.push(format!(
-            "[Dossiers partagés et répertoires de ressources mis à disposition]\n{}",
-            shared_dirs.iter().map(|d| format!("- {}", d)).collect::<Vec<_>>().join("\n")
+            "[Dossiers partagés]\n{}",
+            shared_dirs
+                .iter()
+                .map(|d| format!("- {}", d))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
-    if !conv_ctx.trim().is_empty() {
-        parts.push(format!("[Objectif & Contexte spécifique de cette discussion]\n{}", conv_ctx.trim()));
+    let compact_conv = compact_conv_ctx_for_prompt(conv_ctx, 400, 2);
+    if !compact_conv.is_empty() {
+        parts.push(format!("[Objectif discussion]\n{}", compact_conv));
     }
     if let Some(att_list) = attachments {
         for att in att_list {
@@ -1038,8 +1211,406 @@ fn build_aider_prompt(
             }
         }
     }
-    parts.push(format!("[Demande utilisateur]\n{}", user_prompt.trim()));
+    parts.push("[Consigne] Réponds en français de façon très concise (2 à 3 phrases max pour expliquer la modification).".to_string());
+    parts.push(format!("[Demande]\n{}", user_prompt.trim()));
     parts.join("\n\n")
+}
+
+pub fn list_source_files_for_cartographer(project_root: &Path) -> Vec<String> {
+    let all = list_project_files_internal(project_root);
+    let excluded_names = [
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "cargo.lock",
+        ".ds_store",
+        "thumbs.db",
+    ];
+    let excluded_suffixes = [
+        ".min.js", ".min.css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff",
+        ".woff2", ".ttf", ".eot", ".pdf", ".mov", ".mp4", ".mp3", ".zip", ".wasm", ".sqlite",
+        ".sqlite3", ".db", ".map",
+    ];
+
+    all.into_iter()
+        .filter(|rel| {
+            let lower = rel.to_lowercase();
+            let base = lower.rsplit('/').next().unwrap_or(&lower);
+            !excluded_names.contains(&base)
+                && !excluded_suffixes.iter().any(|ext| lower.ends_with(ext))
+        })
+        .collect()
+}
+
+fn match_candidate_in_files(
+    candidate: &str,
+    prompt_lower: &str,
+    all_files: &[String],
+) -> Option<String> {
+    let cand = candidate.trim_start_matches('@').trim_start_matches("./").trim();
+    if cand.is_empty() || cand.starts_with("http") || !cand.contains('.') || cand.ends_with('.') {
+        return None;
+    }
+    let ext = cand.rsplit('.').next().unwrap_or("");
+    if ext.is_empty() || ext.len() > 8 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    // 1. Exact relative path match
+    if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
+        return Some(found.clone());
+    }
+
+    // 2. Path suffix match
+    let cand_lower = cand.to_lowercase();
+    let suffix = format!("/{cand_lower}");
+    if let Some(found) = all_files.iter().find(|f| f.to_lowercase().ends_with(&suffix)) {
+        return Some(found.clone());
+    }
+
+    // 3. Exact basename match (disambiguate using parent directory if mentioned in prompt, else shortest path)
+    let mut basename_matches: Vec<&String> = all_files
+        .iter()
+        .filter(|f| {
+            let base = f.rsplit('/').next().unwrap_or(f.as_str());
+            base.eq_ignore_ascii_case(cand)
+        })
+        .collect();
+
+    if basename_matches.is_empty() {
+        return None;
+    }
+    basename_matches.sort_by_key(|f| {
+        let parent_mentioned = f
+            .rsplit('/')
+            .nth(1)
+            .map(|dir| !dir.is_empty() && prompt_lower.contains(&dir.to_lowercase()))
+            .unwrap_or(false);
+        (!parent_mentioned, f.len())
+    });
+    Some(basename_matches[0].clone())
+}
+
+pub fn match_files_deterministically(
+    user_prompt: &str,
+    attachments: Option<&[AttachedFile]>,
+    all_files: &[String],
+) -> (Vec<String>, bool) {
+    let mut matched: Vec<String> = Vec::new();
+    let prompt_lower = user_prompt.to_lowercase();
+
+    for raw_tok in user_prompt.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'' | '`')
+    }) {
+        let cleaned = raw_tok.trim_end_matches(|c: char| matches!(c, '.' | ':' | '?' | '!'));
+        if let Some(found) = match_candidate_in_files(cleaned, &prompt_lower, all_files) {
+            if !matched.contains(&found) {
+                matched.push(found);
+                if matched.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if matched.len() < 3 {
+        if let Some(att_list) = attachments {
+            for att in att_list {
+                if !att.is_image {
+                    if let Some(found) =
+                        match_candidate_in_files(&att.name, &prompt_lower, all_files)
+                    {
+                        if !matched.contains(&found) {
+                            matched.push(found);
+                            if matched.len() >= 3 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !matched.is_empty() {
+        return (matched, true);
+    }
+
+    // Fallback: safe toolchain config keyword hints (only if the file actually exists in all_files)
+    let mut add_if_exists = |cand: &str| {
+        if matched.len() >= 2 {
+            return;
+        }
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
+            if !matched.contains(found) {
+                matched.push(found.clone());
+            }
+        }
+    };
+
+    if prompt_lower.contains("vite") {
+        if all_files.iter().any(|f| f.eq_ignore_ascii_case("vite.config.ts")) {
+            add_if_exists("vite.config.ts");
+        } else {
+            add_if_exists("vite.config.js");
+        }
+        if ["script", "start", "démarre", "demarre", "serveur", "server", "build", "dev"]
+            .iter()
+            .any(|kw| prompt_lower.contains(kw))
+        {
+            add_if_exists("package.json");
+        }
+    }
+    if prompt_lower.contains("tauri") {
+        add_if_exists("src-tauri/tauri.conf.json");
+    }
+    if prompt_lower.contains("tsconfig") {
+        add_if_exists("tsconfig.json");
+    }
+    if prompt_lower.contains("cargo") {
+        add_if_exists("src-tauri/Cargo.toml");
+    }
+    if prompt_lower.contains("package.json")
+        || prompt_lower.contains("dépendance")
+        || prompt_lower.contains("dependance")
+        || prompt_lower.contains("dependencies")
+    {
+        add_if_exists("package.json");
+    }
+
+    (matched, false)
+}
+
+fn filter_files_by_size_budget(
+    project_root: &Path,
+    candidates: Vec<String>,
+    max_files: usize,
+    max_single_bytes: u64,
+    max_total_bytes: u64,
+) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for rel in candidates {
+        if kept.len() >= max_files {
+            break;
+        }
+        if rel.contains("..") {
+            continue;
+        }
+        let full = project_root.join(&rel);
+        let Ok(meta) = std::fs::metadata(&full) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let size = meta.len();
+        if size > max_single_bytes || (total_bytes > 0 && total_bytes + size > max_total_bytes) {
+            continue;
+        }
+        total_bytes += size;
+        kept.push(rel);
+    }
+
+    kept
+}
+
+#[derive(Debug, Clone)]
+struct CartographerPlan {
+    target_files: Vec<String>,
+    explicit_match: bool,
+    strategy_note: String,
+    cartographer_tokens: Option<(usize, usize)>,
+}
+
+async fn run_cartographer(
+    project_root: &Path,
+    user_prompt: &str,
+    attachments: Option<&[AttachedFile]>,
+    settings: &AppSettings,
+    ollama_running: bool,
+) -> CartographerPlan {
+    let all_files = list_source_files_for_cartographer(project_root);
+    if all_files.is_empty() {
+        return CartographerPlan {
+            target_files: Vec::new(),
+            explicit_match: false,
+            strategy_note: "Projet sans fichiers indexés".to_string(),
+            cartographer_tokens: None,
+        };
+    }
+
+    let (tier1, explicit) = match_files_deterministically(user_prompt, attachments, &all_files);
+    let budgeted_tier1 = filter_files_by_size_budget(project_root, tier1, 3, 20_480, 28_672);
+    if !budgeted_tier1.is_empty() {
+        return CartographerPlan {
+            target_files: budgeted_tier1,
+            explicit_match: explicit,
+            strategy_note: if explicit {
+                "0 tok déterministe (mention directe)".to_string()
+            } else {
+                "0 tok déterministe (mot-clé outillage)".to_string()
+            },
+            cartographer_tokens: None,
+        };
+    }
+
+    if !ollama_running || all_files.len() < 2 {
+        return CartographerPlan {
+            target_files: Vec::new(),
+            explicit_match: false,
+            strategy_note: "Aucun fichier cible pré-résolu (repo-map Aider)".to_string(),
+            cartographer_tokens: None,
+        };
+    }
+
+    if all_files.len() > 400 {
+        return CartographerPlan {
+            target_files: Vec::new(),
+            explicit_match: false,
+            strategy_note: "Dépôt volumineux (>400 fichiers) · repo-map Aider".to_string(),
+            cartographer_tokens: None,
+        };
+    }
+
+    let mut prioritized = Vec::new();
+    let mut others = Vec::new();
+    for f in &all_files {
+        if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
+            prioritized.push(f.clone());
+        } else {
+            others.push(f.clone());
+        }
+    }
+    prioritized.extend(others);
+    let compact_files: Vec<String> = prioritized.into_iter().take(100).collect();
+
+    let sys = "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum 3 chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication.";
+    let user = format!(
+        "Fichiers:\n{}\n\nDemande:\n{}",
+        compact_files.join("\n"),
+        truncate_chars(user_prompt.trim(), 400)
+    );
+
+    match call_ollama_oneshot(settings, sys, &user, 100, 0.0).await {
+        Ok((reply, p_tok, c_tok)) => {
+            let mut routed = Vec::new();
+            if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
+                if start < end {
+                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&reply[start..=end]) {
+                        for cand in arr {
+                            let clean = cand.trim().trim_start_matches("./");
+                            if let Some(canon) =
+                                all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
+                            {
+                                if !routed.contains(canon) {
+                                    routed.push(canon.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let budgeted = filter_files_by_size_budget(project_root, routed, 3, 20_480, 28_672);
+            let note = if budgeted.is_empty() {
+                "Routeur IA (aucun fichier ciblé)".to_string()
+            } else {
+                "Routeur IA léger".to_string()
+            };
+            CartographerPlan {
+                target_files: budgeted,
+                explicit_match: false,
+                strategy_note: note,
+                cartographer_tokens: Some((p_tok, c_tok)),
+            }
+        }
+        Err(_) => CartographerPlan {
+            target_files: Vec::new(),
+            explicit_match: false,
+            strategy_note: "Repli repo-map Aider".to_string(),
+            cartographer_tokens: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AiderStrategy {
+    pub edit_format: String,
+    pub map_tokens: usize,
+    pub max_chat_history_tokens: usize,
+    pub max_file_lines: usize,
+}
+
+pub fn choose_aider_strategy(
+    project_root: &Path,
+    target_files: &[String],
+    explicit_match: bool,
+    settings: &AppSettings,
+) -> AiderStrategy {
+    let mut max_file_lines = 0usize;
+    let mut total_file_lines = 0usize;
+
+    for rel in target_files {
+        if let Ok(content) = std::fs::read_to_string(project_root.join(rel)) {
+            let lines = content.lines().count();
+            max_file_lines = max_file_lines.max(lines);
+            total_file_lines += lines;
+        }
+    }
+
+    let edit_format = match settings.aider_edit_format.trim() {
+        "whole" => "whole".to_string(),
+        "diff" => "diff".to_string(),
+        _ => {
+            if target_files.is_empty() || (max_file_lines <= 250 && total_file_lines <= 350) {
+                "whole".to_string()
+            } else {
+                "diff".to_string()
+            }
+        }
+    };
+
+    let map_tokens = if target_files.len() == 1 && explicit_match {
+        0
+    } else if !target_files.is_empty() {
+        192
+    } else {
+        384
+    };
+
+    let max_chat_history_tokens = if effective_num_ctx(settings) <= 8192 {
+        1024
+    } else {
+        2048
+    };
+
+    AiderStrategy {
+        edit_format,
+        map_tokens,
+        max_chat_history_tokens,
+        max_file_lines,
+    }
+}
+
+fn write_aider_model_settings(model_arg: &str, num_ctx: usize) -> Option<PathBuf> {
+    let base_dir = storage::state_file_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    if std::fs::create_dir_all(&base_dir).is_err() {
+        return None;
+    }
+    let settings_path = base_dir.join("aider_model_settings.yml");
+    let escaped = model_arg.replace('"', "\\\"");
+    let yaml = format!(
+        "- name: \"{escaped}\"\n  extra_params:\n    num_ctx: {num_ctx}\n"
+    );
+    if std::fs::write(&settings_path, yaml).is_ok() {
+        Some(settings_path)
+    } else {
+        None
+    }
 }
 
 fn is_aider_noise_line(line: &str) -> bool {
@@ -1051,6 +1622,9 @@ fn is_aider_noise_line(line: &str) -> bool {
         "Tokens:",
         "Applied edit to",
         "Added ",
+        "Wrote ",
+        "Removed ",
+        "Commit ",
         "These files should be added",
         "Create new file?",
         "Allow edits to",
@@ -1075,8 +1649,24 @@ fn is_aider_noise_line(line: &str) -> bool {
         "Failed to retrieve content",
         "Protocol error",
         "Repo-map can't include",
+        "The LLM did not conform to the edit format",
+        "SearchReplaceNoExactMatch",
+        "Did you mean to match",
+        "The SEARCH section must exactly match",
+        "Veuillez appliquer ces modifications",
+        "Je suis désolé pour la confusion",
+        "Voici les SEARCH/REPLACE",
     ];
     if prefixes.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    if t.contains("SEARCH/REPLACE block") {
+        return true;
+    }
+    if t.starts_with("Veuillez ajouter ") && t.contains("au chat") {
+        return true;
+    }
+    if t.starts_with("Only ") && t.contains("edit block") {
         return true;
     }
     // Standalone backticked filename line like `` `src/App.vue ``
@@ -1086,34 +1676,114 @@ fn is_aider_noise_line(line: &str) -> bool {
     false
 }
 
-fn build_clean_synthesis(raw_output: &str, modified_files: &[ModifiedFileDiff]) -> String {
+pub fn clean_aider_output_for_display(
+    raw_output: &str,
+    aider_ran: bool,
+    modified_files: &[ModifiedFileDiff],
+) -> (String, bool) {
     let trimmed = raw_output.trim();
+    let had_retries_or_errors = trimmed.contains("SEARCH/REPLACE block failed")
+        || trimmed.contains("SearchReplaceNoExactMatch")
+        || trimmed.contains("The LLM did not conform to the edit format")
+        || trimmed.contains("Veuillez ajouter ")
+        || trimmed.contains("Did you mean to match");
+
     if trimmed.starts_with("⚠️") || trimmed.starts_with("### Stack locale") {
-        return trimmed.to_string();
+        return (trimmed.to_string(), had_retries_or_errors);
     }
 
-    // Preserve fenced code blocks intact while removing Aider CLI noise outside fences
-    // and cleaning stray backticks on headings (e.g. `### \`tsconfig.json` -> `### tsconfig.json`).
-    let mut cleaned_lines: Vec<String> = Vec::new();
+    let modified_paths: Vec<String> = modified_files
+        .iter()
+        .map(|f| f.path.trim().to_string())
+        .collect();
+    let shell_langs = ["bash", "sh", "shell", "zsh", "console", "cmd", "powershell"];
+
+    let mut out_lines: Vec<String> = Vec::new();
     let mut in_fence = false;
-    let mut prev_blank = false;
+    let mut in_raw_diff = false;
+    let mut skip_next_fence = false;
+    let mut fence_header = String::new();
+    let mut fence_lang = String::new();
+    let mut fence_body: Vec<String> = Vec::new();
 
     for line in trimmed.lines() {
         let trimmed_start = line.trim_start();
         if trimmed_start.starts_with("```") {
-            in_fence = !in_fence;
-            cleaned_lines.push(line.trim_end().to_string());
-            prev_blank = false;
+            if !in_fence {
+                in_fence = true;
+                fence_header = line.trim_end().to_string();
+                fence_lang = trimmed_start
+                    .trim_start_matches('`')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(':')
+                    .to_lowercase();
+                fence_body.clear();
+            } else {
+                in_fence = false;
+                let joined = fence_body.join("\n");
+                let has_diff_markers =
+                    joined.contains("<<<<<<< SEARCH") || joined.contains(">>>>>>> REPLACE");
+                let is_shell = shell_langs.contains(&fence_lang.as_str());
+                let prev_non_empty = out_lines
+                    .iter()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().trim_matches('#').trim().trim_matches('`').to_string())
+                    .unwrap_or_default();
+                let prev_is_file = modified_paths.iter().any(|p| p == &prev_non_empty)
+                    || (!prev_non_empty.is_empty()
+                        && !prev_non_empty.contains(' ')
+                        && prev_non_empty.contains('.'));
+
+                let drop_redundant_code = aider_ran
+                    && !modified_files.is_empty()
+                    && !is_shell
+                    && (prev_is_file || fence_body.len() >= 5);
+
+                if !skip_next_fence && !has_diff_markers && !drop_redundant_code && !joined.trim().is_empty() {
+                    out_lines.push(fence_header.clone());
+                    out_lines.extend(fence_body.iter().cloned());
+                    out_lines.push("```".to_string());
+                }
+                skip_next_fence = false;
+                fence_body.clear();
+            }
             continue;
         }
 
         if in_fence {
-            cleaned_lines.push(line.to_string());
-            prev_blank = false;
+            fence_body.push(line.to_string());
+            continue;
+        }
+
+        let t = line.trim();
+        if t.starts_with("<<<<<<< SEARCH") {
+            in_raw_diff = true;
+            continue;
+        }
+        if in_raw_diff {
+            if t.starts_with(">>>>>>> REPLACE") {
+                in_raw_diff = false;
+            }
+            continue;
+        }
+
+        if t.starts_with("Did you mean to match")
+            || t.starts_with("SearchReplaceNoExactMatch")
+            || t.contains("SEARCH/REPLACE block failed")
+        {
+            skip_next_fence = true;
             continue;
         }
 
         if is_aider_noise_line(line) {
+            continue;
+        }
+
+        let unbackticked = t.trim_matches('`');
+        if modified_paths.iter().any(|p| p == unbackticked) {
             continue;
         }
 
@@ -1124,23 +1794,57 @@ fn build_clean_synthesis(raw_output: &str, modified_files: &[ModifiedFileDiff]) 
         }
 
         if normalized.is_empty() {
-            if !prev_blank && !cleaned_lines.is_empty() {
-                cleaned_lines.push(String::new());
-                prev_blank = true;
+            if !out_lines.last().map(|l| l.is_empty()).unwrap_or(true) {
+                out_lines.push(String::new());
             }
         } else {
-            cleaned_lines.push(normalized);
-            prev_blank = false;
+            out_lines.push(normalized);
         }
     }
 
-    let narrative = cleaned_lines.join("\n").trim().to_string();
+    // Deduplicate identical consecutive paragraphs
+    let raw_joined = out_lines.join("\n");
+    let mut dedup_paras: Vec<String> = Vec::new();
+    for para in raw_joined.split("\n\n") {
+        let p = para.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if dedup_paras.last().map(|prev| prev.as_str()) != Some(p) {
+            dedup_paras.push(p.to_string());
+        }
+    }
 
+    (dedup_paras.join("\n\n"), had_retries_or_errors)
+}
+
+fn build_compact_diff_summary(modified_files: &[ModifiedFileDiff], max_chars: usize) -> String {
+    let mut parts = Vec::new();
+    for f in modified_files {
+        let mut file_lines = vec![format!(
+            "Fichier {} (+{} / -{}, ~{} mod):",
+            f.path, f.added, f.removed, f.modified
+        )];
+        for dl in f.lines.iter().filter(|l| l.kind != "ctx").take(14) {
+            let prefix = match dl.kind.as_str() {
+                "add" => "+",
+                "del" => "-",
+                "mod" => "~",
+                _ => " ",
+            };
+            file_lines.push(format!("  {} {}", prefix, truncate_chars(&dl.content, 110)));
+        }
+        parts.push(file_lines.join("\n"));
+    }
+    truncate_chars(&parts.join("\n"), max_chars)
+}
+
+fn append_modified_files_summary(narrative: &str, modified_files: &[ModifiedFileDiff]) -> String {
     if modified_files.is_empty() {
         return if narrative.is_empty() {
-            trimmed.to_string()
+            "Traitement terminé sans modification de fichier.".to_string()
         } else {
-            narrative
+            narrative.to_string()
         };
     }
 
@@ -1163,21 +1867,94 @@ fn build_clean_synthesis(raw_output: &str, modified_files: &[ModifiedFileDiff]) 
 
     let mut sections = Vec::new();
     if !narrative.is_empty() {
-        sections.push(narrative);
+        sections.push(narrative.to_string());
     } else {
-        sections.push("Modifications appliquées en arrière-plan sur le projet.".to_string());
+        sections.push("Modifications appliquées sur le projet.".to_string());
     }
-    if !created.is_empty() {
-        sections.push(format!("### Fichiers créés\n{}", created.join("\n")));
-    }
-    if !updated.is_empty() {
-        sections.push(format!("### Fichiers modifiés\n{}", updated.join("\n")));
-    }
-    if !deleted.is_empty() {
-        sections.push(format!("### Fichiers supprimés\n{}", deleted.join("\n")));
+    if !narrative.contains("### Fichiers ") {
+        if !created.is_empty() {
+            sections.push(format!("### Fichiers créés\n{}", created.join("\n")));
+        }
+        if !updated.is_empty() {
+            sections.push(format!("### Fichiers modifiés\n{}", updated.join("\n")));
+        }
+        if !deleted.is_empty() {
+            sections.push(format!("### Fichiers supprimés\n{}", deleted.join("\n")));
+        }
     }
 
     sections.join("\n\n")
+}
+
+async fn synthesize_final_response(
+    app: &AppHandle,
+    conversation_id: &str,
+    user_prompt: &str,
+    raw_output: &str,
+    aider_ran: bool,
+    ollama_running: bool,
+    settings: &AppSettings,
+    modified_files: &[ModifiedFileDiff],
+    verifier_note: &str,
+) -> (String, String, bool) {
+    let (cleaned_narrative, had_retries_or_errors) =
+        clean_aider_output_for_display(raw_output, aider_ran, modified_files);
+
+    let needs_llm_synthesis = aider_ran
+        && ollama_running
+        && (had_retries_or_errors
+            || cleaned_narrative.is_empty()
+            || cleaned_narrative.chars().count() > 650);
+
+    let core_narrative = if needs_llm_synthesis {
+        let diff_summary = if modified_files.is_empty() {
+            "Aucune modification appliquée sur le disque.".to_string()
+        } else {
+            build_compact_diff_summary(modified_files, 900)
+        };
+        let files_names: Vec<String> = modified_files.iter().map(|f| f.path.clone()).collect();
+        let synth_sys = "Tu es l'Architecte Synthétiseur d'AiderStudio. Résume en français, en 2 à 4 puces claires et concises, la cause identifiée et les modifications réellement appliquées (prêt à copier en message de commit). INTERDIT : blocs de code complets, marqueurs SEARCH/REPLACE, excuses ou blabla.";
+        let synth_user = format!(
+            "Demande : {}\nFichiers modifiés : {}\nExtrait diff :\n{}\nVérification : {}\nNote brute : {}",
+            truncate_chars(user_prompt.trim(), 220),
+            if files_names.is_empty() {
+                "aucun".to_string()
+            } else {
+                files_names.join(", ")
+            },
+            diff_summary,
+            if verifier_note.is_empty() { "N/A" } else { verifier_note },
+            truncate_chars(&cleaned_narrative, 700)
+        );
+
+        match call_ollama_oneshot(settings, synth_sys, &synth_user, 220, 0.1).await {
+            Ok((summary, p_tok, c_tok)) => {
+                if p_tok + c_tok > 0 {
+                    let _ = app.emit(
+                        "aider:tokens",
+                        TokenUsageEvent {
+                            conversation_id: conversation_id.to_string(),
+                            subagent: "5. Synthétiseur (Compte-rendu)".to_string(),
+                            prompt_tokens: p_tok,
+                            completion_tokens: c_tok,
+                            total_tokens: p_tok + c_tok,
+                        },
+                    );
+                }
+                if summary.is_empty() {
+                    cleaned_narrative.clone()
+                } else {
+                    summary
+                }
+            }
+            Err(_) => cleaned_narrative.clone(),
+        }
+    } else {
+        cleaned_narrative.clone()
+    };
+
+    let final_markdown = append_modified_files_summary(&core_narrative, modified_files);
+    (final_markdown, cleaned_narrative, had_retries_or_errors)
 }
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
@@ -1186,6 +1963,15 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     }
     let truncated: String = input.chars().take(max_chars).collect();
     format!("{truncated}…")
+}
+
+fn tail_chars(input: &str, max_chars: usize) -> String {
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+    let skipped: String = input.chars().skip(count - max_chars).collect();
+    format!("…\n{skipped}")
 }
 
 fn parse_aider_token_count(line: &str, marker: &str) -> usize {
@@ -1205,6 +1991,7 @@ fn parse_aider_token_count(line: &str, marker: &str) -> usize {
     0
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_aider_cli(
     app: &AppHandle,
     conversation_id: &str,
@@ -1212,6 +1999,8 @@ async fn execute_aider_cli(
     project_root: &str,
     settings: &AppSettings,
     prompt: &str,
+    target_files: &[String],
+    strategy: &AiderStrategy,
 ) -> anyhow::Result<String> {
     let model_arg = if settings.ollama_model.starts_with("ollama") {
         settings.ollama_model.clone()
@@ -1219,29 +2008,56 @@ async fn execute_aider_cli(
         format!("ollama_chat/{}", settings.ollama_model.trim())
     };
 
-    let mut child = Command::new(aider_bin)
-        .current_dir(project_root)
+    let mut args = vec![
+        "--model".to_string(),
+        model_arg.clone(),
+        "--yes-always".to_string(),
+        "--no-pretty".to_string(),
+        "--no-auto-commits".to_string(),
+        "--no-show-model-warnings".to_string(),
+        "--no-check-update".to_string(),
+        "--no-detect-urls".to_string(),
+        "--no-suggest-shell-commands".to_string(),
+        "--no-auto-lint".to_string(),
+        "--no-auto-test".to_string(),
+        "--no-restore-chat-history".to_string(),
+        "--max-chat-history-tokens".to_string(),
+        strategy.max_chat_history_tokens.to_string(),
+        "--edit-format".to_string(),
+        strategy.edit_format.clone(),
+        "--map-tokens".to_string(),
+        strategy.map_tokens.to_string(),
+    ];
+
+    if let Some(settings_path) =
+        write_aider_model_settings(&model_arg, effective_num_ctx(settings))
+    {
+        args.push("--model-settings-file".to_string());
+        args.push(settings_path.to_string_lossy().to_string());
+    }
+
+    args.push("--chat-language".to_string());
+    args.push("fr".to_string());
+
+    for file in target_files {
+        args.push("--file".to_string());
+        args.push(file.clone());
+    }
+
+    args.push("--message".to_string());
+    args.push(prompt.to_string());
+
+    let mut cmd = Command::new(aider_bin);
+    cmd.current_dir(project_root)
         .env("OLLAMA_API_BASE", settings.ollama_url.trim_end_matches('/'))
-        .args([
-            "--model",
-            &model_arg,
-            "--yes-always",
-            "--no-pretty",
-            "--no-auto-commits",
-            "--no-show-model-warnings",
-            "--no-check-update",
-            "--edit-format",
-            "diff",
-            "--map-tokens",
-            "512",
-            "--chat-language",
-            "fr",
-            "--message",
-            prompt,
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+
+    let mut child = cmd.spawn()?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1250,6 +2066,7 @@ async fn execute_aider_cli(
     let c_out = Arc::clone(&collected);
     let app_out = app.clone();
     let conv_id_out = conversation_id.to_string();
+    let subagent_label = format!("3. Codeur ({})", strategy.edit_format);
 
     let out_task = tokio::spawn(async move {
         if let Some(out) = stdout {
@@ -1267,7 +2084,7 @@ async fn execute_aider_cli(
                             "aider:tokens",
                             TokenUsageEvent {
                                 conversation_id: conv_id_out.clone(),
-                                subagent: "3. Codeur Atomique (Aider)".to_string(),
+                                subagent: subagent_label.clone(),
                                 prompt_tokens,
                                 completion_tokens,
                                 total_tokens,
@@ -1338,6 +2155,11 @@ async fn execute_ollama_streaming(
                 images: images_opt,
             },
         ],
+        options: Some(OllamaOptions {
+            num_ctx: Some(effective_num_ctx(settings)),
+            num_predict: None,
+            temperature: None,
+        }),
     };
 
     let mut resp = client.post(url).json(&payload).send().await?;
@@ -1506,25 +2328,52 @@ pub async fn run_prompt_pipeline(
         let _ = ensure_aiderignore(&project_root_path).await;
     }
 
+    let mut stack = check_stack_status(&settings).await;
+    if !stack.ollama_running && settings.auto_start_ollama && stack.ollama_installed {
+        if let Ok(updated) = start_ollama_service(&settings).await {
+            stack = updated;
+        }
+    }
+    let will_run_aider = image_base64_list.is_empty() && stack.aider_bin.is_some();
+
     // SUB-AGENT 1/5: Architecte & Orchestrateur
     emit_stage(
         app,
         &conversation_id,
         1,
         "1. Architecte & Orchestrateur",
-        "Analyse de la demande, structuration du plan d'action et protection du contexte 8K.",
+        "Analyse de la demande, cadrage du contexte et optimisation 8K.",
         "running",
     );
-    let augmented_prompt = build_augmented_prompt(
-        &project.global_context,
-        &conv_ctx,
-        &user_prompt,
-        attachments.as_deref(),
-        &project.shared_directories,
-    );
 
-    // Initial prompt token footprint estimation
-    let init_prompt_tokens = (augmented_prompt.len() as f64 / 3.8).ceil() as usize;
+    let aider_prompt_opt = if will_run_aider {
+        Some(build_aider_prompt(
+            &project.global_context,
+            &conv_ctx,
+            &user_prompt,
+            attachments.as_deref(),
+            &project.shared_directories,
+        ))
+    } else {
+        None
+    };
+    let direct_prompt_opt = if !will_run_aider {
+        Some(build_augmented_prompt(
+            &project.global_context,
+            &conv_ctx,
+            &user_prompt,
+            attachments.as_deref(),
+            &project.shared_directories,
+        ))
+    } else {
+        None
+    };
+
+    let init_prompt_ref = aider_prompt_opt
+        .as_deref()
+        .or(direct_prompt_opt.as_deref())
+        .unwrap_or("");
+    let init_prompt_tokens = (init_prompt_ref.len() as f64 / 3.8).ceil() as usize;
     let _ = app.emit(
         "aider:tokens",
         TokenUsageEvent {
@@ -1546,38 +2395,90 @@ pub async fn run_prompt_pipeline(
         "running",
     );
 
+    let carto = if will_run_aider {
+        let plan = run_cartographer(
+            &project_root_path,
+            &user_prompt,
+            attachments.as_deref(),
+            &settings,
+            stack.ollama_running,
+        )
+        .await;
+        if let Some((p_tok, c_tok)) = plan.cartographer_tokens {
+            if p_tok + c_tok > 0 {
+                let _ = app.emit(
+                    "aider:tokens",
+                    TokenUsageEvent {
+                        conversation_id: conversation_id.clone(),
+                        subagent: "2. Cartographe (Ciblage)".to_string(),
+                        prompt_tokens: p_tok,
+                        completion_tokens: c_tok,
+                        total_tokens: p_tok + c_tok,
+                    },
+                );
+            }
+        }
+        let target_detail = if plan.target_files.is_empty() {
+            plan.strategy_note.clone()
+        } else {
+            format!("Ciblage : {} ({})", plan.target_files.join(", "), plan.strategy_note)
+        };
+        emit_stage(
+            app,
+            &conversation_id,
+            2,
+            "2. Cartographe & Analyseur",
+            &target_detail,
+            "running",
+        );
+        plan
+    } else {
+        CartographerPlan {
+            target_files: Vec::new(),
+            explicit_match: false,
+            strategy_note: "Mode Ollama direct".to_string(),
+            cartographer_tokens: None,
+        }
+    };
+
+    let strategy = choose_aider_strategy(
+        &project_root_path,
+        &carto.target_files,
+        carto.explicit_match,
+        &settings,
+    );
+
     // SUB-AGENT 3/5: Codeur Atomique
+    let stage3_detail = if will_run_aider {
+        format!(
+            "Format {} · map {} tok · {} fichier(s) sur {}",
+            strategy.edit_format,
+            strategy.map_tokens,
+            carto.target_files.len(),
+            settings.ollama_model
+        )
+    } else {
+        format!(
+            "Génération et application des modifications ciblées sur {}",
+            settings.ollama_model
+        )
+    };
     emit_stage(
         app,
         &conversation_id,
         3,
         "3. Codeur Atomique (Aider & Ollama)",
-        &format!("Génération et application des modifications ciblées sur {}", settings.ollama_model),
+        &stage3_detail,
         "running",
     );
 
-    let mut stack = check_stack_status(&settings).await;
-    if !stack.ollama_running && settings.auto_start_ollama && stack.ollama_installed {
-        if let Ok(updated) = start_ollama_service(&settings).await {
-            stack = updated;
-        }
-    }
-
     let mut aider_ran = false;
-    let (assistant_text, stage_note) = if image_base64_list.is_empty()
-        && stack.aider_bin.is_some()
-    {
+    let (assistant_text, stage_note) = if will_run_aider {
         // Sanitize any existing conflict markers before Aider runs
         git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
 
         let aider_bin = stack.aider_bin.as_deref().unwrap();
-        let aider_prompt = build_aider_prompt(
-            &project.global_context,
-            &conv_ctx,
-            &user_prompt,
-            attachments.as_deref(),
-            &project.shared_directories,
-        );
+        let aider_prompt = aider_prompt_opt.unwrap_or_default();
 
         match execute_aider_cli(
             app,
@@ -1586,6 +2487,8 @@ pub async fn run_prompt_pipeline(
             &project.root_path,
             &settings,
             &aider_prompt,
+            &carto.target_files,
+            &strategy,
         )
         .await
         {
@@ -1593,14 +2496,14 @@ pub async fn run_prompt_pipeline(
                 aider_ran = true;
                 (
                     output,
-                    format!("Aider Diff · {}", settings.ollama_model),
+                    format!("Aider {} · {}", strategy.edit_format, settings.ollama_model),
                 )
             }
             Ok(_) => {
                 aider_ran = true;
                 (
                     "Aider a terminé l'opération sans sortie textuelle supplémentaire.".to_string(),
-                    format!("Aider Diff · {}", settings.ollama_model),
+                    format!("Aider {} · {}", strategy.edit_format, settings.ollama_model),
                 )
             }
             Err(err) => (
@@ -1612,6 +2515,7 @@ pub async fn run_prompt_pipeline(
             ),
         }
     } else if stack.ollama_running {
+        let augmented_prompt = direct_prompt_opt.unwrap_or_default();
         match execute_ollama_streaming(
             app,
             &conversation_id,
@@ -1651,7 +2555,9 @@ pub async fn run_prompt_pipeline(
 
     // Extract thinking and apply local tools directly to create/edit files in local
     let (extracted_thinking, cleaned_content) = extract_thinking_and_content(&assistant_text);
-    let tool_results = apply_tools_and_file_blocks(&project_root_path, &cleaned_content, &user_prompt, aider_ran).await;
+    let tool_results =
+        apply_tools_and_file_blocks(&project_root_path, &cleaned_content, &user_prompt, aider_ran)
+            .await;
 
     // SUB-AGENT 4/5: Testeur & Vérifieur
     emit_stage(
@@ -1664,29 +2570,19 @@ pub async fn run_prompt_pipeline(
     );
     let test_res = run_test_verifier(&project_root_path).await;
 
-    let mut thinking_with_tools = extracted_thinking;
     let mut verifier_note = String::new();
     if test_res.ran {
         if test_res.success {
-            verifier_note = format!("• ✅ **Vérifieur ({})** : {}", test_res.command, test_res.output_summary);
+            verifier_note = format!(
+                "• ✅ **Vérifieur ({})** : {}",
+                test_res.command, test_res.output_summary
+            );
         } else {
-            verifier_note = format!("• ⚠️ **Vérifieur ({})** : Compilation en erreur :\n```\n{}\n```", test_res.command, test_res.output_summary);
+            verifier_note = format!(
+                "• ⚠️ **Vérifieur ({})** : Compilation en erreur :\n```\n{}\n```",
+                test_res.command, test_res.output_summary
+            );
         }
-    }
-
-    if !tool_results.is_empty() || !verifier_note.is_empty() {
-        let mut notes = Vec::new();
-        for r in &tool_results {
-            notes.push(format!("• 🛠️ {}", r.message));
-        }
-        if !verifier_note.is_empty() {
-            notes.push(verifier_note);
-        }
-        let block_str = format!("### Contrôles & Outils exécutés en local\n{}", notes.join("\n"));
-        thinking_with_tools = match thinking_with_tools {
-            Some(t) => Some(format!("{}\n\n{}", t, block_str)),
-            None => Some(block_str),
-        };
     }
 
     // SUB-AGENT 5/5: Synthétiseur & Mémoire Globale
@@ -1695,15 +2591,33 @@ pub async fn run_prompt_pipeline(
         &conversation_id,
         5,
         "5. Synthétiseur & Mémoire Globale",
-        "Calcul du diff Git, extraction des artefacts et enregistrement contextuel.",
+        "Calcul du diff Git, synthèse architecte et enregistrement contextuel.",
         "running",
     );
 
     git_diff::sanitize_backtick_paths(&project.root_path).await;
     let (modified_files, lines_added, lines_removed) =
         git_diff::collect_project_diffs(&project.root_path).await;
-    let new_artifacts = extract_artifacts_from_markdown(&cleaned_content);
-    let mut synthesized_text = build_clean_synthesis(&cleaned_content, &modified_files);
+
+    let (mut synthesized_text, cleaned_narrative, had_retries_or_errors) = synthesize_final_response(
+        app,
+        &conversation_id,
+        &user_prompt,
+        &cleaned_content,
+        aider_ran,
+        stack.ollama_running,
+        &settings,
+        &modified_files,
+        &verifier_note,
+    )
+    .await;
+
+    let artifact_source = if aider_ran {
+        cleaned_narrative.as_str()
+    } else {
+        cleaned_content.as_str()
+    };
+    let new_artifacts = extract_artifacts_from_markdown(artifact_source);
 
     let created_files_list: Vec<String> = tool_results
         .iter()
@@ -1717,6 +2631,53 @@ pub async fn run_prompt_pipeline(
             created_files_list.join("\n")
         );
     }
+
+    // Build structured collapsible AI Thinking drawer contents (Orchestration + Verifier + Raw Aider log)
+    let mut thinking_sections: Vec<String> = Vec::new();
+    if let Some(t) = extracted_thinking {
+        thinking_sections.push(t);
+    }
+    if will_run_aider {
+        let targeted_str = if carto.target_files.is_empty() {
+            "aucun (découverte repo-map)".to_string()
+        } else {
+            carto.target_files.join(", ")
+        };
+        thinking_sections.push(format!(
+            "### Orchestration & Ciblage\n• 🧭 **Cartographe** : `{}` ({})\n• ⚙️ **Stratégie Aider** : format `{}` · `--map-tokens {}` · `num_ctx {}` · historique {} tok (max {} lignes)",
+            targeted_str,
+            carto.strategy_note,
+            strategy.edit_format,
+            strategy.map_tokens,
+            effective_num_ctx(&settings),
+            strategy.max_chat_history_tokens,
+            strategy.max_file_lines
+        ));
+    }
+    if !tool_results.is_empty() || !verifier_note.is_empty() {
+        let mut notes = Vec::new();
+        for r in &tool_results {
+            notes.push(format!("• 🛠️ {}", r.message));
+        }
+        if !verifier_note.is_empty() {
+            notes.push(verifier_note);
+        }
+        thinking_sections.push(format!(
+            "### Contrôles & Outils exécutés en local\n{}",
+            notes.join("\n")
+        ));
+    }
+    if aider_ran && (had_retries_or_errors || cleaned_narrative != cleaned_content.trim()) {
+        thinking_sections.push(format!(
+            "### Journal brut Aider\n{}",
+            tail_chars(cleaned_content.trim(), 3500)
+        ));
+    }
+    let thinking_with_tools = if thinking_sections.is_empty() {
+        None
+    } else {
+        Some(thinking_sections.join("\n\n"))
+    };
 
     let result = {
         let mut guard = state_lock.lock().await;
@@ -1749,21 +2710,18 @@ pub async fn run_prompt_pipeline(
         guard.conversations[conv_idx].lines_removed = lines_removed;
         guard.conversations[conv_idx].updated_at = now.clone();
 
-        // Update conversation rolling context (prompt and brief summary without raw code blocks)
+        // Update FIFO conversation rolling context (keep custom objective + latest 6 bullets)
         let text_without_code = strip_code_blocks(&synthesized_text);
-        let summary_snippet = truncate_chars(text_without_code.replace('\n', " ").trim(), 200);
+        let summary_snippet = truncate_chars(text_without_code.replace('\n', " ").trim(), 180);
         let conv_entry = format!(
             "• [{}] Demande: {} → Résumé: {}",
             user_msg_time.get(..16).unwrap_or(&user_msg_time),
-            truncate_chars(user_prompt.trim(), 100),
+            truncate_chars(user_prompt.trim(), 90),
             summary_snippet
         );
         let prev_conv_ctx = guard.conversations[conv_idx].conversation_context.clone();
-        guard.conversations[conv_idx].conversation_context = if prev_conv_ctx.trim().is_empty() {
-            conv_entry
-        } else {
-            truncate_chars(&format!("{prev_conv_ctx}\n{conv_entry}"), 2500)
-        };
+        guard.conversations[conv_idx].conversation_context =
+            update_rolling_conversation_context(&prev_conv_ctx, &conv_entry, 6);
 
         let proj_id = guard.conversations[conv_idx].project_id.clone();
         let proj_idx = guard
@@ -1786,11 +2744,212 @@ pub async fn run_prompt_pipeline(
     emit_stage(
         app,
         &conversation_id,
-        4,
+        5,
         "Prêt",
-        "Réponse intégrée, outils appliqués et contexte global synchronisé.",
+        "Réponse synthétisée et contexte synchronisé.",
         "done",
     );
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::DiffLine;
+
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aiderstudio_test_{}_{}", name, Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_match_files_deterministically() {
+        let all_files = vec![
+            "package.json".to_string(),
+            "vite.config.js".to_string(),
+            "src/App.vue".to_string(),
+            "src/stores/studio.ts".to_string(),
+            "src/components/LeHud.vue".to_string(),
+        ];
+
+        let (m1, exp1) = match_files_deterministically(
+            "Corrige le problème de `vite.config.js`.",
+            None,
+            &all_files,
+        );
+        assert!(exp1);
+        assert_eq!(m1, vec!["vite.config.js"]);
+
+        let (m2, exp2) = match_files_deterministically(
+            "Mets à jour studio.ts et LeHud.vue pour afficher le pic.",
+            None,
+            &all_files,
+        );
+        assert!(exp2);
+        assert_eq!(m2, vec!["src/stores/studio.ts", "src/components/LeHud.vue"]);
+
+        let (m3, exp3) = match_files_deterministically(
+            "Vérifie pourquoi Vite ne démarre pas le serveur web",
+            None,
+            &all_files,
+        );
+        assert!(!exp3);
+        assert_eq!(m3, vec!["vite.config.js", "package.json"]);
+    }
+
+    #[test]
+    fn test_choose_aider_strategy_adaptive() {
+        let dir = make_temp_dir("strategy");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("vite.config.js"), "export default {}\n").unwrap();
+        let big_file = "const x = 1;\n".repeat(280);
+        std::fs::write(dir.join("src/Large.ts"), big_file).unwrap();
+
+        let settings = AppSettings::default();
+
+        // Single small explicit file -> whole + map 0
+        let s1 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, &settings);
+        assert_eq!(s1.edit_format, "whole");
+        assert_eq!(s1.map_tokens, 0);
+        assert_eq!(s1.max_chat_history_tokens, 1024);
+
+        // Large single explicit file -> diff + map 0
+        let s2 = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], true, &settings);
+        assert_eq!(s2.edit_format, "diff");
+        assert_eq!(s2.map_tokens, 0);
+
+        // Non-explicit match -> diff + map 192
+        let s2b = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], false, &settings);
+        assert_eq!(s2b.edit_format, "diff");
+        assert_eq!(s2b.map_tokens, 192);
+
+        // 2 small files -> whole + map 192
+        std::fs::write(dir.join("package.json"), "{}\n").unwrap();
+        let s3 = choose_aider_strategy(
+            &dir,
+            &["vite.config.js".to_string(), "package.json".to_string()],
+            true,
+            &settings,
+        );
+        assert_eq!(s3.edit_format, "whole");
+        assert_eq!(s3.map_tokens, 192);
+
+        // Manual override -> diff
+        let mut s_diff_override = settings.clone();
+        s_diff_override.aider_edit_format = "diff".to_string();
+        let s4 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, &s_diff_override);
+        assert_eq!(s4.edit_format, "diff");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_clean_aider_output_strips_multi_round_diff_noise() {
+        let raw = r#"Pour résoudre le problème de vite.config.js qui empêche le site de démarrer, nous devons modifier ce fichier. Voici les modifications nécessaires :
+
+vite.config.js
+```javascript
+<<<<<<< SEARCH
+import { defineConfig } from 'vite'
+=======
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+>>>>>>> REPLACE
+```
+
+Veuillez ajouter `vite.config.js` au chat pour que je puisse effectuer ces modifications.
+
+1 SEARCH/REPLACE block failed to match!
+SearchReplaceNoExactMatch: This SEARCH block failed to exactly match lines in vite.config.js
+<<<<<<< SEARCH
+import { defineConfig } from 'vite'
+=======
+import vue from '@vitejs/plugin-vue'
+>>>>>>> REPLACE
+
+Did you mean to match some of these actual lines from vite.config.js?
+```
+// Configuration de base de Vite
+export default defineConfig({
+  plugins: []
+})
+```
+The SEARCH section must exactly match an existing block of lines.
+
+Je suis désolé pour la confusion. Voici les SEARCH/REPLACE blocks corrects :
+
+vite.config.js
+```javascript
+<<<<<<< SEARCH
+  plugins: []
+=======
+  plugins: [vue()]
+>>>>>>> REPLACE
+```
+
+Veuillez appliquer ces modifications et me confirmer lorsque vous aurez fait ces changements."#;
+
+        let modified = vec![ModifiedFileDiff {
+            path: "vite.config.js".to_string(),
+            added: 1,
+            removed: 0,
+            modified: 1,
+            lines: vec![DiffLine {
+                kind: "mod".to_string(),
+                old_line: Some(3),
+                new_line: Some(3),
+                content: "  plugins: [vue()]".to_string(),
+            }],
+        }];
+
+        let (cleaned, had_retries) = clean_aider_output_for_display(raw, true, &modified);
+        assert!(had_retries);
+        assert!(!cleaned.contains("<<<<<<< SEARCH"));
+        assert!(!cleaned.contains(">>>>>>> REPLACE"));
+        assert!(!cleaned.contains("SearchReplaceNoExactMatch"));
+        assert!(!cleaned.contains("Did you mean to match"));
+        assert!(!cleaned.contains("Veuillez ajouter"));
+        assert!(!cleaned.contains("Veuillez appliquer"));
+    }
+
+    #[test]
+    fn test_extract_artifacts_ignores_search_replace_diff() {
+        let md = r#"Explication.
+
+```javascript
+<<<<<<< SEARCH
+const a = 1;
+=======
+const a = 2;
+>>>>>>> REPLACE
+```
+
+```ts
+export function cleanHelper(x: number): number {
+  return x + 1;
+}
+```"#;
+        let arts = extract_artifacts_from_markdown(md);
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].language, "ts");
+        assert!(!arts[0].content.contains("<<<<<<< SEARCH"));
+    }
+
+    #[test]
+    fn test_update_rolling_conversation_context_fifo() {
+        let initial = "Objectif : Migrer vers Vite 6 sans casser Tauri.";
+        let mut ctx = initial.to_string();
+        for i in 1..=8 {
+            let entry = format!("• [2026-11-18T22:0{i}] Demande: étape {i} → Résumé: fait {i}");
+            ctx = update_rolling_conversation_context(&ctx, &entry, 6);
+        }
+
+        assert!(ctx.contains("Objectif : Migrer vers Vite 6 sans casser Tauri."));
+        assert!(!ctx.contains("étape 1"));
+        assert!(!ctx.contains("étape 2"));
+        assert!(ctx.contains("étape 3"));
+        assert!(ctx.contains("étape 8"));
+    }
 }

@@ -11,6 +11,22 @@ const artifacts = computed(() => conv.value?.artifacts ?? []);
 const linesAdded = computed(() => conv.value?.linesAdded ?? 0);
 const linesRemoved = computed(() => conv.value?.linesRemoved ?? 0);
 
+const contextTooltip = computed(() => {
+  const lines: string[] = [
+    `Pic appel sous-agent : ${store.activeCallTokens.toLocaleString()} / ${store.contextTokensMax.toLocaleString()} tok (${store.activeContextPercent}%)`,
+  ];
+  if (store.turnTokenSteps.length > 0) {
+    lines.push("Détail par sous-agent :");
+    for (const step of store.turnTokenSteps) {
+      lines.push(
+        `• ${step.subagent} : ${step.totalTokens.toLocaleString()} tok (${step.promptTokens.toLocaleString()} in / ${step.completionTokens.toLocaleString()} out)`
+      );
+    }
+  }
+  lines.push(`Mémoire session cumulée : ${store.contextTokensUsed.toLocaleString()} tok`);
+  return lines.join("\n");
+});
+
 function handleOutsideClick(ev: MouseEvent) {
   if (dropdownRef.value && !dropdownRef.value.contains(ev.target as Node)) {
     dropdownOpen.value = false;
@@ -47,7 +63,7 @@ function selectArtifact(id: string) {
     <!-- SECTION CONTEXTE -->
     <div
       class="hud-context-section"
-      :title="`Charge de l'appel : ${store.activeCallTokens.toLocaleString()} / ${store.contextTokensMax.toLocaleString()} tok (${store.activeContextPercent}%)\nMémoire session cumulée : ${store.contextTokensUsed.toLocaleString()} tok`"
+      :title="contextTooltip"
     >
       <div class="hud-context-header">
         <span class="hud-context-title">
@@ -82,14 +98,14 @@ function selectArtifact(id: string) {
         />
       </div>
 
-      <!-- Badge sous-agent actif et tokens par appel -->
+      <!-- Badge sous-agent actif ou pic du tour -->
       <div
-        v-if="store.lastCallTokens"
+        v-if="store.displayedCallTokenEvent"
         class="hud-subagent-tag"
-        :title="`Prompt : ${store.lastCallTokens.promptTokens.toLocaleString()} tok · Réponse : ${store.lastCallTokens.completionTokens.toLocaleString()} tok`"
+        :title="`Prompt : ${store.displayedCallTokenEvent.promptTokens.toLocaleString()} tok · Réponse : ${store.displayedCallTokenEvent.completionTokens.toLocaleString()} tok`"
       >
-        <span class="subagent-name">{{ store.lastCallTokens.subagent }}</span>
-        <span class="subagent-tokens">{{ store.lastCallTokens.totalTokens.toLocaleString() }} tok</span>
+        <span class="subagent-name">{{ store.displayedCallTokenEvent.subagent }}</span>
+        <span class="subagent-tokens">{{ store.displayedCallTokenEvent.totalTokens.toLocaleString() }} tok</span>
       </div>
 
       <!-- Bulle de recommandation /compact si >= 70% ou forcée si >= 95% -->

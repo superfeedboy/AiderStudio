@@ -1,20 +1,33 @@
 <script setup lang="ts">
 import { reactive, watch } from "vue";
 import { useStudioStore } from "../stores/studio";
-import type { AppSettings, ThemePreference } from "../types/studio";
+import type {
+  AiderEditFormat,
+  AppSettings,
+  ThemePreference,
+} from "../types/studio";
 
 const store = useStudioStore();
-const draft = reactive<AppSettings>({ ...store.settings });
+const draft = reactive<AppSettings>({
+  ...store.settings,
+  aiderEditFormat: store.settings.aiderEditFormat || "auto",
+});
 
 watch(
   () => store.settingsOpen,
   (open) => {
-    if (open) Object.assign(draft, store.settings);
+    if (open) {
+      Object.assign(draft, store.settings);
+      draft.aiderEditFormat = store.settings.aiderEditFormat || "auto";
+    }
   }
 );
 
 async function save() {
-  await store.saveSettings({ ...draft });
+  await store.saveSettings({
+    ...draft,
+    aiderEditFormat: draft.aiderEditFormat || "auto",
+  });
   store.settingsOpen = false;
 }
 
@@ -22,6 +35,12 @@ const themes: { value: ThemePreference; label: string }[] = [
   { value: "system", label: "Système" },
   { value: "dark", label: "Sombre" },
   { value: "light", label: "Clair" },
+];
+
+const editFormats: { value: AiderEditFormat; label: string }[] = [
+  { value: "auto", label: "Auto (8K)" },
+  { value: "whole", label: "Complet" },
+  { value: "diff", label: "Diff" },
 ];
 </script>
 
@@ -37,7 +56,7 @@ const themes: { value: ThemePreference; label: string }[] = [
         <button class="close-x" @click="store.settingsOpen = false">✕</button>
       </div>
 
-      <div class="modal-body">
+      <div class="modal-body custom-scroll">
         <div class="field">
           <label>Thème de l'interface</label>
           <div class="segmented">
@@ -109,7 +128,26 @@ const themes: { value: ThemePreference; label: string }[] = [
             placeholder="8192"
           />
           <span class="field-hint">
-            Définit la taille maximale pour le calcul de saturation du HUD et les alertes /compact (ex: 8192 tokens pour une RTX 4060Ti 8GB avec Qwen2.5-Coder:7B).
+            Transmis automatiquement comme <code>num_ctx</code> à votre serveur Ollama via Aider. Astuce RTX 4060Ti 8 Go + <code>q5_K_M</code> : activez <code>OLLAMA_FLASH_ATTENTION=1</code> et <code>OLLAMA_KV_CACHE_TYPE=q8_0</code> côté Ollama pour débloquer <strong>16K</strong> 100% en VRAM.
+          </span>
+        </div>
+
+        <div class="field">
+          <label>Format d'édition Aider</label>
+          <div class="segmented">
+            <button
+              v-for="fmt in editFormats"
+              :key="fmt.value"
+              type="button"
+              class="seg-btn"
+              :class="{ active: (draft.aiderEditFormat || 'auto') === fmt.value }"
+              @click="draft.aiderEditFormat = fmt.value"
+            >
+              {{ fmt.label }}
+            </button>
+          </div>
+          <span class="field-hint">
+            <strong>Auto (8K)</strong> : utilise <code>whole</code> pour les fichiers ≤ 250 lignes (zéro erreur diff et prompt ultra-léger sur Qwen 7B) et bascule en <code>diff</code> au-delà.
           </span>
         </div>
 
@@ -226,6 +264,9 @@ const themes: { value: ThemePreference; label: string }[] = [
   display: flex;
   flex-direction: column;
   gap: 13px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .field {

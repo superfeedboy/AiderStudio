@@ -29,6 +29,7 @@ const defaultSettings: AppSettings = {
   ollamaModel: "qwen2.5-coder:3b",
   aiderPath: "aider",
   autoStartOllama: true,
+  aiderEditFormat: "auto",
 };
 
 export const useStudioStore = defineStore("studio", () => {
@@ -128,12 +129,31 @@ export const useStudioStore = defineStore("studio", () => {
       : 8192;
   });
 
-  // Track live token usage per conversation emitted by subagents (Ollama / Aider)
+  // Track live token usage, peak load & per-subagent breakdown per conversation
   const conversationTokenUsage = ref<Record<string, TokenUsageEvent>>({});
+  const conversationPeakTokens = ref<Record<string, TokenUsageEvent>>({});
+  const conversationTokenSteps = ref<Record<string, TokenUsageEvent[]>>({});
 
   const lastCallTokens = computed<TokenUsageEvent | null>(() => {
     if (!activeConversationId.value) return null;
     return conversationTokenUsage.value[activeConversationId.value] ?? null;
+  });
+
+  const peakCallTokens = computed<TokenUsageEvent | null>(() => {
+    if (!activeConversationId.value) return null;
+    return conversationPeakTokens.value[activeConversationId.value] ?? null;
+  });
+
+  const turnTokenSteps = computed<TokenUsageEvent[]>(() => {
+    if (!activeConversationId.value) return [];
+    return conversationTokenSteps.value[activeConversationId.value] ?? [];
+  });
+
+  const displayedCallTokenEvent = computed<TokenUsageEvent | null>(() => {
+    if (isProcessing.value) {
+      return lastCallTokens.value ?? peakCallTokens.value;
+    }
+    return peakCallTokens.value ?? lastCallTokens.value;
   });
 
   const contextTokensUsed = computed<number>(() => {
@@ -171,9 +191,18 @@ export const useStudioStore = defineStore("studio", () => {
     return Math.ceil(totalChars / 3.8);
   });
 
-  // Active call tokens is the peak load of the current sub-agent call,
-  // falling back to rolling session memory if no call has been made yet
+  // While running, track live sub-agent tokens; once complete, keep peak call load
+  // so small Stage 5 Synthesizer calls never hide the Codeur's actual peak VRAM usage.
   const activeCallTokens = computed<number>(() => {
+    if (isProcessing.value) {
+      if (lastCallTokens.value && lastCallTokens.value.totalTokens > 0) {
+        return lastCallTokens.value.totalTokens;
+      }
+      return contextTokensUsed.value;
+    }
+    if (peakCallTokens.value && peakCallTokens.value.totalTokens > 0) {
+      return peakCallTokens.value.totalTokens;
+    }
     if (lastCallTokens.value && lastCallTokens.value.totalTokens > 0) {
       return lastCallTokens.value.totalTokens;
     }
@@ -232,10 +261,34 @@ export const useStudioStore = defineStore("studio", () => {
       await listen<TokenUsageEvent>("aider:tokens", (event) => {
         const payload = event.payload;
         if (payload && payload.conversationId) {
+          const cid = payload.conversationId;
           conversationTokenUsage.value = {
             ...conversationTokenUsage.value,
-            [payload.conversationId]: payload,
+            [cid]: payload,
           };
+
+          const existingSteps = conversationTokenSteps.value[cid] ?? [];
+          const stepIdx = existingSteps.findIndex(
+            (s) => s.subagent === payload.subagent
+          );
+          const nextSteps = [...existingSteps];
+          if (stepIdx !== -1) {
+            nextSteps[stepIdx] = payload;
+          } else {
+            nextSteps.push(payload);
+          }
+          conversationTokenSteps.value = {
+            ...conversationTokenSteps.value,
+            [cid]: nextSteps,
+          };
+
+          const currentPeak = conversationPeakTokens.value[cid];
+          if (!currentPeak || payload.totalTokens >= currentPeak.totalTokens) {
+            conversationPeakTokens.value = {
+              ...conversationPeakTokens.value,
+              [cid]: payload,
+            };
+          }
         }
       });
 
@@ -651,12 +704,19 @@ export const useStudioStore = defineStore("studio", () => {
       return;
     }
 
-    // Force /compact automatically at 90% threshold to prevent LLM overflow
-    if (activeContextPercent.value >= 90) {
+    // Force /compact automatically when rolling session memory approaches saturation
+    if (contextPercent.value >= 90) {
       await compactConversation(conv.id);
     }
 
     isProcessing.value = true;
+    const nextPeak = { ...conversationPeakTokens.value };
+    delete nextPeak[conv.id];
+    conversationPeakTokens.value = nextPeak;
+    conversationTokenSteps.value = {
+      ...conversationTokenSteps.value,
+      [conv.id]: [],
+    };
     liveStreamLines.value = [];
     liveThinking.value = "";
     liveContent.value = "";
@@ -991,6 +1051,9 @@ export const useStudioStore = defineStore("studio", () => {
     updateConversationContext,
     conversationTokenUsage,
     lastCallTokens,
+    peakCallTokens,
+    turnTokenSteps,
+    displayedCallTokenEvent,
     activeCallTokens,
     contextTokensMax,
     contextTokensUsed,

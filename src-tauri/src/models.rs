@@ -4,6 +4,10 @@ fn default_context_window() -> usize {
     8192
 }
 
+fn default_edit_format() -> String {
+    "auto".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -14,6 +18,8 @@ pub struct AppSettings {
     pub auto_start_ollama: bool,
     #[serde(default = "default_context_window")]
     pub context_window_tokens: usize,
+    #[serde(default = "default_edit_format")]
+    pub aider_edit_format: String, // "auto" | "whole" | "diff"
 }
 
 impl Default for AppSettings {
@@ -25,6 +31,7 @@ impl Default for AppSettings {
             aider_path: "aider".to_string(),
             auto_start_ollama: true,
             context_window_tokens: 8192,
+            aider_edit_format: "auto".to_string(),
         }
     }
 }

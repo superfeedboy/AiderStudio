@@ -1,5 +1,6 @@
 export type ThemePreference = "system" | "dark" | "light";
 export type CodeDrawerMode = "review" | "artifact";
+export type AiderEditFormat = "auto" | "whole" | "diff";
 
 export interface AppSettings {
   theme: ThemePreference;
@@ -8,6 +9,7 @@ export interface AppSettings {
   aiderPath: string;
   autoStartOllama: boolean;
   contextWindowTokens?: number;
+  aiderEditFormat?: AiderEditFormat;
 }
 
 export interface Project {
