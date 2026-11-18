@@ -82,6 +82,41 @@ pub async fn sanitize_backtick_paths(project_root: &str) {
     .await;
 }
 
+/// Scans modified files in the working directory and automatically cleans up any raw
+/// `<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE` markers that may have corrupted the files,
+/// restoring clean code.
+pub async fn sanitize_corrupted_diff_files(project_root: &str) {
+    let root = Path::new(project_root);
+    if !root.exists() {
+        return;
+    }
+
+    if let Ok(out) = Command::new("git")
+        .args(["-C", project_root, "status", "--porcelain"])
+        .output()
+        .await
+    {
+        if out.status.success() {
+            let list = String::from_utf8_lossy(&out.stdout);
+            for line in list.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let rel_path = parts[parts.len() - 1].trim_matches('"');
+                    let full_path = root.join(rel_path);
+                    if full_path.is_file() {
+                        if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
+                            if content.contains("<<<<<<< SEARCH") && content.contains(">>>>>>> REPLACE") {
+                                let clean = crate::engine::extract_clean_replace_code(&content);
+                                let _ = tokio::fs::write(&full_path, clean).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Collects modified, added, and deleted lines for a Git repository.
 /// Adjacent deleted+added lines inside a hunk are paired into `"mod"` lines
 /// so the UI renders modified lines on a blue background, pure additions on green,
@@ -93,6 +128,7 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
     }
 
     sanitize_backtick_paths(project_root).await;
+    sanitize_corrupted_diff_files(project_root).await;
 
     // Ensure git repo is initialized with a valid HEAD commit
     if !root.join(".git").exists() {

@@ -1009,6 +1009,39 @@ fn build_augmented_prompt(
     parts.join("\n\n")
 }
 
+fn build_aider_prompt(
+    global_ctx: &str,
+    conv_ctx: &str,
+    user_prompt: &str,
+    attachments: Option<&[AttachedFile]>,
+    shared_dirs: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if !global_ctx.trim().is_empty() {
+        parts.push(format!("[Contexte global du projet]\n{}", global_ctx.trim()));
+    }
+    if !shared_dirs.is_empty() {
+        parts.push(format!(
+            "[Dossiers partagés et répertoires de ressources mis à disposition]\n{}",
+            shared_dirs.iter().map(|d| format!("- {}", d)).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    if !conv_ctx.trim().is_empty() {
+        parts.push(format!("[Objectif & Contexte spécifique de cette discussion]\n{}", conv_ctx.trim()));
+    }
+    if let Some(att_list) = attachments {
+        for att in att_list {
+            if !att.is_image {
+                if let Some(content) = &att.content {
+                    parts.push(format!("[Fichier joint: {}]\n{}", att.name, content));
+                }
+            }
+        }
+    }
+    parts.push(format!("[Demande utilisateur]\n{}", user_prompt.trim()));
+    parts.join("\n\n")
+}
+
 fn is_aider_noise_line(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() {
@@ -1534,14 +1567,25 @@ pub async fn run_prompt_pipeline(
     let (assistant_text, stage_note) = if image_base64_list.is_empty()
         && stack.aider_bin.is_some()
     {
+        // Sanitize any existing conflict markers before Aider runs
+        git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
+
         let aider_bin = stack.aider_bin.as_deref().unwrap();
+        let aider_prompt = build_aider_prompt(
+            &project.global_context,
+            &conv_ctx,
+            &user_prompt,
+            attachments.as_deref(),
+            &project.shared_directories,
+        );
+
         match execute_aider_cli(
             app,
             &conversation_id,
             aider_bin,
             &project.root_path,
             &settings,
-            &augmented_prompt,
+            &aider_prompt,
         )
         .await
         {
