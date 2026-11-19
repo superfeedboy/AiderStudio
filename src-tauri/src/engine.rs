@@ -82,7 +82,7 @@ pub fn list_project_files_internal(project_root: &Path) -> Vec<String> {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.')
+            if (name_str.starts_with('.') && name_str != ".github")
                 || name_str == "node_modules"
                 || name_str == "target"
                 || name_str == "dist"
@@ -1158,6 +1158,68 @@ pub fn resolve_agent_slot(role: &str, settings: &AppSettings) -> (String, String
     ("ollama".to_string(), settings.ollama_model.trim().to_string())
 }
 
+fn is_doc_focused_prompt(lower: &str) -> bool {
+    let doc_markers = [
+        "readme",
+        "changelog",
+        "contributing",
+        "documentation",
+        "doc technique",
+        ".md",
+    ];
+    let explicit_ui_code = [
+        "css",
+        "scss",
+        "tailwind",
+        "composant",
+        "component",
+        "sidebar",
+        "bouton",
+        "page web",
+        "interface",
+    ];
+    doc_markers.iter().any(|k| lower.contains(k))
+        && !explicit_ui_code.iter().any(|k| lower.contains(k))
+}
+
+pub fn is_global_or_doc_task(user_prompt: &str, target_files: &[String]) -> bool {
+    let has_doc_target = target_files.iter().any(|f| {
+        let norm = f.trim().replace('\\', "/").to_lowercase();
+        let base = norm.rsplit('/').next().unwrap_or(&norm);
+        matches!(
+            base,
+            "readme.md" | "changelog.md" | "contributing.md" | "architecture.md"
+        ) || norm.starts_with("docs/")
+            || (!norm.contains('/') && norm.ends_with(".md"))
+    });
+    if has_doc_target {
+        return true;
+    }
+
+    let lower = user_prompt.to_lowercase();
+    let global_or_doc_kw = [
+        "readme",
+        "documentation",
+        "changelog",
+        "contributing",
+        "guide d'installation",
+        "guide d'utilisation",
+        "architecture",
+        "vue d'ensemble",
+        "audit",
+        "stack technique",
+        "tout le projet",
+        "ensemble du projet",
+        "codebase",
+        "inventaire",
+        "fonctionnalités de l'application",
+        "fonctionnalites de l'application",
+        "toutes les fonctionnalités",
+        "toutes les fonctionnalites",
+    ];
+    global_or_doc_kw.iter().any(|k| lower.contains(k))
+}
+
 pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
     let lower = user_prompt.to_lowercase();
 
@@ -1222,7 +1284,7 @@ pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
     ];
 
     let wants_tests = test_kw.iter().any(|k| lower.contains(k));
-    if design_kw.iter().any(|k| lower.contains(k)) {
+    if !is_doc_focused_prompt(&lower) && design_kw.iter().any(|k| lower.contains(k)) {
         return ("designer", wants_tests);
     }
     if refac_kw.iter().any(|k| lower.contains(k)) {
@@ -1372,12 +1434,16 @@ fn build_aider_prompt(
     attachments: Option<&[AttachedFile]>,
     shared_dirs: &[String],
     architect_spec: Option<&str>,
+    is_cloud: bool,
+    is_global_task: bool,
+    project_snapshot: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     if !global_ctx.trim().is_empty() {
+        let global_limit = if is_cloud { 2000 } else { 1000 };
         parts.push(format!(
             "[Contexte global]\n{}",
-            truncate_chars(global_ctx.trim(), 1000)
+            truncate_chars(global_ctx.trim(), global_limit)
         ));
     }
     if !shared_dirs.is_empty() {
@@ -1390,13 +1456,22 @@ fn build_aider_prompt(
                 .join("\n")
         ));
     }
-    let compact_conv = compact_conv_ctx_for_prompt(conv_ctx, 400, 2);
+    let compact_conv = if is_cloud {
+        compact_conv_ctx_for_prompt(conv_ctx, 800, 4)
+    } else {
+        compact_conv_ctx_for_prompt(conv_ctx, 400, 2)
+    };
     if !compact_conv.is_empty() {
         parts.push(format!("[Objectif discussion]\n{}", compact_conv));
     }
     if let Some(spec) = architect_spec {
         if !spec.trim().is_empty() {
             parts.push(format!("[Plan Architecte]\n{}", spec.trim()));
+        }
+    }
+    if let Some(snap) = project_snapshot {
+        if !snap.trim().is_empty() {
+            parts.push(format!("[Aperçu du dépôt]\n{}", snap.trim()));
         }
     }
     if let Some(att_list) = attachments {
@@ -1408,7 +1483,11 @@ fn build_aider_prompt(
             }
         }
     }
-    parts.push("[Consigne] Réponds en français de façon très concise (2 à 3 phrases max pour expliquer la modification).".to_string());
+    let mut consigne = "Réponds en français de façon très concise (2 à 3 phrases max pour expliquer la modification).".to_string();
+    if is_global_task {
+        consigne.push_str(" Pour la rédaction ou documentation, écris le contenu complet des fichiers édités sans abréger ni tronquer, et appuie-toi strictement sur les fichiers fournis et l'aperçu du dépôt (aucun lien fictif ni placeholder).");
+    }
+    parts.push(format!("[Consigne] {consigne}"));
     parts.push(format!("[Demande]\n{}", user_prompt.trim()));
     parts.join("\n\n")
 }
@@ -1613,153 +1692,548 @@ fn filter_files_by_size_budget(
     kept
 }
 
+pub fn collect_structural_context_files(
+    project_root: &Path,
+    all_files: &[String],
+    target_files: &[String],
+    is_cloud_exec: bool,
+    is_global_task: bool,
+    exec_num_ctx: usize,
+) -> Vec<String> {
+    if !is_global_task && !(is_cloud_exec && target_files.is_empty()) {
+        return Vec::new();
+    }
+
+    let (max_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
+        (12usize, 49_152u64, 122_880u64)
+    } else if exec_num_ctx >= 16_384 {
+        (5usize, 12_288u64, 24_576u64)
+    } else {
+        (3usize, 6_144u64, 10_240u64)
+    };
+
+    let mut candidates: Vec<String> = Vec::new();
+    let push_if_new = |cand: &str, out: &mut Vec<String>| {
+        if target_files.iter().any(|t| t.eq_ignore_ascii_case(cand)) {
+            return;
+        }
+        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(cand)) {
+            out.push(cand.to_string());
+        }
+    };
+
+    // 1. Manifests and toolchain configs
+    let manifests = [
+        "package.json",
+        "Cargo.toml",
+        "src-tauri/Cargo.toml",
+        "src-tauri/tauri.conf.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "composer.json",
+        "Makefile",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "vite.config.ts",
+        "vite.config.js",
+        "tsconfig.json",
+    ];
+    for name in manifests {
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(name)) {
+            push_if_new(found, &mut candidates);
+        }
+    }
+
+    // 2. CI workflows (up to 2)
+    let mut workflow_count = 0usize;
+    for rel in all_files {
+        let lower = rel.to_lowercase();
+        if lower.starts_with(".github/workflows/")
+            && (lower.ends_with(".yml") || lower.ends_with(".yaml"))
+        {
+            push_if_new(rel, &mut candidates);
+            workflow_count += 1;
+            if workflow_count >= 2 {
+                break;
+            }
+        }
+    }
+
+    // 3. Existing top-level documentation (if not already edited)
+    for doc in ["README.md", "CONTRIBUTING.md"] {
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(doc)) {
+            push_if_new(found, &mut candidates);
+        }
+    }
+
+    // 4. Entry points and key modules
+    let entry_points = [
+        "src/App.vue",
+        "src/App.tsx",
+        "src/App.jsx",
+        "src/main.ts",
+        "src/main.tsx",
+        "src-tauri/src/lib.rs",
+        "src-tauri/src/models.rs",
+        "src-tauri/src/main.rs",
+        "src/lib.rs",
+        "src/main.rs",
+    ];
+    for ep in entry_points {
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(ep)) {
+            push_if_new(found, &mut candidates);
+        }
+    }
+
+    for prefix in [
+        "src/types/",
+        "src/stores/",
+        "src-tauri/src/",
+        "src/components/",
+    ] {
+        for rel in all_files {
+            if rel.to_lowercase().starts_with(prefix) {
+                push_if_new(rel, &mut candidates);
+            }
+        }
+    }
+
+    filter_files_by_size_budget(
+        project_root,
+        candidates,
+        max_files,
+        max_single_bytes,
+        max_total_bytes,
+    )
+}
+
+pub fn normalize_git_remote_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let no_git = if trimmed.to_lowercase().ends_with(".git") {
+        &trimmed[..trimmed.len() - 4]
+    } else {
+        trimmed
+    };
+    let no_git = no_git.trim_end_matches('/');
+
+    if let Some(rest) = no_git.strip_prefix("git@") {
+        if let Some((host, path)) = rest.split_once(':') {
+            let host_clean = host.trim();
+            let path_clean = path.trim_start_matches('/');
+            if !host_clean.is_empty() && !path_clean.is_empty() {
+                return Some(format!("https://{host_clean}/{path_clean}"));
+            }
+        }
+    }
+
+    if let Some((scheme, rest)) = no_git.split_once("://") {
+        let scheme_low = scheme.to_lowercase();
+        if scheme_low == "ssh" || scheme_low == "http" || scheme_low == "https" {
+            let out_scheme = if scheme_low == "ssh" {
+                "https"
+            } else {
+                scheme_low.as_str()
+            };
+            if let Some((authority, path)) = rest.split_once('/') {
+                let host = authority.rsplit('@').next().unwrap_or(authority).trim();
+                let path_clean = path.trim_start_matches('/');
+                if !host.is_empty() && !path_clean.is_empty() {
+                    return Some(format!("{out_scheme}://{host}/{path_clean}"));
+                }
+            } else {
+                let host = rest.rsplit('@').next().unwrap_or(rest).trim();
+                if !host.is_empty() {
+                    return Some(format!("{out_scheme}://{host}"));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn brand_asset_priority(rel: &str) -> (u8, usize, String) {
+    let low = rel.to_lowercase();
+    let base = low.rsplit('/').next().unwrap_or(&low);
+    let score = if matches!(base, "icon.svg" | "icon.png" | "logo.svg" | "logo.png") {
+        0
+    } else if base.contains("logo") || base.contains("icon") {
+        1
+    } else {
+        2
+    };
+    (score, rel.len(), low)
+}
+
+pub fn discover_project_brand_assets(project_root: &Path) -> Vec<String> {
+    if !project_root.exists() {
+        return Vec::new();
+    }
+
+    fn collect_images(dir: &Path, root: &Path, depth_left: usize, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.')
+                || matches!(
+                    name_str.as_ref(),
+                    "node_modules" | "target" | "dist" | "build" | "coverage"
+                )
+            {
+                continue;
+            }
+            if path.is_dir() {
+                if depth_left > 0 {
+                    collect_images(&path, root, depth_left - 1, out);
+                }
+            } else if path.is_file() {
+                let low = name_str.to_lowercase();
+                if low.ends_with(".png") || low.ends_with(".svg") || low.ends_with(".webp") {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        let norm = rel.to_string_lossy().replace('\\', "/");
+                        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(&norm)) {
+                            out.push(norm);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let search_dirs: [(&str, usize); 8] = [
+        ("", 0),
+        ("src-tauri/icons", 0),
+        ("public", 1),
+        ("assets", 1),
+        ("src/assets", 1),
+        ("static", 1),
+        ("images", 1),
+        ("docs", 1),
+    ];
+
+    let mut found = Vec::new();
+    for (sub, depth) in search_dirs {
+        let target = if sub.is_empty() {
+            project_root.to_path_buf()
+        } else {
+            project_root.join(sub)
+        };
+        if target.is_dir() {
+            collect_images(&target, project_root, depth, &mut found);
+        }
+    }
+
+    if found.is_empty() {
+        return found;
+    }
+
+    let noisy_kw = ["square", "32x32", "64x64", "storelogo", "mipmap"];
+    let non_noisy: Vec<String> = found
+        .iter()
+        .filter(|rel| {
+            let low = rel.to_lowercase();
+            !noisy_kw.iter().any(|k| low.contains(k))
+        })
+        .cloned()
+        .collect();
+
+    let mut selected = if !non_noisy.is_empty() {
+        non_noisy
+    } else {
+        found
+    };
+    selected.sort_by_key(|rel| brand_asset_priority(rel));
+    selected.truncate(5);
+    selected
+}
+
+async fn run_git_short_cmd(project_root: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args).current_dir(project_root);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(1), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+async fn build_project_overview_snapshot(
+    project_root: &Path,
+    all_files: &[String],
+    is_cloud_exec: bool,
+) -> Option<String> {
+    let mut lines = Vec::new();
+
+    if let Some(raw_remote) = run_git_short_cmd(project_root, &["remote", "get-url", "origin"]).await
+    {
+        if let Some(clean_url) = normalize_git_remote_url(&raw_remote) {
+            lines.push(format!("- Dépôt Git (origin) : {clean_url}"));
+        }
+    }
+
+    if let Some(tag) = run_git_short_cmd(project_root, &["describe", "--tags", "--abbrev=0"]).await
+    {
+        lines.push(format!("- Dernier tag Git : {tag}"));
+    }
+
+    let assets = discover_project_brand_assets(project_root);
+    if !assets.is_empty() {
+        lines.push(format!("- Logos / icônes détectés : {}", assets.join(", ")));
+    }
+
+    if !all_files.is_empty() {
+        let max_tree = if is_cloud_exec { 60usize } else { 25usize };
+        let shown: Vec<&str> = all_files.iter().take(max_tree).map(String::as_str).collect();
+        let mut tree = shown.join("\n  ");
+        if all_files.len() > max_tree {
+            tree.push_str(&format!("\n  ... (+{} autres fichiers)", all_files.len() - max_tree));
+        }
+        lines.push(format!(
+            "- Arborescence des fichiers ({} indexés) :\n  {}",
+            all_files.len(),
+            tree
+        ));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CartographerPlan {
     target_files: Vec<String>,
+    read_only_files: Vec<String>,
     explicit_match: bool,
+    is_global_task: bool,
     strategy_note: String,
     cartographer_tokens: Option<(usize, usize)>,
 }
 
+fn is_markdown_only_targets(files: &[String]) -> bool {
+    !files.is_empty() && files.iter().all(|f| f.to_lowercase().ends_with(".md"))
+}
+
 async fn run_cartographer(
     project_root: &Path,
+    all_files: &[String],
     user_prompt: &str,
     attachments: Option<&[AttachedFile]>,
     settings: &AppSettings,
     carto_provider: &str,
     carto_model: &str,
+    exec_provider: &str,
     ollama_running: bool,
     is_design_task: bool,
 ) -> CartographerPlan {
-    let all_files = list_source_files_for_cartographer(project_root);
     if all_files.is_empty() {
+        let is_global_task = is_global_or_doc_task(user_prompt, &[]);
         return CartographerPlan {
             target_files: Vec::new(),
+            read_only_files: Vec::new(),
             explicit_match: false,
+            is_global_task,
             strategy_note: "Projet sans fichiers indexés".to_string(),
             cartographer_tokens: None,
         };
     }
 
-    let (mut tier1, explicit) = match_files_deterministically(user_prompt, attachments, &all_files);
-    if is_design_task && !tier1.is_empty() {
-        augment_design_target_files(&all_files, &mut tier1);
-    }
-    let budgeted_tier1 = filter_files_by_size_budget(project_root, tier1, 3, 20_480, 28_672);
-    if !budgeted_tier1.is_empty() {
-        return CartographerPlan {
-            target_files: budgeted_tier1,
-            explicit_match: explicit,
-            strategy_note: if explicit {
-                "0 tok déterministe (mention directe)".to_string()
-            } else {
-                "0 tok déterministe (mot-clé outillage)".to_string()
-            },
-            cartographer_tokens: None,
-        };
-    }
-
-    let can_call_llm = if carto_provider == "ollama" {
-        ollama_running
+    let is_cloud_exec = exec_provider != "ollama";
+    let exec_num_ctx = effective_num_ctx(settings);
+    let (max_target_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
+        (6usize, 65_536u64, 163_840u64)
+    } else if exec_num_ctx >= 16_384 {
+        (4usize, 32_768u64, 57_344u64)
     } else {
-        providers::find_provider_key(settings, carto_provider).is_some()
+        (3usize, 20_480u64, 28_672u64)
     };
+    let doc_focused_prompt = is_doc_focused_prompt(&user_prompt.to_lowercase());
 
-    if !can_call_llm || all_files.len() < 2 {
-        let mut fallback = Vec::new();
-        if is_design_task {
-            augment_design_target_files(&all_files, &mut fallback);
-        }
-        let budgeted = filter_files_by_size_budget(project_root, fallback, 3, 20_480, 28_672);
-        return CartographerPlan {
-            target_files: budgeted,
-            explicit_match: false,
-            strategy_note: "Ciblage auto CSS / repo-map Aider".to_string(),
-            cartographer_tokens: None,
-        };
+    let (mut tier1, explicit) = match_files_deterministically(user_prompt, attachments, all_files);
+    let tier1_doc_only = is_global_or_doc_task(user_prompt, &tier1) && is_markdown_only_targets(&tier1);
+    if is_design_task && !tier1.is_empty() && !tier1_doc_only && !doc_focused_prompt {
+        augment_design_target_files(all_files, &mut tier1);
     }
-
-    if all_files.len() > 400 {
-        let mut fallback = Vec::new();
-        if is_design_task {
-            augment_design_target_files(&all_files, &mut fallback);
-        }
-        let budgeted = filter_files_by_size_budget(project_root, fallback, 3, 20_480, 28_672);
-        return CartographerPlan {
-            target_files: budgeted,
-            explicit_match: false,
-            strategy_note: "Dépôt volumineux (>400 fichiers) · repo-map Aider".to_string(),
-            cartographer_tokens: None,
-        };
-    }
-
-    let mut prioritized = Vec::new();
-    let mut others = Vec::new();
-    for f in &all_files {
-        if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
-            prioritized.push(f.clone());
-        } else {
-            others.push(f.clone());
-        }
-    }
-    prioritized.extend(others);
-    let compact_files: Vec<String> = prioritized.into_iter().take(100).collect();
-
-    let sys = "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum 3 chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication.";
-    let user = format!(
-        "Fichiers:\n{}\n\nDemande:\n{}",
-        compact_files.join("\n"),
-        truncate_chars(user_prompt.trim(), 400)
+    let budgeted_tier1 = filter_files_by_size_budget(
+        project_root,
+        tier1,
+        max_target_files,
+        max_single_bytes,
+        max_total_bytes,
     );
 
-    match providers::call_provider_oneshot(carto_provider, carto_model, settings, sys, &user, 100, 0.0).await {
-        Ok((reply, p_tok, c_tok)) => {
-            let mut routed = Vec::new();
-            if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
-                if start < end {
-                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&reply[start..=end]) {
-                        for cand in arr {
-                            let clean = cand.trim().trim_start_matches("./");
-                            if let Some(canon) =
-                                all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
-                            {
-                                if !routed.contains(canon) {
-                                    routed.push(canon.clone());
+    let (target_files, explicit_match, base_note, cartographer_tokens) = if !budgeted_tier1.is_empty() {
+        let note = if explicit {
+            "0 tok déterministe (mention directe)".to_string()
+        } else {
+            "0 tok déterministe (mot-clé outillage)".to_string()
+        };
+        (budgeted_tier1, explicit, note, None)
+    } else {
+        let can_call_llm = if carto_provider == "ollama" {
+            ollama_running
+        } else {
+            providers::find_provider_key(settings, carto_provider).is_some()
+        };
+
+        if !can_call_llm || all_files.len() < 2 {
+            let mut fallback = Vec::new();
+            if is_design_task && !doc_focused_prompt {
+                augment_design_target_files(all_files, &mut fallback);
+            }
+            let budgeted = filter_files_by_size_budget(
+                project_root,
+                fallback,
+                max_target_files,
+                max_single_bytes,
+                max_total_bytes,
+            );
+            (budgeted, false, "Ciblage auto CSS / repo-map Aider".to_string(), None)
+        } else if all_files.len() > 400 {
+            let mut fallback = Vec::new();
+            if is_design_task && !doc_focused_prompt {
+                augment_design_target_files(all_files, &mut fallback);
+            }
+            let budgeted = filter_files_by_size_budget(
+                project_root,
+                fallback,
+                max_target_files,
+                max_single_bytes,
+                max_total_bytes,
+            );
+            (
+                budgeted,
+                false,
+                "Dépôt volumineux (>400 fichiers) · repo-map Aider".to_string(),
+                None,
+            )
+        } else {
+            let mut prioritized = Vec::new();
+            let mut others = Vec::new();
+            for f in all_files {
+                if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
+                    prioritized.push(f.clone());
+                } else {
+                    others.push(f.clone());
+                }
+            }
+            prioritized.extend(others);
+            let compact_limit = if is_cloud_exec { 200 } else { 100 };
+            let compact_files: Vec<String> = prioritized.into_iter().take(compact_limit).collect();
+
+            let sys = if is_cloud_exec {
+                "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum 6 chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication."
+            } else {
+                "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum 3 chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication."
+            };
+            let user = format!(
+                "Fichiers:\n{}\n\nDemande:\n{}",
+                compact_files.join("\n"),
+                truncate_chars(user_prompt.trim(), 400)
+            );
+
+            match providers::call_provider_oneshot(carto_provider, carto_model, settings, sys, &user, 120, 0.0).await {
+                Ok((reply, p_tok, c_tok)) => {
+                    let mut routed = Vec::new();
+                    if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
+                        if start < end {
+                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&reply[start..=end]) {
+                                for cand in arr {
+                                    let clean = cand.trim().trim_start_matches("./");
+                                    if let Some(canon) =
+                                        all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
+                                    {
+                                        if !routed.contains(canon) {
+                                            routed.push(canon.clone());
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    let routed_doc_only = is_global_or_doc_task(user_prompt, &routed)
+                        && is_markdown_only_targets(&routed);
+                    if is_design_task && !routed_doc_only && !doc_focused_prompt {
+                        augment_design_target_files(all_files, &mut routed);
+                    }
+                    let budgeted = filter_files_by_size_budget(
+                        project_root,
+                        routed,
+                        max_target_files,
+                        max_single_bytes,
+                        max_total_bytes,
+                    );
+                    let note = if budgeted.is_empty() {
+                        "Routeur IA (aucun fichier ciblé)".to_string()
+                    } else {
+                        format!("Routeur IA ({carto_provider})")
+                    };
+                    (budgeted, false, note, Some((p_tok, c_tok)))
+                }
+                Err(_) => {
+                    let mut fallback = Vec::new();
+                    if is_design_task && !doc_focused_prompt {
+                        augment_design_target_files(all_files, &mut fallback);
+                    }
+                    let budgeted = filter_files_by_size_budget(
+                        project_root,
+                        fallback,
+                        max_target_files,
+                        max_single_bytes,
+                        max_total_bytes,
+                    );
+                    (budgeted, false, "Repli repo-map Aider".to_string(), None)
                 }
             }
-            if is_design_task {
-                augment_design_target_files(&all_files, &mut routed);
-            }
-            let budgeted = filter_files_by_size_budget(project_root, routed, 3, 20_480, 28_672);
-            let note = if budgeted.is_empty() {
-                "Routeur IA (aucun fichier ciblé)".to_string()
-            } else {
-                format!("Routeur IA ({carto_provider})")
-            };
-            CartographerPlan {
-                target_files: budgeted,
-                explicit_match: false,
-                strategy_note: note,
-                cartographer_tokens: Some((p_tok, c_tok)),
-            }
         }
-        Err(_) => {
-            let mut fallback = Vec::new();
-            if is_design_task {
-                augment_design_target_files(&all_files, &mut fallback);
-            }
-            let budgeted = filter_files_by_size_budget(project_root, fallback, 3, 20_480, 28_672);
-            CartographerPlan {
-                target_files: budgeted,
-                explicit_match: false,
-                strategy_note: "Repli repo-map Aider".to_string(),
-                cartographer_tokens: None,
-            }
-        }
+    };
+
+    let is_global_task = is_global_or_doc_task(user_prompt, &target_files);
+    let read_only_files = collect_structural_context_files(
+        project_root,
+        all_files,
+        &target_files,
+        is_cloud_exec,
+        is_global_task,
+        exec_num_ctx,
+    );
+    let strategy_note = if read_only_files.is_empty() {
+        base_note
+    } else {
+        format!("{base_note} + {} réf. lecture seule", read_only_files.len())
+    };
+
+    CartographerPlan {
+        target_files,
+        read_only_files,
+        explicit_match,
+        is_global_task,
+        strategy_note,
+        cartographer_tokens,
     }
 }
 
@@ -1777,6 +2251,7 @@ pub fn choose_aider_strategy(
     explicit_match: bool,
     provider: &str,
     settings: &AppSettings,
+    is_global_task: bool,
 ) -> AiderStrategy {
     let mut max_file_lines = 0usize;
     let mut total_file_lines = 0usize;
@@ -1807,7 +2282,26 @@ pub fn choose_aider_strategy(
         }
     };
 
-    let map_tokens = if target_files.len() == 1 && explicit_match {
+    let num_ctx = effective_num_ctx(settings);
+    let map_tokens = if provider != "ollama" {
+        if is_global_task || target_files.is_empty() {
+            2048
+        } else if target_files.len() == 1 && explicit_match {
+            1024
+        } else {
+            1536
+        }
+    } else if num_ctx >= 16_384 {
+        if is_global_task || target_files.is_empty() {
+            1024
+        } else if target_files.len() == 1 && explicit_match {
+            256
+        } else {
+            512
+        }
+    } else if is_global_task {
+        384
+    } else if target_files.len() == 1 && explicit_match {
         0
     } else if !target_files.is_empty() {
         192
@@ -1815,7 +2309,9 @@ pub fn choose_aider_strategy(
         384
     };
 
-    let max_chat_history_tokens = if provider == "ollama" && effective_num_ctx(settings) <= 8192 {
+    let max_chat_history_tokens = if provider != "ollama" {
+        4096
+    } else if num_ctx <= 8192 {
         1024
     } else {
         2048
@@ -2368,6 +2864,7 @@ async fn execute_aider_cli(
     settings: &AppSettings,
     prompt: &str,
     target_files: &[String],
+    read_only_files: &[String],
     strategy: &AiderStrategy,
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<(String, usize, usize)> {
@@ -2413,6 +2910,13 @@ async fn execute_aider_cli(
     for file in target_files {
         args.push("--file".to_string());
         args.push(file.clone());
+    }
+
+    for ro_file in read_only_files {
+        if !target_files.iter().any(|t| t.eq_ignore_ascii_case(ro_file)) {
+            args.push("--read".to_string());
+            args.push(ro_file.clone());
+        }
     }
 
     args.push("--message".to_string());
@@ -2814,6 +3318,62 @@ async fn finish_cancelled_pipeline(
     Ok(result)
 }
 
+async fn append_context_sections_to_direct_prompt(
+    prompt: &mut String,
+    project_root: &Path,
+    project_snapshot: Option<&str>,
+    target_files: &[String],
+    read_only_files: &[String],
+    is_cloud: bool,
+) {
+    if let Some(snap) = project_snapshot {
+        if !snap.trim().is_empty() {
+            prompt.push_str(&format!("\n\n[Aperçu du dépôt]\n{}", snap.trim()));
+        }
+    }
+    if !target_files.is_empty() {
+        let max_targets = if is_cloud { 6 } else { 3 };
+        let clip_chars = if is_cloud { 16_000 } else { 12_000 };
+        let mut file_sections = Vec::new();
+        for rel in target_files.iter().take(max_targets) {
+            let full = project_root.join(rel);
+            if let Ok(content) = tokio::fs::read_to_string(&full).await {
+                let clipped = truncate_chars(&content, clip_chars);
+                file_sections.push(format!("### {rel}\n```\n{clipped}\n```"));
+            }
+        }
+        if !file_sections.is_empty() {
+            prompt.push_str(&format!(
+                "\n\n[Contenu actuel des fichiers cibles]\n{}",
+                file_sections.join("\n\n")
+            ));
+        }
+    }
+    if !read_only_files.is_empty() {
+        let mut ref_sections = Vec::new();
+        let mut total_chars = 0usize;
+        let max_total_chars = if is_cloud { 60_000 } else { 8_000 };
+        let clip_each = if is_cloud { 8_000 } else { 3_000 };
+        for rel in read_only_files {
+            if total_chars >= max_total_chars {
+                break;
+            }
+            let full = project_root.join(rel);
+            if let Ok(content) = tokio::fs::read_to_string(&full).await {
+                let clipped = truncate_chars(&content, clip_each);
+                total_chars += clipped.chars().count();
+                ref_sections.push(format!("### {rel}\n```\n{clipped}\n```"));
+            }
+        }
+        if !ref_sections.is_empty() {
+            prompt.push_str(&format!(
+                "\n\n[Fichiers de référence du projet (lecture seule)]\n{}",
+                ref_sections.join("\n\n")
+            ));
+        }
+    }
+}
+
 pub async fn run_prompt_pipeline(
     app: &AppHandle,
     state_lock: &Arc<Mutex<AppStateData>>,
@@ -3081,40 +3641,21 @@ pub async fn run_prompt_pipeline(
         }
     }
 
-    let aider_prompt_opt = if will_run_aider {
-        Some(build_aider_prompt(
-            &project.global_context,
-            &conv_ctx,
-            &user_prompt,
-            attachments.as_deref(),
-            &project.shared_directories,
-            architect_spec.as_deref(),
-        ))
-    } else {
-        None
-    };
-    let direct_prompt_opt = if !will_run_aider {
-        let mut p = build_augmented_prompt(
-            &project.global_context,
-            &conv_ctx,
-            &user_prompt,
-            attachments.as_deref(),
-            &project.shared_directories,
-        );
-        if let Some(spec) = architect_spec.as_deref() {
-            p.push_str(&format!("\n\n[Plan & Consignes Architecte]\n{spec}"));
-        }
-        Some(p)
-    } else {
-        None
-    };
-
     if !architect_llm_ran {
-        let init_prompt_ref = aider_prompt_opt
+        let att_chars: usize = attachments
             .as_deref()
-            .or(direct_prompt_opt.as_deref())
-            .unwrap_or("");
-        let init_prompt_tokens = (init_prompt_ref.len() as f64 / 3.8).ceil() as usize;
+            .unwrap_or(&[])
+            .iter()
+            .filter(|a| !a.is_image)
+            .filter_map(|a| a.content.as_ref())
+            .map(|c| c.len())
+            .sum();
+        let approx_chars = project.global_context.len().min(2000)
+            + conv_ctx.len().min(800)
+            + user_prompt.len()
+            + att_chars
+            + 160;
+        let init_prompt_tokens = (approx_chars as f64 / 3.8).ceil() as usize;
         arch_tokens_used = init_prompt_tokens;
         let _ = app.emit(
             "aider:tokens",
@@ -3182,6 +3723,8 @@ pub async fn run_prompt_pipeline(
         },
     );
 
+    let (exec_prov, exec_model) = resolve_agent_slot(exec_role, &settings);
+
     // SUB-AGENT 2/5: Cartographe & Analyseur
     let (carto_prov, carto_model) = resolve_agent_slot("cartographer", &settings);
     emit_stage(
@@ -3207,6 +3750,7 @@ pub async fn run_prompt_pipeline(
         },
     );
 
+    let all_project_files = list_source_files_for_cartographer(&project_root_path);
     let carto = if will_run_aider {
         let plan = tokio::select! {
             biased;
@@ -3225,11 +3769,13 @@ pub async fn run_prompt_pipeline(
             }
             p = run_cartographer(
                 &project_root_path,
+                &all_project_files,
                 &user_prompt,
                 attachments.as_deref(),
                 &settings,
                 &carto_prov,
                 &carto_model,
+                &exec_prov,
                 stack.ollama_running,
                 exec_role == "designer",
             ) => p,
@@ -3272,10 +3818,26 @@ pub async fn run_prompt_pipeline(
         );
         plan
     } else {
+        let is_global_task = is_global_or_doc_task(&user_prompt, &[]);
+        let read_only_files = collect_structural_context_files(
+            &project_root_path,
+            &all_project_files,
+            &[],
+            exec_prov != "ollama",
+            is_global_task,
+            effective_num_ctx(&settings),
+        );
+        let strategy_note = if read_only_files.is_empty() {
+            "Mode direct".to_string()
+        } else {
+            format!("Mode direct + {} réf. lecture seule", read_only_files.len())
+        };
         CartographerPlan {
             target_files: Vec::new(),
+            read_only_files,
             explicit_match: false,
-            strategy_note: "Mode direct".to_string(),
+            is_global_task,
+            strategy_note,
             cartographer_tokens: None,
         }
     };
@@ -3306,14 +3868,61 @@ pub async fn run_prompt_pipeline(
         },
     );
 
+    let is_cloud_exec = exec_prov != "ollama";
+    let project_snapshot = if carto.is_global_task {
+        build_project_overview_snapshot(&project_root_path, &all_project_files, is_cloud_exec).await
+    } else {
+        None
+    };
+
+    let aider_prompt_opt = if will_run_aider {
+        Some(build_aider_prompt(
+            &project.global_context,
+            &conv_ctx,
+            &user_prompt,
+            attachments.as_deref(),
+            &project.shared_directories,
+            architect_spec.as_deref(),
+            is_cloud_exec,
+            carto.is_global_task,
+            project_snapshot.as_deref(),
+        ))
+    } else {
+        None
+    };
+    let direct_prompt_opt = if !will_run_aider {
+        let mut p = build_augmented_prompt(
+            &project.global_context,
+            &conv_ctx,
+            &user_prompt,
+            attachments.as_deref(),
+            &project.shared_directories,
+        );
+        if let Some(spec) = architect_spec.as_deref() {
+            p.push_str(&format!("\n\n[Plan & Consignes Architecte]\n{spec}"));
+        }
+        append_context_sections_to_direct_prompt(
+            &mut p,
+            &project_root_path,
+            project_snapshot.as_deref(),
+            &carto.target_files,
+            &carto.read_only_files,
+            is_cloud_exec,
+        )
+        .await;
+        Some(p)
+    } else {
+        None
+    };
+
     // SUB-AGENT 3/5: Exécution (Designer / Codeur / Refactoring / Testeur)
-    let (exec_prov, exec_model) = resolve_agent_slot(exec_role, &settings);
     let strategy = choose_aider_strategy(
         &project_root_path,
         &carto.target_files,
         carto.explicit_match,
         &exec_prov,
         &settings,
+        carto.is_global_task,
     );
 
     let stage3_label = format!(
@@ -3322,12 +3931,18 @@ pub async fn run_prompt_pipeline(
         exec_prov,
         exec_model
     );
+    let ref_suffix = if carto.read_only_files.is_empty() {
+        String::new()
+    } else {
+        format!(" (+{} réf.)", carto.read_only_files.len())
+    };
     let stage3_detail = if will_run_aider {
         format!(
-            "Format {} · map {} tok · {} fichier(s) sur {}:{}",
+            "Format {} · map {} tok · {} fichier(s){} sur {}:{}",
             strategy.edit_format,
             strategy.map_tokens,
             carto.target_files.len(),
+            ref_suffix,
             exec_prov,
             exec_model
         )
@@ -3382,6 +3997,7 @@ pub async fn run_prompt_pipeline(
             &settings,
             &aider_prompt,
             &carto.target_files,
+            &carto.read_only_files,
             &strategy,
             &mut cancel_rx,
         )
@@ -3448,22 +4064,15 @@ pub async fn run_prompt_pipeline(
                     if let Some(spec) = architect_spec.as_deref() {
                         fallback_prompt.push_str(&format!("\n\n[Plan & Consignes Architecte]\n{spec}"));
                     }
-                    if !carto.target_files.is_empty() {
-                        let mut file_sections = Vec::new();
-                        for rel in carto.target_files.iter().take(3) {
-                            let full = project_root_path.join(rel);
-                            if let Ok(content) = tokio::fs::read_to_string(&full).await {
-                                let clipped = truncate_chars(&content, 12_000);
-                                file_sections.push(format!("### {rel}\n```\n{clipped}\n```"));
-                            }
-                        }
-                        if !file_sections.is_empty() {
-                            fallback_prompt.push_str(&format!(
-                                "\n\n[Contenu actuel des fichiers cibles]\n{}",
-                                file_sections.join("\n\n")
-                            ));
-                        }
-                    }
+                    append_context_sections_to_direct_prompt(
+                        &mut fallback_prompt,
+                        &project_root_path,
+                        project_snapshot.as_deref(),
+                        &carto.target_files,
+                        &carto.read_only_files,
+                        true,
+                    )
+                    .await;
 
                     let direct_sys = "Tu es AiderStudio, un expert en architecture logicielle et génération de code. RÈGLE STRICTE : Réponds TOUJOURS EN FRANÇAIS. Pour modifier ou créer un fichier, écris son chemin exact sans backtick suivi du bloc de code complet (ex: ### src/App.vue puis ```vue ... ```) ou un <tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"...\",\"content\":\"...\"}}</tool_call>.";
                     let direct_fallback_res = tokio::select! {
@@ -3813,6 +4422,7 @@ pub async fn run_prompt_pipeline(
                 true,
                 &test_prov,
                 &settings,
+                false,
             );
             if let Some(aider_bin) = stack.aider_bin.as_deref() {
                 match execute_aider_cli(
@@ -3826,6 +4436,7 @@ pub async fn run_prompt_pipeline(
                     &settings,
                     &test_prompt,
                     &changed_paths,
+                    &[],
                     &test_strategy,
                     &mut cancel_rx,
                 )
@@ -4258,28 +4869,44 @@ mod tests {
 
         let settings = AppSettings::default();
 
-        // Single small explicit file -> whole + map 0
-        let s1 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, "ollama", &settings);
+        // Ollama 8K: Single small explicit non-global file -> whole + map 0 + history 1024
+        let s1 = choose_aider_strategy(
+            &dir,
+            &["vite.config.js".to_string()],
+            true,
+            "ollama",
+            &settings,
+            false,
+        );
         assert_eq!(s1.edit_format, "whole");
         assert_eq!(s1.map_tokens, 0);
         assert_eq!(s1.max_chat_history_tokens, 1024);
 
-        // Large single explicit file -> diff + map 0
-        let s2 = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], true, "ollama", &settings);
+        // Ollama 8K: Large single explicit file -> diff + map 0
+        let s2 = choose_aider_strategy(
+            &dir,
+            &["src/Large.ts".to_string()],
+            true,
+            "ollama",
+            &settings,
+            false,
+        );
         assert_eq!(s2.edit_format, "diff");
         assert_eq!(s2.map_tokens, 0);
 
-        // Non-explicit match -> diff + map 192
-        let s2b = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], false, "ollama", &settings);
+        // Ollama 8K: Non-explicit match -> diff + map 192
+        let s2b = choose_aider_strategy(
+            &dir,
+            &["src/Large.ts".to_string()],
+            false,
+            "ollama",
+            &settings,
+            false,
+        );
         assert_eq!(s2b.edit_format, "diff");
         assert_eq!(s2b.map_tokens, 192);
 
-        // Cloud provider on 150-line file (> 120 threshold) -> diff + 2048 chat history
-        let s_cloud = choose_aider_strategy(&dir, &["src/Medium.ts".to_string()], true, "gemini", &settings);
-        assert_eq!(s_cloud.edit_format, "diff");
-        assert_eq!(s_cloud.max_chat_history_tokens, 2048);
-
-        // 2 small files -> whole + map 192
+        // Ollama 8K: 2 small files -> whole + map 192
         std::fs::write(dir.join("package.json"), "{}\n").unwrap();
         let s3 = choose_aider_strategy(
             &dir,
@@ -4287,14 +4914,72 @@ mod tests {
             true,
             "ollama",
             &settings,
+            false,
         );
         assert_eq!(s3.edit_format, "whole");
         assert_eq!(s3.map_tokens, 192);
 
+        // Ollama 16K: explicit single file vs global task
+        let mut settings_16k = settings.clone();
+        settings_16k.context_window_tokens = 16_384;
+        let s_16k_single = choose_aider_strategy(
+            &dir,
+            &["vite.config.js".to_string()],
+            true,
+            "ollama",
+            &settings_16k,
+            false,
+        );
+        assert_eq!(s_16k_single.map_tokens, 256);
+        assert_eq!(s_16k_single.max_chat_history_tokens, 2048);
+
+        let s_16k_global = choose_aider_strategy(
+            &dir,
+            &["vite.config.js".to_string()],
+            true,
+            "ollama",
+            &settings_16k,
+            true,
+        );
+        assert_eq!(s_16k_global.map_tokens, 1024);
+        assert_eq!(s_16k_global.max_chat_history_tokens, 2048);
+
+        // Cloud provider on 150-line non-global file (> 120 threshold) -> diff + map 1024 + 4096 chat history
+        let s_cloud = choose_aider_strategy(
+            &dir,
+            &["src/Medium.ts".to_string()],
+            true,
+            "gemini",
+            &settings,
+            false,
+        );
+        assert_eq!(s_cloud.edit_format, "diff");
+        assert_eq!(s_cloud.map_tokens, 1024);
+        assert_eq!(s_cloud.max_chat_history_tokens, 4096);
+
+        // Cloud provider on global task -> map 2048 + 4096 chat history
+        let s_cloud_global = choose_aider_strategy(
+            &dir,
+            &["src/Medium.ts".to_string()],
+            true,
+            "gemini",
+            &settings,
+            true,
+        );
+        assert_eq!(s_cloud_global.map_tokens, 2048);
+        assert_eq!(s_cloud_global.max_chat_history_tokens, 4096);
+
         // Manual override -> diff
         let mut s_diff_override = settings.clone();
         s_diff_override.aider_edit_format = "diff".to_string();
-        let s4 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, "ollama", &s_diff_override);
+        let s4 = choose_aider_strategy(
+            &dir,
+            &["vite.config.js".to_string()],
+            true,
+            "ollama",
+            &s_diff_override,
+            false,
+        );
         assert_eq!(s4.edit_format, "diff");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4305,6 +4990,12 @@ mod tests {
         assert_eq!(
             classify_prompt_role("Crée un design moderne avec menu à gauche 100% hauteur"),
             ("designer", false)
+        );
+        assert_eq!(
+            classify_prompt_role(
+                "Prépare un joli README.md avec le logo de l'application centré en haut et des badges"
+            ),
+            ("coder", false)
         );
         assert_eq!(
             classify_prompt_role("Factorise et nettoie ce module TypeScript"),
@@ -4483,5 +5174,136 @@ export function cleanHelper(x: number): number {
             Some("Optimisation cache Vite")
         );
         assert_eq!(clean_generated_title("   \n\"\"  "), None);
+    }
+
+    #[test]
+    fn test_list_project_files_includes_github_workflows_but_skips_git() {
+        let dir = make_temp_dir("github_idx");
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join(".github/workflows/build.yml"), "name: CI\n").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(dir.join("src/App.vue"), "<template></template>\n").unwrap();
+
+        let files = list_project_files_internal(&dir);
+        assert!(files.contains(&".github/workflows/build.yml".to_string()));
+        assert!(files.contains(&"src/App.vue".to_string()));
+        assert!(!files.iter().any(|f| f.starts_with(".git/")));
+        assert!(!files.iter().any(|f| f == ".env"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_global_or_doc_task() {
+        assert!(is_global_or_doc_task("Mets à jour la doc", &["README.md".to_string()]));
+        assert!(is_global_or_doc_task("Écris un guide", &["docs/install.md".to_string()]));
+        assert!(is_global_or_doc_task("Prépare un joli README avec la stack technique", &[]));
+        assert!(is_global_or_doc_task("Fais un audit de l'architecture du projet", &[]));
+        assert!(!is_global_or_doc_task(
+            "Corrige le padding du bouton dans LeMenu.vue",
+            &["src/components/LeMenu.vue".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_collect_structural_context_files_cloud_vs_local() {
+        let dir = make_temp_dir("struct_ctx");
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(dir.join("src/stores")).unwrap();
+        std::fs::create_dir_all(dir.join("src-tauri/src")).unwrap();
+
+        let files = vec![
+            "README.md".to_string(),
+            "package.json".to_string(),
+            "src-tauri/Cargo.toml".to_string(),
+            "src-tauri/tauri.conf.json".to_string(),
+            ".github/workflows/build.yml".to_string(),
+            "src/App.vue".to_string(),
+            "src/stores/studio.ts".to_string(),
+            "src-tauri/src/models.rs".to_string(),
+            "src-tauri/src/lib.rs".to_string(),
+        ];
+        for f in &files {
+            std::fs::write(dir.join(f), format!("// {f}\n")).unwrap();
+        }
+
+        let target = vec!["README.md".to_string()];
+
+        // Non-global with target -> empty (no overhead for focused edits)
+        assert!(collect_structural_context_files(&dir, &files, &target, true, false, 8192).is_empty());
+
+        // Cloud global -> up to 12 structural files, excludes target README.md
+        let cloud_refs = collect_structural_context_files(&dir, &files, &target, true, true, 8192);
+        assert!(!cloud_refs.contains(&"README.md".to_string()));
+        assert!(cloud_refs.contains(&"package.json".to_string()));
+        assert!(cloud_refs.contains(&"src-tauri/Cargo.toml".to_string()));
+        assert!(cloud_refs.contains(&".github/workflows/build.yml".to_string()));
+        assert!(cloud_refs.contains(&"src/App.vue".to_string()));
+        assert_eq!(cloud_refs.len(), 8);
+
+        // Local 8K global -> capped at 3 files
+        let local_refs = collect_structural_context_files(&dir, &files, &target, false, true, 8192);
+        assert_eq!(local_refs.len(), 3);
+        assert!(!local_refs.contains(&"README.md".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_normalize_git_remote_url() {
+        assert_eq!(
+            normalize_git_remote_url("git@github.com:superfeedboy/AiderStudio.git").as_deref(),
+            Some("https://github.com/superfeedboy/AiderStudio")
+        );
+        assert_eq!(
+            normalize_git_remote_url("ssh://git@github.com/superfeedboy/AiderStudio.git").as_deref(),
+            Some("https://github.com/superfeedboy/AiderStudio")
+        );
+        assert_eq!(
+            normalize_git_remote_url("https://ghp_secret@github.com/superfeedboy/AiderStudio.git/")
+                .as_deref(),
+            Some("https://github.com/superfeedboy/AiderStudio")
+        );
+        assert_eq!(normalize_git_remote_url("   "), None);
+    }
+
+    #[test]
+    fn test_discover_project_brand_assets() {
+        let dir = make_temp_dir("brand_assets");
+        std::fs::create_dir_all(dir.join("src-tauri/icons")).unwrap();
+        std::fs::create_dir_all(dir.join("public")).unwrap();
+        std::fs::write(dir.join("src-tauri/icons/icon.png"), b"png").unwrap();
+        std::fs::write(dir.join("src-tauri/icons/Square150x150Logo.png"), b"png").unwrap();
+        std::fs::write(dir.join("src-tauri/icons/32x32.png"), b"png").unwrap();
+        std::fs::write(dir.join("public/logo.svg"), b"<svg/>").unwrap();
+
+        let assets = discover_project_brand_assets(&dir);
+        assert!(assets.contains(&"src-tauri/icons/icon.png".to_string()));
+        assert!(assets.contains(&"public/logo.svg".to_string()));
+        assert!(!assets.iter().any(|a| a.contains("Square150x150Logo")));
+        assert!(!assets.iter().any(|a| a.contains("32x32")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_aider_prompt_with_project_snapshot() {
+        let prompt = build_aider_prompt(
+            "Stack Vue 3 + Tauri",
+            "Session README",
+            "Génère README.md",
+            None,
+            &[],
+            None,
+            true,
+            true,
+            Some("- Dépôt Git (origin) : https://github.com/superfeedboy/AiderStudio"),
+        );
+        assert!(prompt.contains("[Aperçu du dépôt]"));
+        assert!(prompt.contains("https://github.com/superfeedboy/AiderStudio"));
+        assert!(prompt.contains("aucun lien fictif ni placeholder"));
     }
 }
