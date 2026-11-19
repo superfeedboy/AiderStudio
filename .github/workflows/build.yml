@@ -1,12 +1,15 @@
-name: Build AiderStudio (macOS & Windows)
+name: Build & Release AiderStudio
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [master, main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -17,9 +20,11 @@ jobs:
           - os: macos-latest
             target: universal-apple-darwin
             name: macOS Universal
+            artifact: aiderstudio-macos-universal
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: Windows x64
+            artifact: aiderstudio-windows-x64
 
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -47,17 +52,111 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Typecheck & build frontend
-        run: npm run build
+      - name: Sync app version from git tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node .github/scripts/sync-version.mjs "${{ github.ref_name }}"
 
-      - name: Build Tauri application
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Tauri bundles
+        run: npx tauri build --ci --target ${{ matrix.target }}
+
+      - name: Collect distributable packages
+        shell: bash
+        run: |
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            echo "Bundle directory not found: $BUNDLE_DIR" >&2
+            exit 1
+          fi
+
+          mkdir -p release-packages
+          find "$BUNDLE_DIR" -type f \( -path "*/dmg/*.dmg" -o -path "*/msi/*.msi" -o -path "*/nsis/*.exe" \) -exec cp {} release-packages/ \;
+
+          if [ -z "$(ls -A release-packages)" ]; then
+            echo "No distributable packages (.dmg, .msi, .exe) found in $BUNDLE_DIR" >&2
+            find "$BUNDLE_DIR" -maxdepth 3 -ls >&2 || true
+            exit 1
+          fi
+
+          ls -lh release-packages
+
+      - name: Upload build packages
+        uses: actions/upload-artifact@v4
         with:
-          tagName: v__VERSION__
-          releaseName: AiderStudio v__VERSION__
-          releaseBody: "Build automatique macOS & Windows de AiderStudio."
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.target }}
+          name: ${{ matrix.artifact }}
+          path: release-packages/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download build packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aiderstudio-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release packages
+        shell: bash
+        run: |
+          if [ ! -d release-assets ] || [ -z "$(ls -A release-assets)" ]; then
+            echo "No release packages downloaded into release-assets" >&2
+            exit 1
+          fi
+          ls -lh release-assets
+
+      - name: Generate templated release notes
+        shell: bash
+        run: |
+          node .github/scripts/generate-release-notes.mjs \
+            --tag "${{ github.ref_name }}" \
+            --assets-dir release-assets \
+            --output release-notes.md
+          cat release-notes.md
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == *-* ]]; then
+            IS_PRERELEASE="true"
+          else
+            IS_PRERELEASE="false"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "AiderStudio $TAG" \
+              --notes-file release-notes.md \
+              --draft=false \
+              --prerelease="$IS_PRERELEASE"
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            EXTRA_ARGS=()
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              EXTRA_ARGS+=(--prerelease)
+            fi
+            gh release create "$TAG" release-assets/* \
+              --title "AiderStudio $TAG" \
+              --notes-file release-notes.md \
+              "${EXTRA_ARGS[@]}"
+          fi
