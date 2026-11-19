@@ -120,7 +120,6 @@ const defaultSettings: AppSettings = {
   theme: "system",
   ollamaUrl: "http://127.0.0.1:11434",
   ollamaModel: "qwen2.5-coder:3b",
-  aiderPath: "aider",
   autoStartOllama: true,
   aiderEditFormat: "auto",
   activeTarget: "agent",
@@ -146,8 +145,7 @@ export const useStudioStore = defineStore("studio", () => {
   });
 
   const stackStatus = ref<StackStatus>({
-    aiderInstalled: false,
-    aiderBin: null,
+    nativeEngineReady: true,
     ollamaInstalled: false,
     ollamaRunning: false,
     modelAvailable: false,
@@ -161,6 +159,7 @@ export const useStudioStore = defineStore("studio", () => {
   const codeMode = ref<CodeDrawerMode>("review");
   const codeWidth = ref<number>(420);
   const activeDiffFilePath = ref<string | null>(null);
+  const activeDiffTargetLine = ref<number | null>(null);
   const activeArtifactId = ref<string | null>(null);
 
   // Screen aspect ratio & ultra-wide 50/50 detection (ratio > standard 16:9, e.g. ratio >= 2.05 & width >= 1550)
@@ -590,7 +589,7 @@ export const useStudioStore = defineStore("studio", () => {
             name: "AiderStudio",
             rootPath: "/Users/gilles/Documents/Dev/AiderStudio",
             globalContext:
-              "Application Tauri v2 + Vue 3 + Rust orchestrant Aider & Ollama.",
+              "Application Tauri v2 + Vue 3 + Rust avec moteur natif multi-agents (Ollama & fournisseurs cloud).",
             updatedAt: now,
           },
         ],
@@ -1230,10 +1229,20 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  function openReview(filePath?: string) {
+  function openReview(filePath?: string, targetLine?: number | null) {
     codeMode.value = "review";
+    activeDiffTargetLine.value =
+      typeof targetLine === "number" && Number.isFinite(targetLine) && targetLine > 0
+        ? targetLine
+        : null;
     if (filePath) {
       activeDiffFilePath.value = filePath;
+      const alreadyLoaded = activeConversation.value?.modifiedFiles.some(
+        (f) => f.path === filePath
+      );
+      if (!alreadyLoaded) {
+        void refreshDiff();
+      }
     } else if (
       !activeDiffFilePath.value &&
       activeConversation.value?.modifiedFiles.length
@@ -1374,6 +1383,7 @@ export const useStudioStore = defineStore("studio", () => {
     isWideScreen,
     autoToolsEnabled,
     activeDiffFilePath,
+    activeDiffTargetLine,
     activeArtifactId,
     settingsOpen,
     settingsActiveTab,

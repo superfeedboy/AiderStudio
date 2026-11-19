@@ -407,12 +407,12 @@ const agentRoles: {
             placeholder="8192"
           />
           <span class="field-hint">
-            Transmis automatiquement comme <code>num_ctx</code> à votre serveur Ollama via Aider. Astuce RTX 4060Ti 8 Go + <code>q5_K_M</code> : activez <code>OLLAMA_FLASH_ATTENTION=1</code> et <code>OLLAMA_KV_CACHE_TYPE=q8_0</code> côté Ollama pour débloquer <strong>16K</strong> 100% en VRAM.
+            Transmis automatiquement comme <code>num_ctx</code> à votre serveur Ollama. Astuce RTX 4060Ti 8 Go + <code>q5_K_M</code> : activez <code>OLLAMA_FLASH_ATTENTION=1</code> et <code>OLLAMA_KV_CACHE_TYPE=q8_0</code> côté Ollama pour débloquer <strong>16K</strong> 100% en VRAM.
           </span>
         </div>
 
         <div class="field">
-          <label>Format d'édition Aider</label>
+          <label>Format d'édition (Moteur natif)</label>
           <div class="segmented">
             <button
               v-for="fmt in editFormats"
@@ -428,15 +428,6 @@ const agentRoles: {
           <span class="field-hint">
             <strong>Auto (8K)</strong> : utilise <code>whole</code> pour les fichiers ≤ 250 lignes sur Ollama (≤ 120 lignes sur cloud) et bascule en <code>diff</code> au-delà.
           </span>
-        </div>
-
-        <div class="field">
-          <label>Binaire Aider CLI</label>
-          <input
-            v-model="draft.aiderPath"
-            type="text"
-            placeholder="aider"
-          />
         </div>
 
         <div class="stack-probe-section">
@@ -459,21 +450,16 @@ const agentRoles: {
               </div>
             </div>
 
-            <div class="probe-card" :class="store.stackStatus.aiderInstalled ? 'is-installed' : 'is-missing'">
+            <div class="probe-card is-installed">
               <div class="probe-header">
-                <span class="probe-title">Aider CLI</span>
-                <span class="probe-status-tag" :class="store.stackStatus.aiderInstalled ? 'ok' : 'danger'">
-                  {{ store.stackStatus.aiderInstalled ? 'Prêt' : 'Non détecté' }}
+                <span class="probe-title">Moteur Natif Rust</span>
+                <span class="probe-status-tag ok">
+                  Prêt
                 </span>
               </div>
               <p class="probe-desc">
-                {{ store.stackStatus.aiderInstalled ? 'Pilote de code pair-programming en ligne de commande.' : 'Aider CLI n\'a pas été détecté dans votre environnement.' }}
+                Moteur pair-programming intégré (streaming multi-fournisseurs, patch fuzzy, outils & MCP, zéro dépendance Python/Aider).
               </p>
-              <div v-if="!store.stackStatus.aiderInstalled" class="probe-action-row">
-                <a href="https://aider.chat/docs/install.html" target="_blank" rel="noopener noreferrer" class="download-link-btn">
-                  📥 Installer Aider (`pipx install aider-chat`)
-                </a>
-              </div>
             </div>
           </div>
         </div>

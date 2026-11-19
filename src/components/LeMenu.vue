@@ -136,12 +136,12 @@ function handleDeleteProject(proj: Project) {
           </span>
         </div>
         <div class="stack-row">
-          <span class="stack-label">Aider CLI</span>
+          <span class="stack-label">Moteur Natif</span>
           <span
             class="stack-status"
-            :class="store.stackStatus.aiderInstalled ? 'ok' : 'muted'"
+            :class="store.stackStatus.nativeEngineReady ? 'ok' : 'muted'"
           >
-            {{ store.stackStatus.aiderInstalled ? "Prêt" : "Non détecté" }}
+            {{ store.stackStatus.nativeEngineReady ? "Prêt" : "Indisponible" }}
           </span>
         </div>
         <button

@@ -4,7 +4,7 @@
 
 <h1>AiderStudio</h1>
 
-<p><strong>IDE desktop de pair-programming IA pilotant Aider CLI avec Ollama en local et fournisseurs cloud externes.</strong></p>
+<p><strong>IDE desktop de pair-programming IA doté d'un moteur natif Rust multi-agents, avec Ollama en local et fournisseurs cloud externes.</strong></p>
 
 <p>
   <a href="https://github.com/superfeedboy/AiderStudio/actions/workflows/build.yml"><img src="https://img.shields.io/github/actions/workflow/status/superfeedboy/AiderStudio/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=Build%20%26%20Release" alt="Build & Release" /></a>
@@ -15,7 +15,6 @@
   <a href="https://v2.tauri.app/"><img src="https://img.shields.io/badge/Tauri-v2-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri v2" /></a>
   <a href="https://vuejs.org/"><img src="https://img.shields.io/badge/Vue-3.5-4FC08D?style=flat-square&logo=vuedotjs&logoColor=white" alt="Vue 3" /></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2021-DEA584?style=flat-square&logo=rust&logoColor=black" alt="Rust" /></a>
-  <a href="https://aider.chat/"><img src="https://img.shields.io/badge/Engine-Aider%20CLI-0ea5e9?style=flat-square" alt="Aider CLI" /></a>
   <a href="https://ollama.com/"><img src="https://img.shields.io/badge/LLM%20Local-Ollama-10b981?style=flat-square&logo=ollama&logoColor=white" alt="Ollama" /></a>
 </p>
 
@@ -25,20 +24,22 @@
 
 ## Présentation
 
-**AiderStudio** est une application desktop native (**macOS Universal** et **Windows x64**) conçue pour le pair-programming assisté par IA. Elle associe la puissance d'édition de code de **[Aider](https://aider.chat/)** à une interface moderne en 3 volets, une orchestration multi-agents et un fonctionnement hybride combinant des modèles locaux via **[Ollama](https://ollama.com/)** et des fournisseurs cloud externes (**Gemini**, **OpenAI**, **Anthropic**, **DeepSeek**, **OpenRouter**, **Mistral**).
+**AiderStudio** est une application desktop native (**macOS Universal** et **Windows x64**) conçue pour le pair-programming assisté par IA. Elle embarque un **moteur d'exécution et d'édition de code 100 % natif en Rust** (zéro dépendance Python ou Aider CLI), une interface moderne en 3 volets, une orchestration multi-agents et un fonctionnement hybride combinant des modèles locaux via **[Ollama](https://ollama.com/)** et des fournisseurs cloud externes (**Gemini**, **OpenAI**, **Anthropic**, **DeepSeek**, **OpenRouter**, **Mistral**).
 
 L'application est optimisée pour tirer le meilleur parti des modèles locaux à fenêtre de contexte contrainte (8K–16K) tout en permettant de déléguer certains rôles spécialisés à des modèles cloud lorsque c'est nécessaire.
 
 ## Fonctionnalités
 
-- **Orchestration multi-agents configurable** : pipeline collaboratif jusqu'à **7 rôles spécialisés** (*Architecte & Orchestrateur*, *Cartographe 0-tok*, *Designer UI/UX*, *Codeur*, *Refactoring*, *Testeur*, *Synthétiseur*), chacun routable indépendamment vers Ollama ou un fournisseur API externe, avec trace d'exécution détaillée par étape.
-- **Pilotage adaptatif d'Aider CLI** : stratégie automatique du format d'édition (`Auto (8K)` : mode `whole` pour les fichiers ≤ 250 lignes sur Ollama / ≤ 120 lignes sur cloud, bascule en `diff` au-delà), génération automatique de `.aiderignore` pour protéger la fenêtre de contexte, initialisation Git automatique et transmission dynamique de `num_ctx`.
+- **Moteur natif Rust autonome (zéro dépendance Python/Aider)** : streaming SSE/NDJSON unifié sur les 7 fournisseurs avec gestion native du raisonnement (`<think>`, DeepSeek `reasoning_content`, Claude `thinking`, Gemini `thought`), prompt caching éphémère, retry exponentiel et support multimodal (images).
+- **Éditeur chirurgical fuzzy & boucle d'auto-réparation** : stratégie adaptative (`Auto (8K)` : mode `whole` pour les fichiers ≤ 250 lignes sur Ollama / ≤ 120 lignes sur cloud, bascule en `diff` au-delà), applicateur `SEARCH/REPLACE` tolérant à 4 niveaux (exact, espaces fin de ligne, réindentation automatique, ellipses et similarité Levenshtein), protection anti-troncature et boucle multi-tours d'auto-réparation.
+- **Orchestration multi-agents configurable** : pipeline collaboratif jusqu'à **7 rôles spécialisés** (*Architecte & Orchestrateur*, *Cartographe 0-tok*, *Designer UI/UX*, *Codeur*, *Refactoring*, *Testeur*, *Synthétiseur*), chacun routable indépendamment vers Ollama ou un fournisseur API externe, avec auto-correction de compilation (`cargo check` / `vue-tsc`) et trace d'exécution détaillée par étape.
+- **Repo-Map légère & outils de navigation natifs** : indexation rapide des signatures multi-langages budgétée en tokens, respect natif de `.gitignore` / `.aiderignore` / `.studioignore`, et outils agentiques intégrés (`read_file`, `search_code`, `list_files`, `write_file`, `delete_file`, `run_command`).
 - **Mode hybride Local (Ollama) & Fournisseurs Cloud** : diagnostic temps réel et démarrage automatique d'Ollama, gestion et validation de clés API avec découverte automatique des modèles pour **Gemini**, **OpenAI**, **Anthropic (Claude)**, **DeepSeek**, **OpenRouter** et **Mistral**.
 - **Espace de travail en 3 panneaux & mode écran large** : `Le Menu` (arborescence multi-projets, dossiers partagés, multi-conversations avec auto-titrage et renommage), `La Discussion` (coloration syntaxique Highlight.js, mentions `@file`, `@tool`, `@plugin`, `@mcp`, pièces jointes fichiers & images, flux temps réel et annulation de prompt) et `Le Code` (tiroir redimensionnable passant en split 50/50 sur grand écran).
 - **Revue Git Diff, Undo granulaire & Artefacts** : inspection des fichiers modifiés (lignes ajoutées, modifiées, supprimées), annulation ciblée par fichier ou restauration globale (`Tout défaire`), et prévisualisation intégrée des artefacts générés (code, HTML, SVG).
 - **HUD temps réel (Télémétrie, Contexte & Quotas)** : suivi matériel natif (CPU, GPU, RAM, température sur macOS et Windows), barre de contexte horizontale stackée par sous-agent avec alertes et compactage `/compact` (seuils 70 % / 80 % / 95 %), et suivi journalier de la consommation de tokens API externes par fournisseur.
 - **Gestion avancée des contextes & mémoire** : séparation entre le contexte global permanent du projet et l'objectif/mémoire dédié à chaque conversation, éditables et réinitialisables à la volée.
-- **Intégration MCP (Model Context Protocol)** : ajout et test de serveurs MCP `stdio` (préconfigurations SQLite et PostgreSQL ou serveurs personnalisés) pour exposer des bases de données et outils locaux aux agents.
+- **Intégration MCP (Model Context Protocol)** : ajout, test et invocation directe en boucle agentique de serveurs MCP `stdio` (préconfigurations SQLite et PostgreSQL ou serveurs personnalisés) pour exposer des bases de données et outils locaux aux agents.
 - **Thèmes & distribution desktop** : thèmes *Système*, *Sombre* et *Clair* ; builds automatisés via GitHub Actions pour **macOS Universal (`.dmg`)** et **Windows x64 (`.msi` / `.exe`)**.
 
 ## Stack technique & Prérequis
@@ -48,47 +49,15 @@ L'application est optimisée pour tirer le meilleur parti des modèles locaux à
 | Couche | Technologies |
 | :--- | :--- |
 | **Frontend** | [Vue 3](https://vuejs.org/) (`3.5`) · [TypeScript](https://www.typescriptlang.org/) (`5.9`) · [Pinia](https://pinia.vuejs.org/) (`2.3`) · [Vite](https://vite.dev/) (`6.4`) · [Highlight.js](https://highlightjs.org/) (`11.12`) |
-| **Backend Desktop** | [Tauri v2](https://v2.tauri.app/) (`2.12`) · [Rust](https://www.rust-lang.org/) (édition 2021, `tokio`, `reqwest`, `serde`) |
+| **Backend & Moteur IA** | [Tauri v2](https://v2.tauri.app/) (`2.12`) · [Rust](https://www.rust-lang.org/) (édition 2021, `tokio`, `reqwest`, `serde`, moteur SSE/patcher/repo-map natif) |
 | **CI/CD & Packaging** | Node.js `22+` · Toolchain Rust stable · GitHub Actions (`.dmg`, `.msi`, `.exe`) |
 
-### Dépendances runtime indispensables
+### Dépendances runtime
 
-Pour exécuter **AiderStudio** en local, les outils suivants doivent être installés sur la machine :
+**AiderStudio** est un binaire autonome qui ne nécessite plus Python ni Aider CLI. Seuls les outils suivants sont utilisés selon votre mode :
 
 - **[Git](https://git-scm.com/)** : indispensable pour le suivi des diffs et les fonctions d'annulation (`Undo`).
-- **[Aider CLI](https://aider.chat/)** — [Documentation d'installation](https://aider.chat/docs/install.html) · [Dépôt GitHub](https://github.com/Aider-AI/aider) : moteur pair-programming piloté par AiderStudio (requiert Python 3.8–3.13).
-
-  ```bash
-  # Méthode recommandée via pipx
-  pipx install aider-chat
-
-  # Ou via l'installeur officiel Python
-  python -m pip install aider-install
-  aider-install
-  ```
-
-  <details>
-  <summary>Installeurs rapides (macOS / Linux / Windows PowerShell)</summary>
-
-  ```bash
-  # macOS / Linux
-  curl -LsSf https://aider.chat/install.sh | sh
-  ```
-
-  ```powershell
-  # Windows (PowerShell)
-  powershell -ExecutionPolicy ByPass -c "irm https://aider.chat/install.ps1 | iex"
-  ```
-
-  </details>
-
-  Vérifiez l'installation dans votre terminal :
-
-  ```bash
-  aider --version
-  ```
-
-- **[Ollama](https://ollama.com/)** — [Téléchargement](https://ollama.com/download) · [Modèle Qwen2.5-Coder](https://ollama.com/library/qwen2.5-coder) · [Dépôt GitHub](https://github.com/ollama/ollama) : moteur d'inférence LLM local utilisé par défaut et comme repli.
+- **[Ollama](https://ollama.com/)** *(optionnel si vous utilisez uniquement des API cloud)* — [Téléchargement](https://ollama.com/download) · [Modèle Qwen2.5-Coder](https://ollama.com/library/qwen2.5-coder) · [Dépôt GitHub](https://github.com/ollama/ollama) : moteur d'inférence LLM local utilisé par défaut et comme repli.
 
 ### Compiler l'application depuis les sources
 
@@ -185,7 +154,7 @@ Assurez-vous que la colonne **`PROCESSOR`** affiche **`100% GPU`** (sans débord
 Renseignez les champs suivants dans **Paramètres → Général** d'AiderStudio :
 
 - **URL API Ollama** : `http://127.0.0.1:11434`
-- **Modèle Ollama par défaut (local / repli)** : `qwen2.5-coder-7b-aider` (vous pouvez aussi sélectionner directement `qwen2.5-coder:7b-instruct-q5_K_M`, AiderStudio transmettant automatiquement `num_ctx` à Aider via `aider_model_settings.yml`)
+- **Modèle Ollama par défaut (local / repli)** : `qwen2.5-coder-7b-aider` (vous pouvez aussi sélectionner directement `qwen2.5-coder:7b-instruct-q5_K_M`, AiderStudio transmettant automatiquement `num_ctx` directement à Ollama via le moteur natif)
 - **Fenêtre de contexte cible Ollama (tokens)** : `16384` (`16K`) ou `8192` (`8K`), alignée sur la valeur `num_ctx` du `Modelfile`
-- **Format d'édition Aider** : `Auto (8K)`
-- **Binaire Aider CLI** : `aider` (ou le chemin complet vers votre exécutable) et cochez **Démarrer Ollama automatiquement si arrêté**
+- **Format d'édition (Moteur natif)** : `Auto (8K)`
+- Cochez **Démarrer Ollama automatiquement si arrêté**

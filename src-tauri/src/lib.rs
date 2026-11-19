@@ -2,7 +2,9 @@ mod engine;
 mod git_diff;
 mod mcp;
 mod models;
+mod patcher;
 mod providers;
+mod repo_map;
 mod storage;
 mod telemetry;
 

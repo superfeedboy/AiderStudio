@@ -3,9 +3,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import hljs from "highlight.js";
 import "highlight.js/styles/github-dark.css";
 import { useStudioStore } from "../stores/studio";
-import type { AttachedFile, ChatMessage, ModifiedFileDiff } from "../types/studio";
+import type { AttachedFile, ChatMessage, FileChangeSummary } from "../types/studio";
 import AppLogo from "./AppLogo.vue";
 import LeHud from "./LeHud.vue";
+import MarkdownInline from "./MarkdownInline.vue";
+import { tokenizeInline, type InlineToken, type ResolvedFileTarget } from "../utils/markdownInline";
 
 const store = useStudioStore();
 const scrollRef = ref<HTMLElement | null>(null);
@@ -36,29 +38,25 @@ async function toggleFilesDropdown(msgId: string) {
   const willOpen = !openFilesDropdown.value[msgId];
   openFilesDropdown.value[msgId] = willOpen;
 
+  if (!willOpen) return;
+
   await nextTick();
 
-  if (scrollRef.value) {
-    const wrapEl = document.getElementById(`diff-dropdown-${msgId}`);
-    if (willOpen) {
-      if (wrapEl) {
-        wrapEl.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
-      // Scroll forcé pour faire remonter le dropdown et éviter qu'il ne soit masqué par le prompt
-      window.setTimeout(() => {
-        if (scrollRef.value) {
-          scrollRef.value.scrollTop = Math.min(
-            scrollRef.value.scrollHeight,
-            scrollRef.value.scrollTop + 180
-          );
-        }
-      }, 90);
-    } else {
-      // Re-scroll pour réajuster le flux dès qu'on le range
-      if (wrapEl) {
-        wrapEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }
-    }
+  const container = scrollRef.value;
+  const wrapEl = document.getElementById(`diff-dropdown-${msgId}`);
+  if (!container || !wrapEl) return;
+
+  const containerRect = container.getBoundingClientRect();
+  const wrapRect = wrapEl.getBoundingClientRect();
+  const bottomMargin = 20;
+  const topMargin = 16;
+
+  if (wrapRect.bottom > containerRect.bottom - bottomMargin) {
+    const needed = wrapRect.bottom - (containerRect.bottom - bottomMargin);
+    const maxShift = Math.max(0, wrapRect.top - (containerRect.top + topMargin));
+    container.scrollTop += Math.min(needed, maxShift);
+  } else if (wrapRect.top < containerRect.top + topMargin) {
+    container.scrollTop -= containerRect.top + topMargin - wrapRect.top;
   }
 }
 
@@ -95,6 +93,7 @@ const builtInTools: MentionItem[] = [
   { id: "tool-write", name: "write_file", description: "Créer ou écraser un fichier local", category: "tool", tag: "@tool:write_file" },
   { id: "tool-create", name: "create_file", description: "Créer un nouveau fichier dans le projet", category: "tool", tag: "@tool:create_file" },
   { id: "tool-read", name: "read_file", description: "Lire le contenu d'un fichier", category: "tool", tag: "@tool:read_file" },
+  { id: "tool-search", name: "search_code", description: "Rechercher un motif dans le code du projet", category: "tool", tag: "@tool:search_code" },
   { id: "tool-cmd", name: "run_command", description: "Exécuter une commande shell locale", category: "tool", tag: "@tool:run_command" },
   { id: "tool-list", name: "list_files", description: "Lister les fichiers d'un dossier", category: "tool", tag: "@tool:list_files" },
   { id: "tool-diff", name: "git_diff", description: "Inspecter les modifications Git", category: "tool", tag: "@tool:git_diff" },
@@ -423,45 +422,13 @@ watch(
   { flush: "post" }
 );
 
-type InlineToken =
-  | { kind: "text"; text: string }
-  | { kind: "bold"; text: string }
-  | { kind: "italic"; text: string }
-  | { kind: "code"; text: string };
-
 type MarkdownBlock =
   | { kind: "heading"; level: 1 | 2 | 3; tokens: InlineToken[] }
   | { kind: "paragraph"; tokens: InlineToken[] }
   | { kind: "quote"; tokens: InlineToken[] }
   | { kind: "ul"; items: { indent: number; tokens: InlineToken[] }[] }
   | { kind: "ol"; items: InlineToken[][] }
-  | { kind: "code"; lang: string; body: string; filename?: string };
-
-function tokenizeInline(input: string): InlineToken[] {
-  const tokens: InlineToken[] = [];
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
-  let lastIdx = 0;
-  let match: RegExpExecArray | null;
-
-  while ((match = regex.exec(input)) !== null) {
-    if (match.index > lastIdx) {
-      tokens.push({ kind: "text", text: input.slice(lastIdx, match.index) });
-    }
-    const raw = match[0];
-    if (raw.startsWith("`") && raw.endsWith("`")) {
-      tokens.push({ kind: "code", text: raw.slice(1, -1) });
-    } else if (raw.startsWith("**") && raw.endsWith("**")) {
-      tokens.push({ kind: "bold", text: raw.slice(2, -2) });
-    } else if (raw.startsWith("*") && raw.endsWith("*")) {
-      tokens.push({ kind: "italic", text: raw.slice(1, -1) });
-    }
-    lastIdx = regex.lastIndex;
-  }
-  if (lastIdx < input.length) {
-    tokens.push({ kind: "text", text: input.slice(lastIdx) });
-  }
-  return tokens;
-}
+  | { kind: "code"; lang: string; body: string; filename?: string; streaming?: boolean };
 
 function parseMarkdownProse(prose: string): MarkdownBlock[] {
   const blocks: MarkdownBlock[] = [];
@@ -600,18 +567,64 @@ function guessFilename(lang: string, body: string, explicitHint?: string): strin
   return extMap[cleanLang] || `code.${cleanLang || "txt"}`;
 }
 
-function renderCodeHtml(code: string, lang: string): string {
+const HLJS_LANG_ALIASES: Record<string, string> = {
+  vue: "xml",
+  html: "xml",
+  htm: "xml",
+  svelte: "xml",
+  svg: "xml",
+  ts: "typescript",
+  tsx: "typescript",
+  mts: "typescript",
+  cts: "typescript",
+  js: "javascript",
+  jsx: "javascript",
+  mjs: "javascript",
+  cjs: "javascript",
+  rs: "rust",
+  py: "python",
+  sh: "bash",
+  zsh: "bash",
+  shell: "bash",
+  console: "bash",
+  yml: "yaml",
+  md: "markdown",
+};
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderCodeHtml(code: string, lang: string, isStreaming = false): string {
+  if (!code) return "";
   const cleanLang = (lang || "").trim().toLowerCase();
+  const mappedLang = HLJS_LANG_ALIASES[cleanLang] || cleanLang;
   try {
-    if (cleanLang && hljs.getLanguage(cleanLang)) {
-      return hljs.highlight(code, { language: cleanLang, ignoreIllegals: true }).value;
+    if (
+      mappedLang &&
+      mappedLang !== "code" &&
+      mappedLang !== "txt" &&
+      mappedLang !== "text" &&
+      hljs.getLanguage(mappedLang)
+    ) {
+      return hljs.highlight(code, { language: mappedLang, ignoreIllegals: true }).value;
+    }
+    if (
+      isStreaming ||
+      !cleanLang ||
+      cleanLang === "code" ||
+      cleanLang === "txt" ||
+      cleanLang === "text" ||
+      code.length > 20_000
+    ) {
+      return escapeHtml(code);
     }
     return hljs.highlightAuto(code).value;
   } catch {
-    return code
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+    return escapeHtml(code);
   }
 }
 
@@ -631,30 +644,126 @@ function downloadCodeBlock(code: string, filename: string) {
   }
 }
 
-function parseMarkdownMessage(content: string): MarkdownBlock[] {
-  const blocks: MarkdownBlock[] = [];
-  const fenceRegex = /```([a-zA-Z0-9_\-+]*)(?:[ :]([^\n]+))?\n([\s\S]*?)```/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
+function parseFenceInfo(info: string): { lang: string; hint: string } {
+  const trimmed = info.trim();
+  if (!trimmed) return { lang: "code", hint: "" };
 
-  while ((match = fenceRegex.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      const prose = content.slice(lastIndex, match.index);
-      blocks.push(...parseMarkdownProse(prose));
+  const colonIdx = trimmed.indexOf(":");
+  if (colonIdx > 0) {
+    const left = trimmed.slice(0, colonIdx).trim();
+    const right = trimmed.slice(colonIdx + 1).trim();
+    if (left && !/\s/.test(left)) {
+      return { lang: left, hint: right };
     }
-    const lang = (match[1] || "code").trim();
-    const hint = (match[2] || "").trim();
-    const body = match[3] ?? "";
-    const filename = guessFilename(lang, body, hint);
-    blocks.push({ kind: "code", lang, body, filename });
-    lastIndex = fenceRegex.lastIndex;
   }
 
-  if (lastIndex < content.length) {
-    const tail = content.slice(lastIndex);
-    blocks.push(...parseMarkdownProse(tail));
+  const spaceMatch = /^([a-zA-Z0-9_\-+#.]+)\s+(.+)$/.exec(trimmed);
+  if (spaceMatch) {
+    return { lang: spaceMatch[1], hint: spaceMatch[2].trim() };
   }
 
+  if (/^[a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,10}$/.test(trimmed)) {
+    const ext = trimmed.split(".").pop() || "code";
+    return { lang: ext, hint: trimmed };
+  }
+
+  return { lang: trimmed, hint: "" };
+}
+
+function extractPrecedingPathHint(proseLines: string[]): string | undefined {
+  for (let i = proseLines.length - 1; i >= 0; i--) {
+    const line = proseLines[i].trim();
+    if (!line) continue;
+    const isHeadingOrPathLine =
+      line.startsWith("#") || /^[`*_\s]*[a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,10}[`*_\s:]*$/.test(line);
+    const match =
+      /(?:^|[\s"'\*#`:(])([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,10})(?:[\s"'\*`:).,;]|$)/.exec(
+        line
+      );
+    if (match && match[1]) {
+      const candidate = match[1];
+      if (isHeadingOrPathLine || candidate.includes("/") || candidate.includes("\\")) {
+        return candidate;
+      }
+    }
+    break;
+  }
+  return undefined;
+}
+
+function sanitizeLiveContent(raw: string): string {
+  if (!raw) return "";
+  return raw
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+    .replace(/<tool_call(?:\s[^>]*)?>[\s\S]*$/g, "")
+    .replace(/<tool(?:_c(?:a(?:l(?:l)?)?)?)?$/g, "")
+    .replace(/^\s*```(?:json:)?tool_call\b[^\n]*\n[\s\S]*?^\s*```\s*$/gm, "")
+    .replace(/^\s*```(?:json:)?tool_call\b[^\n]*(?:\n[\s\S]*)?$/m, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function parseMarkdownMessage(content: string, isStreaming = false): MarkdownBlock[] {
+  const blocks: MarkdownBlock[] = [];
+  const normalized = (content || "").replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  let proseLines: string[] = [];
+  let i = 0;
+
+  const flushProse = () => {
+    if (proseLines.length > 0) {
+      blocks.push(...parseMarkdownProse(proseLines.join("\n")));
+      proseLines = [];
+    }
+  };
+
+  while (i < lines.length) {
+    const openMatch = /^\s*(`{3,})(.*)$/.exec(lines[i]);
+    if (openMatch && !openMatch[2].includes("`")) {
+      const openTicks = openMatch[1].length;
+      const { lang, hint } = parseFenceInfo(openMatch[2]);
+      const precedingHint = hint || extractPrecedingPathHint(proseLines);
+
+      flushProse();
+
+      const codeLines: string[] = [];
+      let closed = false;
+      i++;
+
+      while (i < lines.length) {
+        const closeMatch = /^\s*(`{3,})\s*$/.exec(lines[i]);
+        if (closeMatch && closeMatch[1].length >= openTicks) {
+          closed = true;
+          i++;
+          break;
+        }
+        codeLines.push(lines[i]);
+        i++;
+      }
+
+      if (!closed && isStreaming && codeLines.length > 0) {
+        if (/^\s*`{1,2}\s*$/.test(codeLines[codeLines.length - 1])) {
+          codeLines.pop();
+        }
+      }
+
+      const body = codeLines.join("\n");
+      const filename = guessFilename(lang, body, precedingHint);
+      blocks.push({
+        kind: "code",
+        lang,
+        body,
+        filename,
+        streaming: isStreaming && !closed,
+      });
+      continue;
+    }
+
+    proseLines.push(lines[i]);
+    i++;
+  }
+
+  flushProse();
   return blocks;
 }
 
@@ -718,20 +827,52 @@ function messageDiffStats(
   return null;
 }
 
-function getFileListForMessage(msg: ChatMessage, idx: number): ModifiedFileDiff[] {
-  if (idx === lastAssistantIndex.value && conv.value?.modifiedFiles) {
-    return conv.value.modifiedFiles;
+function getFileListForMessage(msg: ChatMessage, idx: number): FileChangeSummary[] {
+  if (idx === lastAssistantIndex.value && (conv.value?.modifiedFiles.length ?? 0) > 0) {
+    return conv.value!.modifiedFiles;
+  }
+  if (msg.filesSummary && msg.filesSummary.length > 0) {
+    return msg.filesSummary;
   }
   return [];
 }
 
-function getFileStatus(file: ModifiedFileDiff): "created" | "modified" | "deleted" {
-  if (file.removed === 0 && file.added > 0) return "created";
-  if (file.added === 0 && file.removed > 0) return "deleted";
+function canUndoMessageFiles(idx: number): boolean {
+  return idx === lastAssistantIndex.value && (conv.value?.modifiedFiles.length ?? 0) > 0;
+}
+
+function getAvailableDiffPaths(msg?: ChatMessage): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const addPath = (p?: string) => {
+    const clean = (p || "").trim();
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      paths.push(clean);
+    }
+  };
+  for (const f of conv.value?.modifiedFiles ?? []) {
+    addPath(f.path);
+  }
+  if (msg?.filesSummary) {
+    for (const f of msg.filesSummary) {
+      addPath(f.path);
+    }
+  }
+  return paths;
+}
+
+function handleOpenFileInReview(payload: ResolvedFileTarget) {
+  store.openReview(payload.path, payload.line);
+}
+
+function getFileStatus(file: FileChangeSummary): "created" | "modified" | "deleted" {
+  if ((file.modified ?? 0) === 0 && file.removed === 0 && file.added > 0) return "created";
+  if ((file.modified ?? 0) === 0 && file.added === 0 && file.removed > 0) return "deleted";
   return "modified";
 }
 
-function getFileStatusLabel(file: ModifiedFileDiff): string {
+function getFileStatusLabel(file: FileChangeSummary): string {
   const status = getFileStatus(file);
   if (status === "created") return "CRÉÉ";
   if (status === "deleted") return "SUPPRIMÉ";
@@ -1200,7 +1341,7 @@ async function copyCodeBlock(key: string, code: string) {
             }}
           </span>
           <span class="meta-chip">
-            {{ store.stackStatus.aiderInstalled ? "Aider CLI prêt" : "Mode Ollama direct" }}
+            {{ store.stackStatus.nativeEngineReady ? "Moteur natif prêt" : "Moteur en attente" }}
           </span>
         </div>
       </div>
@@ -1396,12 +1537,13 @@ async function copyCodeBlock(key: string, code: string) {
                       </div>
                     </div>
                     <div class="trace-step-summary">
-                      <template v-for="(tok, tIdx) in tokenizeInline(step.summary)" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="tokenizeInline(step.summary)"
+                        :available-paths="getAvailableDiffPaths(msg)"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </div>
                   </div>
                 </div>
@@ -1412,36 +1554,40 @@ async function copyCodeBlock(key: string, code: string) {
                     :key="tbIdx"
                   >
                     <h1 v-if="block.kind === 'heading' && block.level === 1" class="tmd-h1">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths(msg)"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </h1>
                     <h2 v-else-if="block.kind === 'heading' && block.level === 2" class="tmd-h2">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths(msg)"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </h2>
                     <h3 v-else-if="block.kind === 'heading' && block.level === 3" class="tmd-h3">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths(msg)"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </h3>
                     <blockquote v-else-if="block.kind === 'quote'" class="tmd-quote">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths(msg)"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </blockquote>
                     <ul v-else-if="block.kind === 'ul'" class="tmd-ul">
                       <li
@@ -1449,32 +1595,35 @@ async function copyCodeBlock(key: string, code: string) {
                         :key="liIdx"
                         :style="{ marginLeft: `${item.indent * 14}px` }"
                       >
-                        <template v-for="(tok, tIdx) in item.tokens" :key="tIdx">
-                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                          <template v-else>{{ tok.text }}</template>
-                        </template>
+                        <MarkdownInline
+                          :tokens="item.tokens"
+                          :available-paths="getAvailableDiffPaths(msg)"
+                          :project-root="store.activeProject?.rootPath"
+                          variant="thinking"
+                          @open-file="handleOpenFileInReview"
+                        />
                       </li>
                     </ul>
                     <ol v-else-if="block.kind === 'ol'" class="tmd-ol">
                       <li v-for="(item, liIdx) in block.items" :key="liIdx">
-                        <template v-for="(tok, tIdx) in item" :key="tIdx">
-                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                          <template v-else>{{ tok.text }}</template>
-                        </template>
+                        <MarkdownInline
+                          :tokens="item"
+                          :available-paths="getAvailableDiffPaths(msg)"
+                          :project-root="store.activeProject?.rootPath"
+                          variant="thinking"
+                          @open-file="handleOpenFileInReview"
+                        />
                       </li>
                     </ol>
-                    <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
+                    <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang, Boolean(block.streaming))" /></pre>
                     <p v-else-if="block.kind === 'paragraph'" class="tmd-p">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths(msg)"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </p>
                   </template>
                 </div>
@@ -1488,39 +1637,39 @@ async function copyCodeBlock(key: string, code: string) {
                 :key="bIdx"
               >
                 <h1 v-if="block.kind === 'heading' && block.level === 1" class="md-h1">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                    <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths(msg)"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </h1>
 
                 <h2 v-else-if="block.kind === 'heading' && block.level === 2" class="md-h2">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                    <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths(msg)"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </h2>
 
                 <h3 v-else-if="block.kind === 'heading' && block.level === 3" class="md-h3">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                    <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths(msg)"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </h3>
 
                 <blockquote v-else-if="block.kind === 'quote'" class="md-quote">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                    <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths(msg)"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </blockquote>
 
                 <ul v-else-if="block.kind === 'ul'" class="md-ul">
@@ -1529,23 +1678,23 @@ async function copyCodeBlock(key: string, code: string) {
                     :key="liIdx"
                     :style="{ marginLeft: `${item.indent * 16}px` }"
                   >
-                    <template v-for="(tok, tIdx) in item.tokens" :key="tIdx">
-                      <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                      <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                      <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                      <template v-else>{{ tok.text }}</template>
-                    </template>
+                    <MarkdownInline
+                      :tokens="item.tokens"
+                      :available-paths="getAvailableDiffPaths(msg)"
+                      :project-root="store.activeProject?.rootPath"
+                      @open-file="handleOpenFileInReview"
+                    />
                   </li>
                 </ul>
 
                 <ol v-else-if="block.kind === 'ol'" class="md-ol">
                   <li v-for="(item, liIdx) in block.items" :key="liIdx">
-                    <template v-for="(tok, tIdx) in item" :key="tIdx">
-                      <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                      <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                      <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                      <template v-else>{{ tok.text }}</template>
-                    </template>
+                    <MarkdownInline
+                      :tokens="item"
+                      :available-paths="getAvailableDiffPaths(msg)"
+                      :project-root="store.activeProject?.rootPath"
+                      @open-file="handleOpenFileInReview"
+                    />
                   </li>
                 </ol>
 
@@ -1609,12 +1758,12 @@ async function copyCodeBlock(key: string, code: string) {
                 </div>
 
                 <p v-else-if="block.kind === 'paragraph'" class="md-p">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                    <code v-else-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths(msg)"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </p>
               </template>
             </div>
@@ -1627,6 +1776,7 @@ async function copyCodeBlock(key: string, code: string) {
               :class="{ 'is-open': openFilesDropdown[msg.id] }"
             >
               <button
+                type="button"
                 class="diff-dropdown-trigger"
                 :title="openFilesDropdown[msg.id] ? 'Masquer la liste des fichiers modifiés' : 'Afficher les fichiers modifiés et leurs modifications'"
                 @click="toggleFilesDropdown(msg.id)"
@@ -1661,7 +1811,7 @@ async function copyCodeBlock(key: string, code: string) {
               </button>
 
               <!-- Menu déroulant Dropdown -->
-              <div v-if="openFilesDropdown[msg.id]" class="diff-dropdown-menu halo-hud custom-scroll">
+              <div v-if="openFilesDropdown[msg.id]" class="diff-dropdown-menu halo-hud">
                 <div class="diff-menu-header">
                   <div class="diff-menu-header-left">
                     <span class="diff-menu-header-text">Fichiers modifiés</span>
@@ -1678,7 +1828,8 @@ async function copyCodeBlock(key: string, code: string) {
                     </div>
                   </div>
                   <button
-                    v-if="getFileListForMessage(msg, msgIdx).length > 0"
+                    v-if="canUndoMessageFiles(msgIdx)"
+                    type="button"
                     class="diff-undo-all-action-btn"
                     title="Annuler toutes les modifications apportées aux fichiers du projet"
                     @click.stop="confirmUndoAll()"
@@ -1693,7 +1844,7 @@ async function copyCodeBlock(key: string, code: string) {
                 <div v-if="getFileListForMessage(msg, msgIdx).length === 0" class="diff-menu-empty">
                   Aucun détail de fichier spécifique pour ce message.
                 </div>
-                <div v-else class="diff-menu-list">
+                <div v-else class="diff-menu-list custom-scroll">
                   <div
                     v-for="file in getFileListForMessage(msg, msgIdx)"
                     :key="file.path"
@@ -1707,10 +1858,13 @@ async function copyCodeBlock(key: string, code: string) {
                     <span class="menu-file-path">{{ file.path }}</span>
                     <div class="menu-file-actions">
                       <div class="menu-file-delta">
+                        <span v-if="file.modified > 0" class="c-mod">~{{ file.modified }}</span>
                         <span v-if="file.added > 0" class="c-add">+{{ file.added }}</span>
                         <span v-if="file.removed > 0" class="c-del">-{{ file.removed }}</span>
                       </div>
                       <button
+                        v-if="canUndoMessageFiles(msgIdx)"
+                        type="button"
                         class="menu-file-undo-btn"
                         :title="`Annuler les modifications de ${file.path}`"
                         @click.stop="confirmUndoFile(file.path)"
@@ -1724,7 +1878,7 @@ async function copyCodeBlock(key: string, code: string) {
                 </div>
 
                 <div class="diff-menu-footer">
-                  <button class="diff-full-review-cta" @click="store.openReview()">
+                  <button type="button" class="diff-full-review-cta" @click="store.openReview()">
                     <span>Ouvrir l'éditeur de review complet</span>
                     <svg class="cta-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                       <line x1="5" y1="12" x2="19" y2="12" />
@@ -1737,7 +1891,7 @@ async function copyCodeBlock(key: string, code: string) {
 
             <!-- Relative Timestamp -->
             <div class="msg-timestamp">
-              Aider ({{ msg.stageSummary || store.settings.ollamaModel }}) · {{ formatRelativeTime(msg.createdAt) }}
+              Studio ({{ msg.stageSummary || store.settings.ollamaModel }}) · {{ formatRelativeTime(msg.createdAt) }}
             </div>
           </article>
         </div>
@@ -1745,7 +1899,7 @@ async function copyCodeBlock(key: string, code: string) {
         <!-- LIVE STREAMING CARD (Displayed while IA is processing) -->
         <div v-if="store.isProcessing" class="msg-wrapper is-assistant is-live">
           <article class="assistant-article live-article">
-            <!-- Live Thinking block avec Flux Aider intégré -->
+            <!-- Live Thinking block avec Flux Moteur intégré -->
             <div class="thinking-block live-thinking">
               <div class="thinking-header is-live">
                 <div class="thinking-title">
@@ -1755,7 +1909,7 @@ async function copyCodeBlock(key: string, code: string) {
                   <span>Activité de l'IA</span>
                 </div>
 
-                <!-- Onglets Réflexion / Flux Aider intégrés sous le prompt -->
+                <!-- Onglets Réflexion / Flux Moteur intégrés sous le prompt -->
                 <div class="thinking-tabs-group">
                   <button
                     type="button"
@@ -1771,7 +1925,7 @@ async function copyCodeBlock(key: string, code: string) {
                     :class="{ active: liveTab === 'stream' }"
                     @click="liveTab = 'stream'"
                   >
-                    Flux Aider
+                    Flux Moteur
                     <span v-if="store.liveStreamLines.length > 0" class="stream-count-dot">
                       {{ store.liveStreamLines.length }}
                     </span>
@@ -1838,12 +1992,13 @@ async function copyCodeBlock(key: string, code: string) {
                         </div>
                       </div>
                       <div class="trace-step-summary">
-                        <template v-for="(tok, tIdx) in tokenizeInline(step.summary)" :key="tIdx">
-                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                          <template v-else>{{ tok.text }}</template>
-                        </template>
+                        <MarkdownInline
+                          :tokens="tokenizeInline(step.summary)"
+                          :available-paths="getAvailableDiffPaths()"
+                          :project-root="store.activeProject?.rootPath"
+                          variant="thinking"
+                          @open-file="handleOpenFileInReview"
+                        />
                       </div>
                     </div>
                   </div>
@@ -1855,41 +2010,46 @@ async function copyCodeBlock(key: string, code: string) {
                     <template
                       v-for="(block, lbIdx) in parseMarkdownMessage(
                         store.liveThinking ||
-                          'Analyse du prompt, sélection des outils et préparation du code...'
+                          'Analyse du prompt, sélection des outils et préparation du code...',
+                        Boolean(store.liveThinking)
                       )"
                       :key="lbIdx"
                     >
                     <h1 v-if="block.kind === 'heading' && block.level === 1" class="tmd-h1">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths()"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </h1>
                     <h2 v-else-if="block.kind === 'heading' && block.level === 2" class="tmd-h2">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths()"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </h2>
                     <h3 v-else-if="block.kind === 'heading' && block.level === 3" class="tmd-h3">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths()"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </h3>
                     <blockquote v-else-if="block.kind === 'quote'" class="tmd-quote">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths()"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </blockquote>
                     <ul v-else-if="block.kind === 'ul'" class="tmd-ul">
                       <li
@@ -1897,73 +2057,134 @@ async function copyCodeBlock(key: string, code: string) {
                         :key="liIdx"
                         :style="{ marginLeft: `${item.indent * 14}px` }"
                       >
-                        <template v-for="(tok, tIdx) in item.tokens" :key="tIdx">
-                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                          <template v-else>{{ tok.text }}</template>
-                        </template>
+                        <MarkdownInline
+                          :tokens="item.tokens"
+                          :available-paths="getAvailableDiffPaths()"
+                          :project-root="store.activeProject?.rootPath"
+                          variant="thinking"
+                          @open-file="handleOpenFileInReview"
+                        />
                       </li>
                     </ul>
                     <ol v-else-if="block.kind === 'ol'" class="tmd-ol">
                       <li v-for="(item, liIdx) in block.items" :key="liIdx">
-                        <template v-for="(tok, tIdx) in item" :key="tIdx">
-                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                          <template v-else>{{ tok.text }}</template>
-                        </template>
+                        <MarkdownInline
+                          :tokens="item"
+                          :available-paths="getAvailableDiffPaths()"
+                          :project-root="store.activeProject?.rootPath"
+                          variant="thinking"
+                          @open-file="handleOpenFileInReview"
+                        />
                       </li>
                     </ol>
-                    <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
+                    <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang, Boolean(block.streaming))" /></pre>
                     <p v-else-if="block.kind === 'paragraph'" class="tmd-p">
-                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
-                        <template v-else>{{ tok.text }}</template>
-                      </template>
+                      <MarkdownInline
+                        :tokens="block.tokens"
+                        :available-paths="getAvailableDiffPaths()"
+                        :project-root="store.activeProject?.rootPath"
+                        variant="thinking"
+                        @open-file="handleOpenFileInReview"
+                      />
                     </p>
                   </template>
                   </div>
                 </template>
 
-                <!-- Vue Flux Aider intégrée -->
+                <!-- Vue Flux Moteur intégrée -->
                 <pre
                   v-else
                   class="stream-log-live custom-scroll"
-                >{{ store.liveStreamLines.length > 0 ? store.liveStreamLines.join("\n") : "En attente des premières lignes du moteur Aider..." }}</pre>
+                >{{ store.liveStreamLines.length > 0 ? store.liveStreamLines.join("\n") : "En attente du flux moteur..." }}</pre>
               </div>
             </div>
 
             <!-- Live Content streaming right after thinking -->
-            <div v-if="store.liveContent" class="md-content live-content">
+            <div v-if="sanitizeLiveContent(store.liveContent)" class="md-content live-content">
               <template
-                v-for="(block, bIdx) in parseMarkdownMessage(store.liveContent)"
+                v-for="(block, bIdx) in parseMarkdownMessage(sanitizeLiveContent(store.liveContent), true)"
                 :key="bIdx"
               >
-                <h2 v-if="block.kind === 'heading'" class="md-h2">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <code v-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <strong v-else-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                <h1 v-if="block.kind === 'heading' && block.level === 1" class="md-h1">
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths()"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
+                </h1>
+
+                <h2 v-else-if="block.kind === 'heading' && block.level === 2" class="md-h2">
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths()"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </h2>
+
+                <h3 v-else-if="block.kind === 'heading' && block.level === 3" class="md-h3">
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths()"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
+                </h3>
+
+                <blockquote v-else-if="block.kind === 'quote'" class="md-quote">
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths()"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
+                </blockquote>
+
+                <ul v-else-if="block.kind === 'ul'" class="md-ul">
+                  <li
+                    v-for="(item, liIdx) in block.items"
+                    :key="liIdx"
+                    :style="{ marginLeft: `${item.indent * 16}px` }"
+                  >
+                    <MarkdownInline
+                      :tokens="item.tokens"
+                      :available-paths="getAvailableDiffPaths()"
+                      :project-root="store.activeProject?.rootPath"
+                      @open-file="handleOpenFileInReview"
+                    />
+                  </li>
+                </ul>
+
+                <ol v-else-if="block.kind === 'ol'" class="md-ol">
+                  <li v-for="(item, liIdx) in block.items" :key="liIdx">
+                    <MarkdownInline
+                      :tokens="item"
+                      :available-paths="getAvailableDiffPaths()"
+                      :project-root="store.activeProject?.rootPath"
+                      @open-file="handleOpenFileInReview"
+                    />
+                  </li>
+                </ol>
+
                 <div v-else-if="block.kind === 'code'" class="msg-code-block halo-hud">
                   <div class="code-toolbar">
                     <div class="code-toolbar-info">
                       <span class="code-lang">{{ block.lang }}</span>
                       <span v-if="block.filename" class="code-filename-pill">{{ block.filename }}</span>
+                      <span v-if="block.streaming" class="code-streaming-pill">En cours…</span>
                     </div>
                   </div>
-                  <pre class="code-pre custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
+                  <pre class="code-pre custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang, Boolean(block.streaming))" /></pre>
                 </div>
+
                 <p v-else-if="block.kind === 'paragraph'" class="md-p">
-                  <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
-                    <code v-if="tok.kind === 'code'" class="md-inline-code">{{ tok.text }}</code>
-                    <strong v-else-if="tok.kind === 'bold'">{{ tok.text }}</strong>
-                    <template v-else>{{ tok.text }}</template>
-                  </template>
+                  <MarkdownInline
+                    :tokens="block.tokens"
+                    :available-paths="getAvailableDiffPaths()"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileInReview"
+                  />
                 </p>
               </template>
               <span class="live-blinking-cursor" />
@@ -2115,7 +2336,7 @@ async function copyCodeBlock(key: string, code: string) {
                 ref="textareaRef"
                 v-model="promptDraft"
                 rows="2"
-                placeholder="Décrivez ce que vous voulez coder avec Aider... (Tapez @ pour outils/fichiers/MCP, collez des images)"
+                placeholder="Décrivez ce que vous voulez coder... (Tapez @ pour outils/fichiers/MCP, collez des images)"
                 :disabled="store.isProcessing"
                 @input="handleTextareaInput"
                 @keydown="handleKeydown"
@@ -3243,6 +3464,16 @@ async function copyCodeBlock(key: string, code: string) {
   color: var(--text-main);
 }
 
+.code-streaming-pill {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--active-bg);
+  border: 1px solid rgba(129, 140, 248, 0.35);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
 .code-toolbar-actions {
   display: flex;
   align-items: center;
@@ -3352,6 +3583,7 @@ async function copyCodeBlock(key: string, code: string) {
 }
 
 .diff-dropdown-trigger {
+  align-self: flex-start;
   display: inline-flex;
   align-items: center;
   gap: 12px;
@@ -3423,15 +3655,13 @@ async function copyCodeBlock(key: string, code: string) {
   margin-top: 6px;
   min-width: 380px;
   max-width: 540px;
-  max-height: 280px;
-  overflow-y: auto;
+  overflow: hidden;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
   background: var(--table-bg);
   box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.45);
   display: flex;
   flex-direction: column;
-  z-index: 20;
 }
 
 .diff-menu-header {
@@ -3495,9 +3725,26 @@ async function copyCodeBlock(key: string, code: string) {
   border-radius: 4px;
 }
 
+.badge-mini-status.tag-created {
+  background: rgba(16, 185, 129, 0.18);
+  color: #10b981;
+}
+
+.badge-mini-status.tag-modified {
+  background: rgba(59, 130, 246, 0.18);
+  color: #3b82f6;
+}
+
+.badge-mini-status.tag-deleted {
+  background: rgba(239, 68, 68, 0.18);
+  color: #ef4444;
+}
+
 .diff-menu-list {
   display: flex;
   flex-direction: column;
+  max-height: 240px;
+  overflow-y: auto;
 }
 
 .diff-menu-row {
@@ -3628,6 +3875,11 @@ async function copyCodeBlock(key: string, code: string) {
 .cta-arrow {
   width: 12px;
   height: 12px;
+}
+
+.c-mod {
+  color: var(--diff-mod-bar);
+  font-weight: 600;
 }
 
 .c-add {

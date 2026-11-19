@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 /// Repairs files and directories mistakenly prefixed/suffixed with backticks (e.g. `` `src/App.vue ``)
-/// emitted by small local LLMs (such as qwen2.5-coder:3b) when using Aider's whole-file edit format.
+/// that small local LLMs occasionally emit inside file headers.
 pub async fn sanitize_backtick_paths(project_root: &str) {
     let root = PathBuf::from(project_root);
     if !root.exists() {
@@ -106,7 +106,7 @@ pub async fn sanitize_corrupted_diff_files(project_root: &str) {
                     if full_path.is_file() {
                         if let Ok(content) = tokio::fs::read_to_string(&full_path).await {
                             if content.contains("<<<<<<< SEARCH") && content.contains(">>>>>>> REPLACE") {
-                                let clean = crate::engine::extract_clean_replace_code(&content);
+                                let clean = crate::patcher::extract_clean_replace_code(&content);
                                 let _ = tokio::fs::write(&full_path, clean).await;
                             }
                         }

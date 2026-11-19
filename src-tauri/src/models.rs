@@ -111,7 +111,6 @@ pub struct AppSettings {
     pub theme: String, // "system" | "dark" | "light"
     pub ollama_url: String,
     pub ollama_model: String,
-    pub aider_path: String,
     pub auto_start_ollama: bool,
     #[serde(default = "default_context_window")]
     pub context_window_tokens: usize,
@@ -131,7 +130,6 @@ impl Default for AppSettings {
             theme: "system".to_string(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
             ollama_model: "qwen2.5-coder:3b".to_string(),
-            aider_path: "aider".to_string(),
             auto_start_ollama: true,
             context_window_tokens: 8192,
             aider_edit_format: "auto".to_string(),
@@ -182,6 +180,15 @@ pub struct ModifiedFileDiff {
     pub removed: usize,
     pub modified: usize,
     pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeSummary {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    pub modified: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +252,8 @@ pub struct ChatMessage {
     pub lines_added: usize,
     #[serde(default)]
     pub lines_removed: usize,
+    #[serde(default)]
+    pub files_summary: Vec<FileChangeSummary>,
     #[serde(default)]
     pub agent_trace: Vec<AgentTraceStep>,
 }
@@ -350,8 +359,7 @@ pub struct PromptStageEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StackStatus {
-    pub aider_installed: bool,
-    pub aider_bin: Option<String>,
+    pub native_engine_ready: bool,
     pub ollama_installed: bool,
     pub ollama_running: bool,
     pub model_available: bool,

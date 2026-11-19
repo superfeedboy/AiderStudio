@@ -145,7 +145,7 @@ function handleDeleteProject() {
               </svg>
               <span class="path-text">{{ store.projectToEdit?.rootPath }}</span>
             </div>
-            <span class="field-hint">Dépôt Git géré par Aider et espace de création de vos fichiers.</span>
+            <span class="field-hint">Dépôt Git suivi par AiderStudio et espace de création de vos fichiers.</span>
           </div>
 
           <!-- Optimization & .aiderignore status card -->
@@ -155,7 +155,7 @@ function handleDeleteProject() {
                 <span class="card-tag" :class="store.hasAiderignore ? 'tag-ok' : 'tag-warn'">
                   {{ store.hasAiderignore ? "✓ Protection Contexte Active" : "⚠️ Optimisation Requise" }}
                 </span>
-                <span class="aiderignore-title">Fichier .aiderignore (Protection 8K)</span>
+                <span class="aiderignore-title">Fichier .aiderignore / .gitignore (Protection 8K)</span>
               </div>
               <button
                 v-if="!store.hasAiderignore"
@@ -167,8 +167,8 @@ function handleDeleteProject() {
             </div>
             <p class="aiderignore-desc">
               {{ store.hasAiderignore
-                ? "Le fichier .aiderignore exclut node_modules, target, dist, lockfiles et logs pour éviter de saturer la fenêtre de contexte de votre modèle local."
-                : "Sans .aiderignore, Aider indexe les dossiers volumineux (node_modules, target, dist) ce qui sature immédiatement la mémoire de 8K tokens." }}
+                ? "Le fichier .aiderignore (en complément de .gitignore) exclut node_modules, target, dist, lockfiles et logs de la repo-map et des outils du moteur natif."
+                : "Sans .aiderignore, les dossiers volumineux non ignorés par Git peuvent encombrer la repo-map et la recherche du moteur natif sur les modèles 8K." }}
             </p>
           </div>
         </div>

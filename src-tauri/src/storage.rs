@@ -33,7 +33,7 @@ pub fn create_seed_state() -> AppStateData {
         id: project_id.clone(),
         name: "AiderStudio".to_string(),
         root_path: default_workspace_path(),
-        global_context: "Stack : Tauri v2 + Rust + Vue 3 + TypeScript + Pinia.\nObjectif : IDE pair-programming pilotant Aider avec Ollama (qwen2.5-coder:3b).".to_string(),
+        global_context: "Stack : Tauri v2 + Rust + Vue 3 + TypeScript + Pinia.\nObjectif : IDE pair-programming doté d'un moteur natif Rust orchestrant Ollama en local et les fournisseurs cloud.".to_string(),
         shared_directories: Vec::new(),
         updated_at: now.clone(),
     };

@@ -161,70 +161,6 @@ fn clean_model_name(provider: &str, model: &str) -> String {
     trimmed.strip_prefix(&prefix).unwrap_or(trimmed).to_string()
 }
 
-pub fn aider_model_and_env(
-    provider: &str,
-    model: &str,
-    settings: &AppSettings,
-) -> Result<(String, Vec<(String, String)>), String> {
-    let clean = clean_model_name(provider, model);
-    if clean.is_empty() {
-        return Err(format!("Aucun modèle sélectionné pour '{provider}'."));
-    }
-
-    if provider == "ollama" {
-        return Ok((
-            format!("ollama_chat/{clean}"),
-            vec![(
-                "OLLAMA_API_BASE".to_string(),
-                settings.ollama_url.trim_end_matches('/').to_string(),
-            )],
-        ));
-    }
-
-    let key = find_provider_key(settings, provider).ok_or_else(|| {
-        format!("Clé API manquante pour le fournisseur '{provider}'. Configurez-la dans Paramètres → Fournisseurs.")
-    })?;
-
-    let mut env_vars = Vec::new();
-    let aider_model = match provider {
-        "gemini" => {
-            env_vars.push(("GEMINI_API_KEY".to_string(), key));
-            format!("gemini/{clean}")
-        }
-        "openai" => {
-            env_vars.push(("OPENAI_API_KEY".to_string(), key));
-            if let Some(cfg) = find_provider_config(settings, "openai") {
-                if let Some(base) = &cfg.base_url {
-                    let b = base.trim().trim_end_matches('/');
-                    if !b.is_empty() {
-                        env_vars.push(("OPENAI_API_BASE".to_string(), b.to_string()));
-                    }
-                }
-            }
-            format!("openai/{clean}")
-        }
-        "anthropic" => {
-            env_vars.push(("ANTHROPIC_API_KEY".to_string(), key));
-            format!("anthropic/{clean}")
-        }
-        "deepseek" => {
-            env_vars.push(("DEEPSEEK_API_KEY".to_string(), key));
-            format!("deepseek/{clean}")
-        }
-        "openrouter" => {
-            env_vars.push(("OPENROUTER_API_KEY".to_string(), key));
-            format!("openrouter/{clean}")
-        }
-        "mistral" => {
-            env_vars.push(("MISTRAL_API_KEY".to_string(), key));
-            format!("mistral/{clean}")
-        }
-        other => return Err(format!("Fournisseur inconnu : {other}")),
-    };
-
-    Ok((aider_model, env_vars))
-}
-
 fn default_models_for(provider_id: &str) -> Vec<String> {
     default_providers()
         .into_iter()
@@ -866,15 +802,22 @@ pub async fn call_provider_oneshot(
             };
             let base = custom_base.unwrap_or(default_base);
             let url = format!("{base}/chat/completions");
-            let body = serde_json::json!({
+            let reasoning = is_reasoning_model(provider, &clean_model);
+            let mut body = serde_json::json!({
                 "model": clean_model,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
                 "messages": [
-                    { "role": "system", "content": system_prompt },
+                    { "role": if reasoning { "developer" } else { "system" }, "content": system_prompt },
                     { "role": "user", "content": user_prompt }
                 ]
             });
+            if let Some(obj) = body.as_object_mut() {
+                if reasoning {
+                    obj.insert("max_completion_tokens".to_string(), Value::from(max_tokens.max(1024)));
+                } else {
+                    obj.insert("max_tokens".to_string(), Value::from(max_tokens));
+                    obj.insert("temperature".to_string(), Value::from(temperature));
+                }
+            }
             let mut req = client.post(url).bearer_auth(key).json(&body);
             if provider == "openrouter" {
                 req = req
@@ -914,6 +857,1047 @@ pub async fn call_provider_oneshot(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmMessage {
+    pub role: String,
+    pub content: String,
+    pub images: Vec<String>,
+}
+
+impl LlmMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+            images,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmRequestOptions {
+    pub max_tokens: usize,
+    pub temperature: f32,
+    pub enable_cache: bool,
+}
+
+impl Default for LlmRequestOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: 8192,
+            temperature: 0.2,
+            enable_cache: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    Thinking(String),
+    Content(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LlmStreamResult {
+    pub content: String,
+    pub thinking: Option<String>,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cache_read_tokens: usize,
+    pub finish_reason: Option<String>,
+}
+
+/// Tampon octet par octet pour découper des lignes sans jamais couper un caractère UTF-8 multi-octets.
+#[derive(Debug, Default)]
+pub struct ByteLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl ByteLineBuffer {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        let mut start = 0usize;
+        for (idx, &b) in self.buf.iter().enumerate() {
+            if b == b'\n' {
+                let mut end = idx;
+                if end > start && self.buf[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                lines.push(String::from_utf8_lossy(&self.buf[start..end]).to_string());
+                start = idx + 1;
+            }
+        }
+        if start > 0 {
+            self.buf.drain(0..start);
+        }
+        lines
+    }
+
+    pub fn flush(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let mut end = self.buf.len();
+        if end > 0 && self.buf[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let s = String::from_utf8_lossy(&self.buf[..end]).to_string();
+        self.buf.clear();
+        Some(s)
+    }
+}
+
+/// Séparateur incrémental `<think>...</think>` robuste aux balises coupées entre deux deltas.
+#[derive(Debug, Default)]
+pub struct ThinkStreamSplitter {
+    buffer: String,
+    in_think: bool,
+}
+
+impl ThinkStreamSplitter {
+    fn trailing_tag_prefix_len(text: &str, tag: &str) -> usize {
+        let max_check = text.len().min(tag.len().saturating_sub(1));
+        for len in (1..=max_check).rev() {
+            if text.ends_with(&tag[..len]) {
+                return len;
+            }
+        }
+        0
+    }
+
+    pub fn push(&mut self, chunk: &str) -> Vec<StreamDelta> {
+        let mut out = Vec::new();
+        if chunk.is_empty() {
+            return out;
+        }
+        self.buffer.push_str(chunk);
+
+        loop {
+            if !self.in_think {
+                if let Some(pos) = self.buffer.find("<think>") {
+                    if pos > 0 {
+                        out.push(StreamDelta::Content(self.buffer[..pos].to_string()));
+                    }
+                    self.buffer.drain(..pos + "<think>".len());
+                    self.in_think = true;
+                } else {
+                    let keep = Self::trailing_tag_prefix_len(&self.buffer, "<think>");
+                    let emit_len = self.buffer.len() - keep;
+                    if emit_len > 0 {
+                        out.push(StreamDelta::Content(self.buffer[..emit_len].to_string()));
+                        self.buffer.drain(..emit_len);
+                    }
+                    break;
+                }
+            } else if let Some(pos) = self.buffer.find("</think>") {
+                if pos > 0 {
+                    out.push(StreamDelta::Thinking(self.buffer[..pos].to_string()));
+                }
+                self.buffer.drain(..pos + "</think>".len());
+                self.in_think = false;
+            } else {
+                let keep = Self::trailing_tag_prefix_len(&self.buffer, "</think>");
+                let emit_len = self.buffer.len() - keep;
+                if emit_len > 0 {
+                    out.push(StreamDelta::Thinking(self.buffer[..emit_len].to_string()));
+                    self.buffer.drain(..emit_len);
+                }
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn finish(&mut self) -> Vec<StreamDelta> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let rem = std::mem::take(&mut self.buffer);
+        if self.in_think {
+            vec![StreamDelta::Thinking(rem)]
+        } else {
+            vec![StreamDelta::Content(rem)]
+        }
+    }
+}
+
+pub fn is_reasoning_model(provider: &str, clean_model: &str) -> bool {
+    if provider != "openai" {
+        return false;
+    }
+    let low = clean_model.to_lowercase();
+    low.starts_with("o1")
+        || low.starts_with("o3")
+        || low.starts_with("o4")
+        || low.starts_with("gpt-5")
+}
+
+fn detect_image_mime_and_b64(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("data:") {
+        if let Some((mime, b64)) = rest.split_once(";base64,") {
+            return (mime.to_string(), b64.to_string());
+        }
+    }
+    let mime = if trimmed.starts_with("/9j/") {
+        "image/jpeg"
+    } else if trimmed.starts_with("iVBOR") {
+        "image/png"
+    } else if trimmed.starts_with("R0lGOD") {
+        "image/gif"
+    } else if trimmed.starts_with("UklGR") {
+        "image/webp"
+    } else {
+        "image/png"
+    };
+    (mime.to_string(), trimmed.to_string())
+}
+
+fn normalize_finish_reason(raw: &str) -> String {
+    match raw {
+        "max_tokens" | "MAX_TOKENS" | "length" => "length".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn build_openai_stream_payload(
+    provider: &str,
+    clean_model: &str,
+    messages: &[LlmMessage],
+    options: &LlmRequestOptions,
+    include_stream_options: bool,
+) -> Value {
+    let reasoning = is_reasoning_model(provider, clean_model);
+    let mut api_msgs = Vec::new();
+
+    for m in messages {
+        let role = if m.role == "system" && reasoning {
+            "developer"
+        } else {
+            m.role.as_str()
+        };
+        if m.images.is_empty() {
+            api_msgs.push(serde_json::json!({
+                "role": role,
+                "content": m.content
+            }));
+        } else {
+            let mut parts = vec![serde_json::json!({
+                "type": "text",
+                "text": m.content
+            })];
+            for img in &m.images {
+                let (mime, b64) = detect_image_mime_and_b64(img);
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{mime};base64,{b64}")
+                    }
+                }));
+            }
+            api_msgs.push(serde_json::json!({
+                "role": role,
+                "content": parts
+            }));
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": clean_model,
+        "stream": true,
+        "messages": api_msgs
+    });
+
+    if let Some(obj) = body.as_object_mut() {
+        if reasoning {
+            obj.insert(
+                "max_completion_tokens".to_string(),
+                Value::from(options.max_tokens.max(1024)),
+            );
+        } else {
+            obj.insert(
+                "max_tokens".to_string(),
+                Value::from(options.max_tokens.max(1024)),
+            );
+            obj.insert("temperature".to_string(), Value::from(options.temperature));
+        }
+        if include_stream_options && provider != "mistral" {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
+    }
+
+    body
+}
+
+pub fn build_anthropic_stream_payload(
+    clean_model: &str,
+    messages: &[LlmMessage],
+    options: &LlmRequestOptions,
+) -> Value {
+    let mut system_blocks = Vec::new();
+    let mut api_msgs = Vec::new();
+    let mut first_long_user_marked = false;
+
+    for m in messages {
+        if m.role == "system" {
+            let mut block = serde_json::json!({
+                "type": "text",
+                "text": m.content
+            });
+            if options.enable_cache {
+                block
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("cache_control".to_string(), serde_json::json!({ "type": "ephemeral" }));
+            }
+            system_blocks.push(block);
+            continue;
+        }
+
+        let role = if m.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        if m.images.is_empty() && !(options.enable_cache && role == "user" && !first_long_user_marked && m.content.len() > 1200) {
+            api_msgs.push(serde_json::json!({
+                "role": role,
+                "content": m.content
+            }));
+        } else {
+            let mut parts = Vec::new();
+            for img in &m.images {
+                let (mime, b64) = detect_image_mime_and_b64(img);
+                parts.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": b64
+                    }
+                }));
+            }
+            let mut text_block = serde_json::json!({
+                "type": "text",
+                "text": m.content
+            });
+            if options.enable_cache && role == "user" && !first_long_user_marked && m.content.len() > 1200 {
+                first_long_user_marked = true;
+                text_block
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("cache_control".to_string(), serde_json::json!({ "type": "ephemeral" }));
+            }
+            parts.push(text_block);
+            api_msgs.push(serde_json::json!({
+                "role": role,
+                "content": parts
+            }));
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": clean_model,
+        "max_tokens": options.max_tokens.max(1024),
+        "temperature": options.temperature,
+        "stream": true,
+        "messages": api_msgs
+    });
+    if !system_blocks.is_empty() {
+        body.as_object_mut()
+            .unwrap()
+            .insert("system".to_string(), Value::Array(system_blocks));
+    }
+    body
+}
+
+pub fn build_gemini_stream_payload(
+    messages: &[LlmMessage],
+    options: &LlmRequestOptions,
+) -> Value {
+    let mut system_texts = Vec::new();
+    let mut contents = Vec::new();
+
+    for m in messages {
+        if m.role == "system" {
+            if !m.content.trim().is_empty() {
+                system_texts.push(m.content.as_str());
+            }
+            continue;
+        }
+        let role = if m.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
+        let mut parts = vec![serde_json::json!({ "text": m.content })];
+        for img in &m.images {
+            let (mime, b64) = detect_image_mime_and_b64(img);
+            parts.push(serde_json::json!({
+                "inlineData": {
+                    "mimeType": mime,
+                    "data": b64
+                }
+            }));
+        }
+        contents.push(serde_json::json!({
+            "role": role,
+            "parts": parts
+        }));
+    }
+
+    let mut body = serde_json::json!({
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": options.max_tokens.max(2048),
+            "temperature": options.temperature
+        }
+    });
+    if !system_texts.is_empty() {
+        body.as_object_mut().unwrap().insert(
+            "systemInstruction".to_string(),
+            serde_json::json!({
+                "parts": [{ "text": system_texts.join("\n\n") }]
+            }),
+        );
+    }
+    body
+}
+
+#[derive(Debug, Default)]
+struct StreamAccumulator {
+    content: String,
+    thinking: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cache_read_tokens: usize,
+    finish_reason: Option<String>,
+}
+
+impl StreamAccumulator {
+    fn emit<F: FnMut(StreamDelta)>(&mut self, delta: StreamDelta, on_delta: &mut F) {
+        match &delta {
+            StreamDelta::Thinking(t) if !t.is_empty() => {
+                self.thinking.push_str(t);
+                on_delta(delta);
+            }
+            StreamDelta::Content(c) if !c.is_empty() => {
+                self.content.push_str(c);
+                on_delta(delta);
+            }
+            _ => {}
+        }
+    }
+
+    fn into_result(self) -> LlmStreamResult {
+        let trimmed_think = self.thinking.trim().to_string();
+        LlmStreamResult {
+            content: self.content.trim().to_string(),
+            thinking: if trimmed_think.is_empty() {
+                None
+            } else {
+                Some(trimmed_think)
+            },
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            finish_reason: self.finish_reason,
+        }
+    }
+}
+
+fn process_openai_sse_data<F: FnMut(StreamDelta)>(
+    data: &str,
+    splitter: &mut ThinkStreamSplitter,
+    acc: &mut StreamAccumulator,
+    on_delta: &mut F,
+) -> anyhow::Result<bool> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    if trimmed == "[DONE]" {
+        for d in splitter.finish() {
+            acc.emit(d, on_delta);
+        }
+        return Ok(true);
+    }
+    let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
+        return Ok(false);
+    };
+    if let Some(err) = json.get("error") {
+        let msg = extract_api_error_message(&err.to_string()).unwrap_or_else(|| err.to_string());
+        anyhow::bail!("{msg}");
+    }
+    if let Some(usage) = json.get("usage").filter(|u| !u.is_null()) {
+        if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            acc.prompt_tokens = pt as usize;
+        }
+        if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            acc.completion_tokens = ct as usize;
+        }
+        if let Some(cached) = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+        {
+            acc.cache_read_tokens = cached as usize;
+        }
+    }
+    if let Some(choice) = json.get("choices").and_then(|c| c.get(0)) {
+        if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+            if !fr.is_empty() {
+                acc.finish_reason = Some(normalize_finish_reason(fr));
+            }
+        }
+        if let Some(delta) = choice.get("delta") {
+            if let Some(rc) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(|v| v.as_str())
+            {
+                if !rc.is_empty() {
+                    acc.emit(StreamDelta::Thinking(rc.to_string()), on_delta);
+                }
+            }
+            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                for d in splitter.push(content) {
+                    acc.emit(d, on_delta);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn process_anthropic_sse_data<F: FnMut(StreamDelta)>(
+    data: &str,
+    splitter: &mut ThinkStreamSplitter,
+    acc: &mut StreamAccumulator,
+    on_delta: &mut F,
+) -> anyhow::Result<()> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
+        return Ok(());
+    };
+    let ev_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match ev_type {
+        "message_start" => {
+            if let Some(usage) = json.get("message").and_then(|m| m.get("usage")) {
+                let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let cache_create = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let cache_read = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                acc.prompt_tokens = inp + cache_create + cache_read;
+                acc.cache_read_tokens = cache_read;
+            }
+        }
+        "content_block_delta" => {
+            if let Some(delta) = json.get("delta") {
+                let dtype = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if dtype == "thinking_delta" {
+                    if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                        acc.emit(StreamDelta::Thinking(t.to_string()), on_delta);
+                    }
+                } else if dtype == "text_delta" {
+                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                        for d in splitter.push(t) {
+                            acc.emit(d, on_delta);
+                        }
+                    }
+                }
+            }
+        }
+        "message_delta" => {
+            if let Some(sr) = json
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|v| v.as_str())
+            {
+                if !sr.is_empty() {
+                    acc.finish_reason = Some(normalize_finish_reason(sr));
+                }
+            }
+            if let Some(out) = json
+                .get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+            {
+                acc.completion_tokens = out as usize;
+            }
+        }
+        "message_stop" => {
+            for d in splitter.finish() {
+                acc.emit(d, on_delta);
+            }
+        }
+        "error" => {
+            let msg = extract_api_error_message(&json.to_string())
+                .unwrap_or_else(|| json.to_string());
+            anyhow::bail!("Anthropic stream error : {msg}");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn process_gemini_sse_data<F: FnMut(StreamDelta)>(
+    data: &str,
+    splitter: &mut ThinkStreamSplitter,
+    acc: &mut StreamAccumulator,
+    on_delta: &mut F,
+) -> anyhow::Result<()> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(());
+    }
+    let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
+        return Ok(());
+    };
+    if let Some(err) = json.get("error") {
+        let msg = extract_api_error_message(&err.to_string()).unwrap_or_else(|| err.to_string());
+        anyhow::bail!("Gemini stream error : {msg}");
+    }
+    if let Some(usage) = json.get("usageMetadata") {
+        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+            acc.prompt_tokens = pt as usize;
+        }
+        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+            acc.completion_tokens = ct as usize;
+        }
+        if let Some(cached) = usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()) {
+            acc.cache_read_tokens = cached as usize;
+        }
+    }
+    if let Some(cand) = json.get("candidates").and_then(|c| c.get(0)) {
+        if let Some(fr) = cand.get("finishReason").and_then(|v| v.as_str()) {
+            if !fr.is_empty() {
+                acc.finish_reason = Some(normalize_finish_reason(fr));
+            }
+        }
+        if let Some(parts) = cand
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+        {
+            for part in parts {
+                let Some(text) = part.get("text").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                    acc.emit(StreamDelta::Thinking(text.to_string()), on_delta);
+                } else {
+                    for d in splitter.push(text) {
+                        acc.emit(d, on_delta);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wait_stream_cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504 | 529)
+}
+
+/// Appel unifié multi-tours en streaming SSE / NDJSON pour les 7 fournisseurs avec retry et annulation.
+pub async fn call_provider_streaming<F>(
+    provider: &str,
+    model: &str,
+    settings: &AppSettings,
+    messages: &[LlmMessage],
+    options: &LlmRequestOptions,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    mut on_delta: F,
+) -> anyhow::Result<LlmStreamResult>
+where
+    F: FnMut(StreamDelta),
+{
+    if *cancel_rx.borrow() {
+        anyhow::bail!("CANCELLED_BY_USER");
+    }
+
+    let clean_model = clean_model_name(provider, model);
+    if clean_model.is_empty() {
+        anyhow::bail!("Modèle vide pour le fournisseur {provider}");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()?;
+
+    if provider == "ollama" {
+        let url = format!("{}/api/chat", settings.ollama_url.trim_end_matches('/'));
+        let api_msgs: Vec<Value> = messages
+            .iter()
+            .map(|m| {
+                let mut obj = serde_json::json!({
+                    "role": m.role,
+                    "content": m.content
+                });
+                if !m.images.is_empty() {
+                    let b64_list: Vec<String> = m
+                        .images
+                        .iter()
+                        .map(|img| detect_image_mime_and_b64(img).1)
+                        .collect();
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("images".to_string(), serde_json::json!(b64_list));
+                }
+                obj
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "model": clean_model,
+            "stream": true,
+            "messages": api_msgs,
+            "options": {
+                "num_ctx": effective_ollama_num_ctx(settings),
+                "num_predict": options.max_tokens.max(1024),
+                "temperature": options.temperature
+            }
+        });
+
+        let mut resp = tokio::select! {
+            biased;
+            _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+            res = client.post(url).json(&payload).send() => res?,
+        };
+        if !resp.status().is_success() {
+            let st = resp.status();
+            let err_txt = resp.text().await.unwrap_or_default();
+            let clean = extract_api_error_message(&err_txt).unwrap_or(err_txt);
+            anyhow::bail!("Ollama HTTP {st} : {clean}");
+        }
+
+        let mut line_buf = ByteLineBuffer::default();
+        let mut splitter = ThinkStreamSplitter::default();
+        let mut acc = StreamAccumulator::default();
+
+        loop {
+            let chunk_opt = tokio::select! {
+                biased;
+                _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                res = resp.chunk() => res?,
+            };
+            let Some(chunk_bytes) = chunk_opt else {
+                break;
+            };
+            for line in line_buf.push_bytes(&chunk_bytes) {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<Value>(t) {
+                    if let Some(msg) = parsed.get("message") {
+                        if let Some(th) = msg.get("thinking").and_then(|v| v.as_str()) {
+                            if !th.is_empty() {
+                                acc.emit(StreamDelta::Thinking(th.to_string()), &mut on_delta);
+                            }
+                        }
+                        if let Some(delta) = msg.get("content").and_then(|v| v.as_str()) {
+                            for d in splitter.push(delta) {
+                                acc.emit(d, &mut on_delta);
+                            }
+                        }
+                    }
+                    if parsed.get("done").and_then(|v| v.as_bool()) == Some(true) {
+                        if let Some(pt) = parsed.get("prompt_eval_count").and_then(|v| v.as_u64()) {
+                            acc.prompt_tokens = pt as usize;
+                        }
+                        if let Some(ct) = parsed.get("eval_count").and_then(|v| v.as_u64()) {
+                            acc.completion_tokens = ct as usize;
+                        }
+                        if let Some(dr) = parsed.get("done_reason").and_then(|v| v.as_str()) {
+                            if !dr.is_empty() {
+                                acc.finish_reason = Some(normalize_finish_reason(dr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(last) = line_buf.flush() {
+            let t = last.trim();
+            if let Ok(parsed) = serde_json::from_str::<Value>(t) {
+                if let Some(delta) = parsed
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|v| v.as_str())
+                {
+                    for d in splitter.push(delta) {
+                        acc.emit(d, &mut on_delta);
+                    }
+                }
+            }
+        }
+        for d in splitter.finish() {
+            acc.emit(d, &mut on_delta);
+        }
+        return Ok(acc.into_result());
+    }
+
+    let key = find_provider_key(settings, provider)
+        .ok_or_else(|| anyhow::anyhow!("Clé API absente pour '{provider}'"))?;
+    let custom_base = find_provider_config(settings, provider)
+        .and_then(|c| c.base_url.as_deref())
+        .map(|b| b.trim().trim_end_matches('/'))
+        .filter(|b| !b.is_empty());
+
+    let mut include_stream_options = true;
+    let backoff_secs = [1u64, 2u64, 4u64];
+
+    for attempt in 0..3 {
+        if *cancel_rx.borrow() {
+            anyhow::bail!("CANCELLED_BY_USER");
+        }
+
+        let resp_res = match provider {
+            "gemini" => {
+                let base =
+                    custom_base.unwrap_or("https://generativelanguage.googleapis.com/v1beta");
+                let url = format!("{base}/models/{clean_model}:streamGenerateContent?alt=sse&key={key}");
+                let body = build_gemini_stream_payload(messages, options);
+                tokio::select! {
+                    biased;
+                    _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                    res = client.post(url).json(&body).send() => res,
+                }
+            }
+            "anthropic" => {
+                let base = custom_base.unwrap_or("https://api.anthropic.com/v1");
+                let url = format!("{base}/messages");
+                let body = build_anthropic_stream_payload(&clean_model, messages, options);
+                tokio::select! {
+                    biased;
+                    _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                    res = client
+                        .post(url)
+                        .header("x-api-key", &key)
+                        .header("anthropic-version", "2023-06-01")
+                        .json(&body)
+                        .send() => res,
+                }
+            }
+            "openai" | "deepseek" | "openrouter" | "mistral" => {
+                let default_base = match provider {
+                    "openai" => "https://api.openai.com/v1",
+                    "deepseek" => "https://api.deepseek.com/v1",
+                    "openrouter" => "https://openrouter.ai/api/v1",
+                    "mistral" => "https://api.mistral.ai/v1",
+                    _ => "https://api.openai.com/v1",
+                };
+                let base = custom_base.unwrap_or(default_base);
+                let url = format!("{base}/chat/completions");
+                let body = build_openai_stream_payload(
+                    provider,
+                    &clean_model,
+                    messages,
+                    options,
+                    include_stream_options,
+                );
+                let mut req = client.post(url).bearer_auth(&key).json(&body);
+                if provider == "openrouter" {
+                    req = req
+                        .header("HTTP-Referer", "https://aiderstudio.local")
+                        .header("X-Title", "AiderStudio");
+                }
+                tokio::select! {
+                    biased;
+                    _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                    res = req.send() => res,
+                }
+            }
+            other => anyhow::bail!("Fournisseur inconnu : {other}"),
+        };
+
+        let mut resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < 2 && (e.is_timeout() || e.is_connect() || e.is_request()) {
+                    let delay = std::time::Duration::from_secs(backoff_secs[attempt]);
+                    tokio::select! {
+                        biased;
+                        _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let code = status.as_u16();
+            let err_txt = resp.text().await.unwrap_or_default();
+
+            // Repli transparent si le fournisseur OpenAI-compatible refuse `stream_options`
+            if code == 400
+                && include_stream_options
+                && err_txt.to_lowercase().contains("stream_options")
+            {
+                include_stream_options = false;
+                continue;
+            }
+
+            if is_retryable_status(code) && attempt < 2 {
+                let delay = std::time::Duration::from_secs(backoff_secs[attempt]);
+                tokio::select! {
+                    biased;
+                    _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
+            }
+
+            let clean = extract_api_error_message(&err_txt).unwrap_or(err_txt);
+            anyhow::bail!("{provider} HTTP {status} : {clean}");
+        }
+
+        let mut line_buf = ByteLineBuffer::default();
+        let mut splitter = ThinkStreamSplitter::default();
+        let mut acc = StreamAccumulator::default();
+        let mut sse_done = false;
+
+        loop {
+            let chunk_opt = tokio::select! {
+                biased;
+                _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                res = resp.chunk() => res?,
+            };
+            let Some(chunk_bytes) = chunk_opt else {
+                break;
+            };
+
+            for line in line_buf.push_bytes(&chunk_bytes) {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let payload = data.trim_start();
+                    match provider {
+                        "gemini" => process_gemini_sse_data(
+                            payload,
+                            &mut splitter,
+                            &mut acc,
+                            &mut on_delta,
+                        )?,
+                        "anthropic" => process_anthropic_sse_data(
+                            payload,
+                            &mut splitter,
+                            &mut acc,
+                            &mut on_delta,
+                        )?,
+                        _ => {
+                            if process_openai_sse_data(
+                                payload,
+                                &mut splitter,
+                                &mut acc,
+                                &mut on_delta,
+                            )? {
+                                sse_done = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if sse_done {
+                break;
+            }
+        }
+
+        if !sse_done {
+            if let Some(last) = line_buf.flush() {
+                if let Some(data) = last.strip_prefix("data:") {
+                    let payload = data.trim_start();
+                    match provider {
+                        "gemini" => process_gemini_sse_data(
+                            payload,
+                            &mut splitter,
+                            &mut acc,
+                            &mut on_delta,
+                        )?,
+                        "anthropic" => process_anthropic_sse_data(
+                            payload,
+                            &mut splitter,
+                            &mut acc,
+                            &mut on_delta,
+                        )?,
+                        _ => {
+                            let _ = process_openai_sse_data(
+                                payload,
+                                &mut splitter,
+                                &mut acc,
+                                &mut on_delta,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        for d in splitter.finish() {
+            acc.emit(d, &mut on_delta);
+        }
+
+        return Ok(acc.into_result());
+    }
+
+    anyhow::bail!("Échec de l'appel en streaming vers {provider}:{model} après tentatives.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,39 +1913,141 @@ mod tests {
     }
 
     #[test]
-    fn test_aider_model_and_env_all_providers() {
-        let s = settings_with_keys();
+    fn test_think_stream_splitter_handles_split_tags() {
+        let mut splitter = ThinkStreamSplitter::default();
+        let mut deltas = Vec::new();
+        for chunk in ["Bonjour ", "<thi", "nk>Réflexion", " étape 1</thi", "nk>Code prêt."] {
+            deltas.extend(splitter.push(chunk));
+        }
+        deltas.extend(splitter.finish());
 
-        let (m_ollama, env_ollama) = aider_model_and_env("ollama", "qwen2.5-coder:7b", &s).unwrap();
-        assert_eq!(m_ollama, "ollama_chat/qwen2.5-coder:7b");
-        assert_eq!(env_ollama, vec![("OLLAMA_API_BASE".into(), "http://192.168.1.10:11434".into())]);
+        let mut content = String::new();
+        let mut thinking = String::new();
+        for d in deltas {
+            match d {
+                StreamDelta::Thinking(t) => thinking.push_str(&t),
+                StreamDelta::Content(c) => content.push_str(&c),
+            }
+        }
+        assert_eq!(thinking, "Réflexion étape 1");
+        assert_eq!(content, "Bonjour Code prêt.");
+    }
 
-        let (m_gem, env_gem) = aider_model_and_env("gemini", "gemini/gemini-2.5-pro", &s).unwrap();
-        assert_eq!(m_gem, "gemini/gemini-2.5-pro");
-        assert_eq!(env_gem, vec![("GEMINI_API_KEY".into(), "test-key-gemini".into())]);
+    #[test]
+    fn test_byte_line_buffer_splits_utf8_safely() {
+        let mut buf = ByteLineBuffer::default();
+        let raw = "data: café crème\ndata: résumé\n".as_bytes();
+        // Coupe pile au milieu du 'é' (2 octets UTF-8: 0xC3 0xA9)
+        let split_at = 10;
+        let l1 = buf.push_bytes(&raw[..split_at]);
+        assert!(l1.is_empty());
+        let l2 = buf.push_bytes(&raw[split_at..]);
+        assert_eq!(l2, vec!["data: café crème", "data: résumé"]);
+    }
 
-        let (m_oai, env_oai) = aider_model_and_env("openai", "gpt-4.1", &s).unwrap();
-        assert_eq!(m_oai, "openai/gpt-4.1");
-        assert_eq!(env_oai[0], ("OPENAI_API_KEY".into(), "test-key-openai".into()));
+    #[test]
+    fn test_openai_payload_for_reasoning_models() {
+        let msgs = vec![LlmMessage::system("sys"), LlmMessage::user("hi")];
+        let opts = LlmRequestOptions {
+            max_tokens: 4096,
+            temperature: 0.2,
+            enable_cache: true,
+        };
+        let o4_payload = build_openai_stream_payload("openai", "o4-mini", &msgs, &opts, true);
+        assert!(o4_payload.get("max_completion_tokens").is_some());
+        assert!(o4_payload.get("temperature").is_none());
+        assert_eq!(o4_payload["messages"][0]["role"], "developer");
 
-        let (m_ant, env_ant) = aider_model_and_env("anthropic", "claude-sonnet-4-20250514", &s).unwrap();
-        assert_eq!(m_ant, "anthropic/claude-sonnet-4-20250514");
-        assert_eq!(env_ant, vec![("ANTHROPIC_API_KEY".into(), "test-key-anthropic".into())]);
+        let gpt4_payload = build_openai_stream_payload("openai", "gpt-4.1", &msgs, &opts, true);
+        assert!(gpt4_payload.get("max_tokens").is_some());
+        assert!(gpt4_payload.get("temperature").is_some());
+        assert_eq!(gpt4_payload["messages"][0]["role"], "system");
+    }
 
-        let (m_ds, env_ds) = aider_model_and_env("deepseek", "deepseek-chat", &s).unwrap();
-        assert_eq!(m_ds, "deepseek/deepseek-chat");
-        assert_eq!(env_ds, vec![("DEEPSEEK_API_KEY".into(), "test-key-deepseek".into())]);
+    #[test]
+    fn test_sse_parsers_openai_anthropic_gemini() {
+        let _s = settings_with_keys();
 
-        let (m_or, env_or) = aider_model_and_env("openrouter", "anthropic/claude-sonnet-4", &s).unwrap();
-        assert_eq!(m_or, "openrouter/anthropic/claude-sonnet-4");
-        assert_eq!(env_or, vec![("OPENROUTER_API_KEY".into(), "test-key-openrouter".into())]);
+        // OpenAI / DeepSeek reasoning_content
+        let mut sp1 = ThinkStreamSplitter::default();
+        let mut acc1 = StreamAccumulator::default();
+        let mut out1 = Vec::new();
+        process_openai_sse_data(
+            r#"{"choices":[{"delta":{"reasoning_content":"Analyse..."}}]}"#,
+            &mut sp1,
+            &mut acc1,
+            &mut |d| out1.push(d),
+        )
+        .unwrap();
+        process_openai_sse_data(
+            r#"{"choices":[{"delta":{"content":"Ok."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":4}}"#,
+            &mut sp1,
+            &mut acc1,
+            &mut |d| out1.push(d),
+        )
+        .unwrap();
+        assert!(process_openai_sse_data("[DONE]", &mut sp1, &mut acc1, &mut |d| out1.push(d)).unwrap());
+        let res1 = acc1.into_result();
+        assert_eq!(res1.thinking.as_deref(), Some("Analyse..."));
+        assert_eq!(res1.content, "Ok.");
+        assert_eq!(res1.prompt_tokens, 12);
+        assert_eq!(res1.completion_tokens, 4);
 
-        let (m_mis, env_mis) = aider_model_and_env("mistral", "codestral-latest", &s).unwrap();
-        assert_eq!(m_mis, "mistral/codestral-latest");
-        assert_eq!(env_mis, vec![("MISTRAL_API_KEY".into(), "test-key-mistral".into())]);
+        // Anthropic thinking + text + cache usage
+        let mut sp2 = ThinkStreamSplitter::default();
+        let mut acc2 = StreamAccumulator::default();
+        process_anthropic_sse_data(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":50}}}"#,
+            &mut sp2,
+            &mut acc2,
+            &mut |_| {},
+        )
+        .unwrap();
+        process_anthropic_sse_data(
+            r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"Plan"}}"#,
+            &mut sp2,
+            &mut acc2,
+            &mut |_| {},
+        )
+        .unwrap();
+        process_anthropic_sse_data(
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Fait."}}"#,
+            &mut sp2,
+            &mut acc2,
+            &mut |_| {},
+        )
+        .unwrap();
+        process_anthropic_sse_data(
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}"#,
+            &mut sp2,
+            &mut acc2,
+            &mut |_| {},
+        )
+        .unwrap();
+        let res2 = acc2.into_result();
+        assert_eq!(res2.prompt_tokens, 60);
+        assert_eq!(res2.cache_read_tokens, 50);
+        assert_eq!(res2.completion_tokens, 7);
+        assert_eq!(res2.finish_reason.as_deref(), Some("length"));
+        assert_eq!(res2.thinking.as_deref(), Some("Plan"));
+        assert_eq!(res2.content, "Fait.");
 
-        let empty_key_settings = AppSettings::default();
-        assert!(aider_model_and_env("gemini", "gemini-2.5-pro", &empty_key_settings).is_err());
+        // Gemini thought + text
+        let mut sp3 = ThinkStreamSplitter::default();
+        let mut acc3 = StreamAccumulator::default();
+        process_gemini_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"Check"},{"text":"Réponse"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":5,"cachedContentTokenCount":8}}"#,
+            &mut sp3,
+            &mut acc3,
+            &mut |_| {},
+        )
+        .unwrap();
+        let res3 = acc3.into_result();
+        assert_eq!(res3.thinking.as_deref(), Some("Check"));
+        assert_eq!(res3.content, "Réponse");
+        assert_eq!(res3.prompt_tokens, 20);
+        assert_eq!(res3.completion_tokens, 5);
+        assert_eq!(res3.cache_read_tokens, 8);
     }
 
     #[test]

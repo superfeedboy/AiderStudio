@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { useStudioStore } from "../stores/studio";
+import type { DiffLine } from "../types/studio";
 
 const props = defineProps<{
   isResizing: boolean;
@@ -8,6 +9,7 @@ const props = defineProps<{
 
 const store = useStudioStore();
 const copied = ref(false);
+const diffViewerRef = ref<HTMLElement | null>(null);
 
 const conv = computed(() => store.activeConversation);
 const modifiedFiles = computed(() => conv.value?.modifiedFiles ?? []);
@@ -119,6 +121,60 @@ async function confirmUndoAll() {
   if (!ok) return;
   await store.undoAll();
 }
+
+function selectDiffFile(filePath: string) {
+  store.activeDiffTargetLine = null;
+  store.activeDiffFilePath = filePath;
+}
+
+function isTargetDiffLine(line: DiffLine): boolean {
+  if (!store.activeDiffTargetLine) return false;
+  return (line.newLine ?? line.oldLine ?? null) === store.activeDiffTargetLine;
+}
+
+watch(
+  [
+    () => selectedFile.value?.path,
+    () => store.activeDiffTargetLine,
+    () => store.codeOpen,
+    () => store.codeMode,
+  ],
+  async ([nextPath, targetLine, isOpen, mode], [prevPath]) => {
+    if (!isOpen || mode !== "review" || !nextPath) return;
+    await nextTick();
+    const viewer = diffViewerRef.value;
+    if (!viewer) return;
+
+    if (targetLine && targetLine > 0) {
+      const lineNodes = Array.from(
+        viewer.querySelectorAll<HTMLElement>(".diff-line[data-line]")
+      );
+      let bestEl: HTMLElement | null = null;
+      let bestDelta = Number.POSITIVE_INFINITY;
+      for (const el of lineNodes) {
+        const ln = Number(el.dataset.line);
+        if (!Number.isFinite(ln)) continue;
+        const delta = Math.abs(ln - targetLine);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          bestEl = el;
+          if (delta === 0) break;
+        }
+      }
+      if (bestEl) {
+        const viewerRect = viewer.getBoundingClientRect();
+        const lineRect = bestEl.getBoundingClientRect();
+        const relTop = lineRect.top - viewerRect.top + viewer.scrollTop;
+        viewer.scrollTop = Math.max(0, relTop - viewer.clientHeight / 3);
+        return;
+      }
+    }
+
+    if (nextPath !== prevPath) {
+      viewer.scrollTop = 0;
+    }
+  }
+);
 </script>
 
 <template>
@@ -192,7 +248,7 @@ async function confirmUndoAll() {
             class="file-row has-tooltip"
             :class="{ selected: selectedFile?.path === file.path }"
             :title="fullPathFor(file.path)"
-            @click="store.activeDiffFilePath = file.path"
+            @click="selectDiffFile(file.path)"
           >
             <span class="file-path">{{ file.path }}</span>
             <div class="file-row-actions">
@@ -239,12 +295,16 @@ async function confirmUndoAll() {
           </button>
         </div>
 
-        <div v-if="selectedFile" class="diff-viewer custom-scroll">
+        <div v-if="selectedFile" ref="diffViewerRef" class="diff-viewer custom-scroll">
           <div
             v-for="(line, idx) in selectedFile.lines"
             :key="idx"
             class="diff-line"
-            :class="`diff-line--${line.kind}`"
+            :data-line="line.newLine ?? line.oldLine ?? undefined"
+            :class="[
+              `diff-line--${line.kind}`,
+              { 'diff-line--target': isTargetDiffLine(line) },
+            ]"
           >
             <span class="ln-num">{{ line.newLine ?? line.oldLine ?? "" }}</span>
             <span class="ln-prefix">
@@ -687,6 +747,11 @@ async function confirmUndoAll() {
 .diff-line--del {
   background: var(--diff-del-bg);
   border-left-color: var(--diff-del-bar);
+}
+
+.diff-line--target {
+  box-shadow: inset 0 0 0 1px rgba(129, 140, 248, 0.65);
+  background: rgba(129, 140, 248, 0.16);
 }
 
 .ln-num {

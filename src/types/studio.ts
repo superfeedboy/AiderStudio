@@ -60,7 +60,6 @@ export interface AppSettings {
   theme: ThemePreference;
   ollamaUrl: string;
   ollamaModel: string;
-  aiderPath: string;
   autoStartOllama: boolean;
   contextWindowTokens?: number;
   aiderEditFormat?: AiderEditFormat;
@@ -100,6 +99,13 @@ export interface ModifiedFileDiff {
   removed: number;
   modified: number;
   lines: DiffLine[];
+}
+
+export interface FileChangeSummary {
+  path: string;
+  added: number;
+  removed: number;
+  modified: number;
 }
 
 export interface AttachedFile {
@@ -145,6 +151,7 @@ export interface ChatMessage {
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  filesSummary?: FileChangeSummary[];
   agentTrace?: AgentTraceStep[];
 }
 
@@ -223,8 +230,7 @@ export interface PromptStageEvent {
 }
 
 export interface StackStatus {
-  aiderInstalled: boolean;
-  aiderBin: string | null;
+  nativeEngineReady: boolean;
   ollamaInstalled: boolean;
   ollamaRunning: boolean;
   modelAvailable: boolean;
