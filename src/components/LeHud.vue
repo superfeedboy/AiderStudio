@@ -1,29 +1,125 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useStudioStore } from "../stores/studio";
+import type { TokenUsageEvent } from "../types/studio";
 
 const store = useStudioStore();
 const dropdownOpen = ref(false);
 const dropdownRef = ref<HTMLElement | null>(null);
+const hoveredAgentStep = ref<TokenUsageEvent | null>(null);
+const apiHovered = ref(false);
 
 const conv = computed(() => store.activeConversation);
 const artifacts = computed(() => conv.value?.artifacts ?? []);
 const linesAdded = computed(() => conv.value?.linesAdded ?? 0);
 const linesRemoved = computed(() => conv.value?.linesRemoved ?? 0);
 
+const roleColors: Record<string, string> = {
+  architect: "#8b5cf6",
+  cartographer: "#06b6d4",
+  designer: "#ec4899",
+  coder: "#3b82f6",
+  refactoring: "#f59e0b",
+  tester: "#10b981",
+  synthesizer: "#94a3b8",
+};
+
+const roleShortLabels: Record<string, string> = {
+  architect: "Architecte",
+  cartographer: "Cartographe",
+  designer: "Designer",
+  coder: "Codeur",
+  refactoring: "Refactoring",
+  tester: "Testeur",
+  synthesizer: "Synthétiseur",
+};
+
+function resolveRoleKey(step: TokenUsageEvent): string {
+  if (step.role && roleColors[step.role]) return step.role;
+  const low = (step.subagent || "").toLowerCase();
+  if (low.includes("architect")) return "architect";
+  if (low.includes("cartograph")) return "cartographer";
+  if (low.includes("design")) return "designer";
+  if (low.includes("refact")) return "refactoring";
+  if (low.includes("test") || low.includes("vérif")) return "tester";
+  if (low.includes("synth")) return "synthesizer";
+  return "coder";
+}
+
+function roleColor(step: TokenUsageEvent): string {
+  return roleColors[resolveRoleKey(step)] || "#3b82f6";
+}
+
+function roleShortLabel(step: TokenUsageEvent): string {
+  return roleShortLabels[resolveRoleKey(step)] || step.subagent;
+}
+
+function formatCompactTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+function formatCtxLimit(limit: number): string {
+  if (limit >= 1_000_000) {
+    return `${(limit / 1_000_000).toFixed(limit % 1_000_000 === 0 ? 0 : 1)}M`;
+  }
+  if (limit >= 1024 && limit % 1024 === 0) {
+    return `${limit / 1024}K`;
+  }
+  if (limit >= 1000) {
+    return `${Math.round(limit / 1000)}K`;
+  }
+  return String(limit);
+}
+
+const stackedDenominator = computed<number>(() => {
+  return Math.max(1, store.turnTotalTokens, store.contextTokensMax);
+});
+
+function segmentWidthPercent(step: TokenUsageEvent): number {
+  const pct = (step.totalTokens / stackedDenominator.value) * 100;
+  return Math.max(3, Math.min(100, pct));
+}
+
+function hoveredStepPercent(step: TokenUsageEvent): number {
+  const limit =
+    step.contextLimit && step.contextLimit > 0
+      ? step.contextLimit
+      : store.contextTokensMax;
+  return Math.min(100, Math.round((step.totalTokens / Math.max(1, limit)) * 100));
+}
+
+const providerUsageRows = computed(() => {
+  const map = store.apiUsage.byProvider ?? {};
+  const provNames: Record<string, string> = {
+    gemini: "Gemini",
+    openai: "OpenAI",
+    anthropic: "Anthropic",
+    deepseek: "DeepSeek",
+    openrouter: "OpenRouter",
+    mistral: "Mistral",
+  };
+  return Object.entries(map).map(([id, entry]) => ({
+    id,
+    name: provNames[id] || id,
+    ...entry,
+  }));
+});
+
 const contextTooltip = computed(() => {
   const lines: string[] = [
-    `Pic appel sous-agent : ${store.activeCallTokens.toLocaleString()} / ${store.contextTokensMax.toLocaleString()} tok (${store.activeContextPercent}%)`,
+    `Total tour actif : ${store.turnTotalTokens.toLocaleString()} tok`,
+    `Contexte local estimé : ${store.localContextPercent}% de ${store.contextTokensMax.toLocaleString()} tok`,
   ];
   if (store.turnTokenSteps.length > 0) {
     lines.push("Détail par sous-agent :");
     for (const step of store.turnTokenSteps) {
       lines.push(
-        `• ${step.subagent} : ${step.totalTokens.toLocaleString()} tok (${step.promptTokens.toLocaleString()} in / ${step.completionTokens.toLocaleString()} out)`
+        `• ${roleShortLabel(step)} (${step.provider || "ollama"}${step.model ? `:${step.model}` : ""}) : ${step.totalTokens.toLocaleString()} tok (${step.promptTokens.toLocaleString()} in / ${step.completionTokens.toLocaleString()} out)`
       );
     }
   }
-  lines.push(`Mémoire session cumulée : ${store.contextTokensUsed.toLocaleString()} tok`);
   return lines.join("\n");
 });
 
@@ -60,10 +156,99 @@ function selectArtifact(id: string) {
       </button>
     </div>
 
-    <!-- SECTION CONTEXTE -->
+    <!-- BARRE 1: CONSOMMATION API EXTERNES -->
+    <div
+      class="hud-api-section"
+      @mouseenter="apiHovered = true"
+      @mouseleave="apiHovered = false"
+    >
+      <div class="hud-context-header">
+        <span class="hud-context-title">
+          <svg class="hud-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+          </svg>
+          <span>API Externes</span>
+        </span>
+        <div class="hud-api-right">
+          <button
+            v-if="store.validatedExternalProviders.length === 0 && store.externalApiTokensTotal === 0"
+            type="button"
+            class="hud-config-link"
+            title="Configurer une clé API externe"
+            @click="store.openSettingsTab('providers')"
+          >
+            Configurer
+          </button>
+          <template v-else>
+            <strong
+              class="hud-context-percent"
+              :class="{
+                'is-warn': store.externalApiPercent >= 70 && store.externalApiPercent < 85,
+                'is-danger': store.externalApiPercent >= 85,
+              }"
+            >
+              {{ store.externalApiPercent }}%
+            </strong>
+            <button
+              v-if="store.externalApiTokensTotal > 0"
+              type="button"
+              class="hud-reset-btn"
+              title="Réinitialiser le compteur journalier API"
+              aria-label="Réinitialiser le compteur journalier API"
+              @click.stop="store.resetApiUsage()"
+            >
+              ↺
+            </button>
+          </template>
+        </div>
+      </div>
+
+      <template v-if="store.validatedExternalProviders.length > 0 || store.externalApiTokensTotal > 0">
+        <div class="context-bar-track">
+          <div
+            class="context-bar-fill"
+            :style="{ width: `${store.externalApiPercent}%` }"
+            :class="{
+              'fill-ok': store.externalApiPercent < 70,
+              'fill-warn': store.externalApiPercent >= 70 && store.externalApiPercent < 85,
+              'fill-danger': store.externalApiPercent >= 85,
+            }"
+          />
+        </div>
+        <div class="hud-api-caption">
+          <span>{{ formatCompactTokens(store.externalApiTokensTotal) }} / {{ formatCompactTokens(store.externalApiTokenLimit) }} tok</span>
+          <span>{{ store.validatedExternalProviders.length }} actif(s)</span>
+        </div>
+      </template>
+
+      <!-- Hover breakdown card for External APIs -->
+      <div
+        v-if="apiHovered && (providerUsageRows.length > 0 || store.validatedExternalProviders.length > 0)"
+        class="hud-hover-card halo-hud"
+      >
+        <div class="hover-card-title">
+          <span>Consommation du {{ store.apiUsage.date }}</span>
+        </div>
+        <div v-if="providerUsageRows.length === 0" class="hover-card-empty">
+          0 token externe consommé aujourd'hui
+        </div>
+        <div
+          v-for="row in providerUsageRows"
+          :key="row.id"
+          class="hover-card-row"
+        >
+          <span>{{ row.name }} ({{ row.calls }} app.)</span>
+          <strong>{{ row.totalTokens.toLocaleString() }} tok</strong>
+        </div>
+      </div>
+    </div>
+
+    <div class="hud-divider" />
+
+    <!-- BARRE 2: CONTEXTE HORIZONTAL STACKÉ MULTI-AGENTS -->
     <div
       class="hud-context-section"
-      :title="contextTooltip"
+      :title="store.turnTokenSteps.length === 0 ? contextTooltip : undefined"
     >
       <div class="hud-context-header">
         <span class="hud-context-title">
@@ -75,52 +260,119 @@ function selectArtifact(id: string) {
           <span>Contexte</span>
         </span>
         <strong
+          v-if="store.turnTokenSteps.length > 0"
+          class="hud-context-tokens"
+        >
+          {{ store.turnTotalTokens.toLocaleString() }} tok
+        </strong>
+        <strong
+          v-else
           class="hud-context-percent"
           :class="{
-            'is-warn': store.activeContextPercent >= 70 && store.activeContextPercent < 85,
-            'is-danger': store.activeContextPercent >= 85,
+            'is-warn': store.contextPercent >= 70 && store.contextPercent < 85,
+            'is-danger': store.contextPercent >= 85,
           }"
         >
-          {{ store.activeContextPercent }}%
+          {{ store.contextPercent }}%
         </strong>
       </div>
 
-      <!-- Barre de progression colorée -->
-      <div class="context-bar-track">
+      <!-- Barre horizontale stackée par sous-agent (1 couleur par rôle) -->
+      <div
+        v-if="store.turnTokenSteps.length > 0"
+        class="stacked-bar-track"
+      >
+        <div
+          v-for="(step, idx) in store.turnTokenSteps"
+          :key="`${step.subagent}-${idx}`"
+          class="stacked-segment"
+          :class="{
+            'is-hovered': hoveredAgentStep && hoveredAgentStep.subagent === step.subagent,
+          }"
+          :style="{
+            width: `${segmentWidthPercent(step)}%`,
+            backgroundColor: roleColor(step),
+          }"
+          @mouseenter="hoveredAgentStep = step"
+          @mouseleave="hoveredAgentStep = null"
+        />
+      </div>
+      <!-- Repli à l'état initial avant tout appel sous-agent -->
+      <div v-else class="context-bar-track">
         <div
           class="context-bar-fill"
-          :style="{ width: `${store.activeContextPercent}%` }"
+          :style="{ width: `${store.contextPercent}%` }"
           :class="{
-            'fill-ok': store.activeContextPercent < 70,
-            'fill-warn': store.activeContextPercent >= 70 && store.activeContextPercent < 85,
-            'fill-danger': store.activeContextPercent >= 85,
+            'fill-ok': store.contextPercent < 70,
+            'fill-warn': store.contextPercent >= 70 && store.contextPercent < 85,
+            'fill-danger': store.contextPercent >= 85,
           }"
         />
       </div>
 
-      <!-- Badge sous-agent actif ou pic du tour -->
-      <div
-        v-if="store.displayedCallTokenEvent"
-        class="hud-subagent-tag"
-        :title="`Prompt : ${store.displayedCallTokenEvent.promptTokens.toLocaleString()} tok · Réponse : ${store.displayedCallTokenEvent.completionTokens.toLocaleString()} tok`"
-      >
-        <span class="subagent-name">{{ store.displayedCallTokenEvent.subagent }}</span>
-        <span class="subagent-tokens">{{ store.displayedCallTokenEvent.totalTokens.toLocaleString() }} tok</span>
+      <!-- Mini pastilles légende interactives (déclenchent aussi la bulle détaillée) -->
+      <div v-if="store.turnTokenSteps.length > 0" class="stacked-legend">
+        <button
+          v-for="(step, idx) in store.turnTokenSteps"
+          :key="`leg-${step.subagent}-${idx}`"
+          type="button"
+          class="legend-pill"
+          :class="{
+            'is-active': hoveredAgentStep && hoveredAgentStep.subagent === step.subagent,
+          }"
+          @mouseenter="hoveredAgentStep = step"
+          @mouseleave="hoveredAgentStep = null"
+        >
+          <span
+            class="legend-dot"
+            :style="{ backgroundColor: roleColor(step) }"
+          />
+          <span class="legend-name">{{ roleShortLabel(step) }}</span>
+          <span class="legend-val">{{ formatCompactTokens(step.totalTokens) }}</span>
+        </button>
       </div>
 
-      <!-- Bulle de recommandation /compact si >= 70% ou forcée si >= 95% -->
+      <!-- Infobulle détaillée au hover d'un segment ou d'une pastille -->
       <div
-        v-if="store.activeContextPercent >= 70"
+        v-if="hoveredAgentStep"
+        class="hud-hover-card halo-hud"
+      >
+        <div class="hover-card-title">
+          <span
+            class="legend-dot"
+            :style="{ backgroundColor: roleColor(hoveredAgentStep) }"
+          />
+          <strong>{{ roleShortLabel(hoveredAgentStep) }}</strong>
+          <span class="hover-card-pct">
+            {{ hoveredStepPercent(hoveredAgentStep) }}% ctx
+          </span>
+        </div>
+        <div class="hover-card-model">
+          {{ hoveredAgentStep.provider || "ollama" }} · {{ hoveredAgentStep.model || store.settings.ollamaModel }}
+        </div>
+        <div class="hover-card-row">
+          <span>Total utilisé</span>
+          <strong>{{ hoveredAgentStep.totalTokens.toLocaleString() }} tok</strong>
+        </div>
+        <div class="hover-card-sub">
+          <span>{{ hoveredAgentStep.promptTokens.toLocaleString() }} in / {{ hoveredAgentStep.completionTokens.toLocaleString() }} out</span>
+          <span>Fenêtre {{ formatCtxLimit(hoveredAgentStep.contextLimit || store.contextTokensMax) }}</span>
+        </div>
+      </div>
+
+      <!-- Bulle de recommandation /compact si le contexte local >= 70% -->
+      <div
+        v-if="store.localContextPercent >= 70"
         class="compact-alert-bubble"
-        :class="{ 'is-forced': store.activeContextPercent >= 95 }"
+        :class="{ 'is-forced': store.localContextPercent >= 95 }"
       >
         <span class="compact-alert-msg">
           {{
-            store.activeContextPercent >= 95
-              ? "Fenêtre saturée (95%) : /compact forcé !"
-              : store.activeContextPercent >= 80
-                ? "Contexte à 80% : /compact conseillé."
-                : "Contexte à 70% : pensez à /compact."
+            store.localContextPercent >= 95
+              ? "Fenêtre locale saturée (95%) : /compact forcé !"
+              : store.localContextPercent >= 80
+                ? "Contexte local à 80% : /compact conseillé."
+                : "Contexte local à 70% : pensez à /compact."
           }}
         </span>
         <button
@@ -128,7 +380,7 @@ function selectArtifact(id: string) {
           title="Exécuter un /compact pour résumer l'historique et libérer de la mémoire"
           @click="store.compactConversation()"
         >
-          {{ store.activeContextPercent >= 95 ? "Nettoyer" : "Compacter" }}
+          {{ store.localContextPercent >= 95 ? "Nettoyer" : "Compacter" }}
         </button>
       </div>
     </div>
@@ -283,8 +535,8 @@ function selectArtifact(id: string) {
   top: 14px;
   right: 14px;
   z-index: 25;
-  width: clamp(230px, calc((100% - 840px) / 2 - 16px), 320px);
-  min-width: 230px;
+  width: clamp(235px, calc((100% - 840px) / 2 - 16px), 320px);
+  min-width: 235px;
   max-width: calc(100% - 28px);
   padding: 8px 10px;
   display: flex;
@@ -333,8 +585,10 @@ function selectArtifact(id: string) {
   height: 12px;
 }
 
-/* SECTION CONTEXTE */
+/* SECTION API EXTERNES & CONTEXTE */
+.hud-api-section,
 .hud-context-section {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -345,6 +599,7 @@ function selectArtifact(id: string) {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 6px;
 }
 
 .hud-context-title {
@@ -362,6 +617,56 @@ function selectArtifact(id: string) {
   color: var(--text-dim);
 }
 
+.hud-api-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hud-config-link {
+  border: 1px solid var(--border-subtle);
+  background: var(--hover-bg);
+  color: var(--accent);
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.hud-config-link:hover {
+  border-color: var(--accent);
+}
+
+.hud-reset-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 4px;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.hud-reset-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-main);
+}
+
+.hud-api-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 .hud-context-percent {
   font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -376,11 +681,17 @@ function selectArtifact(id: string) {
   color: #ef4444;
 }
 
+.hud-context-tokens {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-main);
+}
+
 .context-bar-track {
   width: 100%;
-  height: 5px;
+  height: 6px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--hover-bg);
   overflow: hidden;
 }
 
@@ -405,32 +716,145 @@ function selectArtifact(id: string) {
   box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
 }
 
-.hud-subagent-tag {
+/* Barre horizontale stackée multi-couleurs */
+.stacked-bar-track {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--hover-bg);
+  overflow: hidden;
+  gap: 1px;
+}
+
+.stacked-segment {
+  height: 100%;
+  min-width: 4px;
+  flex-shrink: 1;
+  cursor: pointer;
+  transition: filter 0.14s ease, transform 0.14s ease, opacity 0.14s ease;
+}
+
+.stacked-segment:hover,
+.stacked-segment.is-hovered {
+  filter: brightness(1.22);
+}
+
+.stacked-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 1px;
+}
+
+.legend-pill {
+  border: 1px solid var(--border-subtle);
+  background: var(--table-bg);
+  color: var(--text-muted);
+  border-radius: 5px;
+  padding: 2px 5px;
+  font-size: 9.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.legend-pill:hover,
+.legend-pill.is-active {
+  border-color: var(--accent);
+  color: var(--text-main);
+  background: var(--hover-bg);
+}
+
+.legend-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.legend-name {
+  font-weight: 500;
+}
+
+.legend-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+/* Floating detail card anchored below bar inside HUD */
+.hud-hover-card {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.hover-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-main);
+}
+
+.hover-card-pct {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.hover-card-model {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hover-card-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
-  font-size: 9.5px;
-  padding: 3px 6px;
-  border-radius: 4px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 10.5px;
   color: var(--text-muted);
 }
 
-.subagent-name {
-  font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 145px;
+.hover-card-row strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-main);
 }
 
-.subagent-tokens {
+.hover-card-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 9px;
-  color: #38bdf8;
-  flex-shrink: 0;
+  font-size: 9.5px;
+  color: var(--text-dim);
+  padding-top: 2px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.hover-card-empty {
+  font-size: 10.5px;
+  color: var(--text-dim);
 }
 
 .compact-alert-bubble {

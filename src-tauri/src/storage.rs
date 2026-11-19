@@ -1,4 +1,4 @@
-use crate::models::{AppSettings, AppStateData, Conversation, Project};
+use crate::models::{ApiUsageState, AppSettings, AppStateData, Conversation, Project};
 use chrono::Utc;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -59,6 +59,7 @@ pub fn create_seed_state() -> AppStateData {
         active_project_id: Some(project_id),
         active_conversation_id: Some(conv_id),
         mcp_servers: Vec::new(),
+        api_usage: ApiUsageState::default(),
     }
 }
 

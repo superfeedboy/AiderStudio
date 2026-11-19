@@ -1,8 +1,10 @@
 use crate::git_diff;
 use crate::models::{
-    AppSettings, AppStateData, ArtifactItem, AttachedFile, ChatMessage, ModifiedFileDiff,
-    PromptStageEvent, SendPromptResult, StackStatus, TokenUsageEvent, ToolExecutionResult,
+    AgentModelSlot, AgentTraceEvent, AgentTraceStep, AppSettings, AppStateData, ArtifactItem,
+    AttachedFile, ChatMessage, ModifiedFileDiff, PromptStageEvent, SendPromptResult, StackStatus,
+    TokenUsageEvent, ToolExecutionResult,
 };
+use crate::providers;
 use crate::storage;
 use chrono::Utc;
 use regex::Regex;
@@ -30,10 +32,6 @@ struct OllamaModelTag {
 struct OllamaOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     num_ctx: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_predict: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,13 +49,6 @@ struct OllamaChatMsg<'a> {
     content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaChatResponse {
-    message: Option<OllamaChatMsgOut>,
-    prompt_eval_count: Option<usize>,
-    eval_count: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,10 +161,15 @@ pub struct TestVerificationResult {
 }
 
 pub fn synthesize_error_log(raw_err: &str) -> String {
+    if let Some(api_msg) = providers::extract_api_error_message(raw_err) {
+        return api_msg;
+    }
+
     let mut clean_lines = Vec::new();
     for line in raw_err.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("Error navigating to")
+        if trimmed.is_empty()
+            || trimmed.starts_with("Error navigating to")
             || trimmed.starts_with("Call log:")
             || trimmed.starts_with("navigating to")
             || trimmed.starts_with("Scraping http")
@@ -185,15 +181,60 @@ pub fn synthesize_error_log(raw_err: &str) -> String {
             clean_lines.push("Connexion locale refusée : le serveur ou service cible n'est pas actif.".to_string());
             break;
         }
-        if trimmed.contains("error TS") || trimmed.contains("error:") || trimmed.contains("FAILED") {
+        if trimmed.contains("Retrying in ") {
+            continue;
+        }
+        if trimmed.contains("error TS")
+            || trimmed.contains("error:")
+            || trimmed.contains("FAILED")
+            || trimmed.contains("503")
+            || trimmed.contains("429")
+            || trimmed.contains("404")
+            || trimmed.contains("403")
+            || trimmed.contains("401")
+            || trimmed.contains("ServiceUnavailable")
+            || trimmed.contains("RateLimit")
+            || trimmed.contains("RESOURCE_EXHAUSTED")
+            || trimmed.contains("UNAVAILABLE")
+            || trimmed.contains("Quota")
+            || trimmed.contains("NotFound")
+            || trimmed.contains("AuthenticationError")
+            || trimmed.contains("BadRequest")
+            || trimmed.contains("Délai dépassé")
+            || trimmed.contains("Appels répétés")
+            || trimmed.contains("litellm.")
+            || trimmed.contains("\"message\"")
+            || trimmed.contains("\"status\"")
+            || trimmed.contains("\"code\"")
+        {
             clean_lines.push(trimmed.to_string());
         }
     }
     if clean_lines.is_empty() {
-        truncate_chars(raw_err, 220)
+        truncate_chars(raw_err, 450)
     } else {
-        clean_lines.into_iter().take(4).collect::<Vec<_>>().join("\n")
+        clean_lines.into_iter().take(6).collect::<Vec<_>>().join("\n")
     }
+}
+
+fn record_trace_step(
+    app: &AppHandle,
+    conversation_id: &str,
+    steps: &mut Vec<AgentTraceStep>,
+    step: AgentTraceStep,
+) {
+    if let Some(existing) = steps.iter_mut().find(|s| s.role == step.role) {
+        *existing = step.clone();
+    } else {
+        steps.push(step.clone());
+    }
+    let _ = app.emit(
+        "aider:trace",
+        AgentTraceEvent {
+            conversation_id: conversation_id.to_string(),
+            step,
+        },
+    );
 }
 
 pub async fn run_test_verifier(project_root: &Path) -> TestVerificationResult {
@@ -1027,64 +1068,215 @@ fn build_augmented_prompt(
 }
 
 fn effective_num_ctx(settings: &AppSettings) -> usize {
-    let ctx = if settings.context_window_tokens == 0 {
-        8192
-    } else {
-        settings.context_window_tokens
-    };
-    ctx.clamp(2048, 131072)
+    providers::effective_ollama_num_ctx(settings)
 }
 
-async fn call_ollama_oneshot(
-    settings: &AppSettings,
-    system_prompt: &str,
-    user_prompt: &str,
-    num_predict: usize,
-    temperature: f32,
-) -> anyhow::Result<(String, usize, usize)> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()?;
-    let url = format!("{}/api/chat", settings.ollama_url.trim_end_matches('/'));
-
-    let payload = OllamaChatRequest {
-        model: settings.ollama_model.trim(),
-        stream: false,
-        messages: vec![
-            OllamaChatMsg {
-                role: "system",
-                content: system_prompt,
-                images: None,
-            },
-            OllamaChatMsg {
-                role: "user",
-                content: user_prompt,
-                images: None,
-            },
-        ],
-        options: Some(OllamaOptions {
-            num_ctx: Some(effective_num_ctx(settings)),
-            num_predict: Some(num_predict),
-            temperature: Some(temperature),
-        }),
-    };
-
-    let resp = client.post(url).json(&payload).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("Ollama HTTP {}", resp.status());
+async fn record_external_api_usage(
+    app: &AppHandle,
+    state_lock: &Arc<Mutex<AppStateData>>,
+    provider: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) {
+    if provider == "ollama" || (prompt_tokens == 0 && completion_tokens == 0) {
+        return;
     }
-    let parsed: OllamaChatResponse = resp.json().await?;
-    let content = parsed
-        .message
-        .and_then(|m| m.content)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    Ok((
-        content,
-        parsed.prompt_eval_count.unwrap_or(0),
-        parsed.eval_count.unwrap_or(0),
-    ))
+    let total = prompt_tokens + completion_tokens;
+    let updated_usage = {
+        let mut guard = state_lock.lock().await;
+        let today = crate::models::today_date_string();
+        if guard.api_usage.date != today {
+            guard.api_usage.date = today;
+            guard.api_usage.by_provider.clear();
+        }
+        let entry = guard
+            .api_usage
+            .by_provider
+            .entry(provider.to_string())
+            .or_default();
+        entry.prompt_tokens += prompt_tokens;
+        entry.completion_tokens += completion_tokens;
+        entry.total_tokens += total;
+        entry.calls += 1;
+        let snapshot = guard.api_usage.clone();
+        let _ = storage::save_state(&guard).await;
+        snapshot
+    };
+    let _ = app.emit("aider:api_usage", updated_usage);
+}
+
+fn slot_for_role<'a>(role: &str, settings: &'a AppSettings) -> &'a AgentModelSlot {
+    match role {
+        "architect" => &settings.agent_routing.architect,
+        "cartographer" => &settings.agent_routing.cartographer,
+        "designer" => &settings.agent_routing.designer,
+        "refactoring" => &settings.agent_routing.refactoring,
+        "tester" => &settings.agent_routing.tester,
+        "synthesizer" => &settings.agent_routing.synthesizer,
+        _ => &settings.agent_routing.coder,
+    }
+}
+
+pub fn resolve_agent_slot(role: &str, settings: &AppSettings) -> (String, String) {
+    let target = settings.active_target.trim();
+    if !target.is_empty() && target != "agent" {
+        if let Some((prov, mdl)) = target.split_once(':') {
+            let p = prov.trim();
+            let m = mdl.trim();
+            if !p.is_empty() && !m.is_empty() {
+                if p == "ollama" || providers::find_provider_key(settings, p).is_some() {
+                    return (p.to_string(), m.to_string());
+                }
+            }
+        }
+    }
+
+    let slot = slot_for_role(role, settings);
+    let p = slot.provider.trim();
+    if p.is_empty() || p == "ollama" {
+        let mdl = if slot.model.trim().is_empty() {
+            settings.ollama_model.trim().to_string()
+        } else {
+            slot.model.trim().to_string()
+        };
+        return ("ollama".to_string(), mdl);
+    }
+
+    if providers::find_provider_key(settings, p).is_some() {
+        let mdl = if !slot.model.trim().is_empty() {
+            slot.model.trim().to_string()
+        } else {
+            providers::find_provider_config(settings, p)
+                .and_then(|c| c.available_models.first().cloned())
+                .unwrap_or_default()
+        };
+        if !mdl.is_empty() {
+            return (p.to_string(), mdl);
+        }
+    }
+
+    ("ollama".to_string(), settings.ollama_model.trim().to_string())
+}
+
+pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
+    let lower = user_prompt.to_lowercase();
+
+    let test_kw = [
+        "test",
+        "vitest",
+        "jest",
+        "cargo test",
+        "unitaire",
+        "intégration",
+        "integration",
+        "couverture",
+    ];
+    let design_kw = [
+        "design",
+        "css",
+        "style",
+        "interface",
+        "ui",
+        "ux",
+        "layout",
+        "menu",
+        "sidebar",
+        "thème",
+        "theme",
+        "couleur",
+        "color",
+        "responsive",
+        "moderne",
+        "bouton",
+        "animation",
+        "tailwind",
+        "hauteur",
+        "largeur",
+        "centré",
+        "visuel",
+        "look",
+        "page web",
+    ];
+    let refac_kw = [
+        "refactor",
+        "nettoie",
+        "factorise",
+        "simplifie",
+        "optimise",
+        "découpe",
+        "réorganise",
+        "clean",
+        "typage",
+    ];
+    let feature_kw = [
+        "feature",
+        "fonctionnalité",
+        "endpoint",
+        "implémente",
+        "implement",
+        "ajoute un ",
+        "ajoute une ",
+        "créé un ",
+        "crée un ",
+        "nouvelle fonctionnalité",
+    ];
+
+    let wants_tests = test_kw.iter().any(|k| lower.contains(k));
+    if design_kw.iter().any(|k| lower.contains(k)) {
+        return ("designer", wants_tests);
+    }
+    if refac_kw.iter().any(|k| lower.contains(k)) {
+        return ("refactoring", wants_tests);
+    }
+    if wants_tests && !feature_kw.iter().any(|k| lower.contains(k)) {
+        return ("tester", true);
+    }
+    ("coder", wants_tests)
+}
+
+pub fn augment_design_target_files(all_files: &[String], matched: &mut Vec<String>) {
+    let has_css = matched
+        .iter()
+        .any(|f| f.ends_with(".css") || f.ends_with(".scss"));
+    if !has_css && matched.len() < 3 {
+        let css_candidates = [
+            "src/style.css",
+            "src/assets/main.css",
+            "src/index.css",
+            "src/app.css",
+        ];
+        for cand in css_candidates {
+            if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
+                if !matched.contains(found) {
+                    matched.push(found.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    if matched.len() < 3 {
+        for app_cand in ["src/App.vue", "src/App.tsx", "src/App.jsx"] {
+            if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(app_cand)) {
+                if !matched.contains(found) {
+                    matched.push(found.clone());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn role_display_name(role: &str) -> &'static str {
+    match role {
+        "architect" => "1. Architecte",
+        "cartographer" => "2. Cartographe",
+        "designer" => "3. Designer",
+        "refactoring" => "3. Refactoring",
+        "tester" => "4. Tests",
+        "synthesizer" => "5. Synthétiseur",
+        _ => "3. Codeur",
+    }
 }
 
 fn compact_conv_ctx_for_prompt(
@@ -1152,7 +1344,6 @@ pub fn update_rolling_conversation_context(
         return combined;
     }
 
-    // If still too long, drop oldest bullet lines first while preserving newest entries & user objective
     let mut final_custom = Vec::new();
     let mut final_bullets = Vec::new();
     for raw in combined.lines() {
@@ -1180,6 +1371,7 @@ fn build_aider_prompt(
     user_prompt: &str,
     attachments: Option<&[AttachedFile]>,
     shared_dirs: &[String],
+    architect_spec: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     if !global_ctx.trim().is_empty() {
@@ -1201,6 +1393,11 @@ fn build_aider_prompt(
     let compact_conv = compact_conv_ctx_for_prompt(conv_ctx, 400, 2);
     if !compact_conv.is_empty() {
         parts.push(format!("[Objectif discussion]\n{}", compact_conv));
+    }
+    if let Some(spec) = architect_spec {
+        if !spec.trim().is_empty() {
+            parts.push(format!("[Plan Architecte]\n{}", spec.trim()));
+        }
     }
     if let Some(att_list) = attachments {
         for att in att_list {
@@ -1429,7 +1626,10 @@ async fn run_cartographer(
     user_prompt: &str,
     attachments: Option<&[AttachedFile]>,
     settings: &AppSettings,
+    carto_provider: &str,
+    carto_model: &str,
     ollama_running: bool,
+    is_design_task: bool,
 ) -> CartographerPlan {
     let all_files = list_source_files_for_cartographer(project_root);
     if all_files.is_empty() {
@@ -1441,7 +1641,10 @@ async fn run_cartographer(
         };
     }
 
-    let (tier1, explicit) = match_files_deterministically(user_prompt, attachments, &all_files);
+    let (mut tier1, explicit) = match_files_deterministically(user_prompt, attachments, &all_files);
+    if is_design_task && !tier1.is_empty() {
+        augment_design_target_files(&all_files, &mut tier1);
+    }
     let budgeted_tier1 = filter_files_by_size_budget(project_root, tier1, 3, 20_480, 28_672);
     if !budgeted_tier1.is_empty() {
         return CartographerPlan {
@@ -1456,18 +1659,34 @@ async fn run_cartographer(
         };
     }
 
-    if !ollama_running || all_files.len() < 2 {
+    let can_call_llm = if carto_provider == "ollama" {
+        ollama_running
+    } else {
+        providers::find_provider_key(settings, carto_provider).is_some()
+    };
+
+    if !can_call_llm || all_files.len() < 2 {
+        let mut fallback = Vec::new();
+        if is_design_task {
+            augment_design_target_files(&all_files, &mut fallback);
+        }
+        let budgeted = filter_files_by_size_budget(project_root, fallback, 3, 20_480, 28_672);
         return CartographerPlan {
-            target_files: Vec::new(),
+            target_files: budgeted,
             explicit_match: false,
-            strategy_note: "Aucun fichier cible pré-résolu (repo-map Aider)".to_string(),
+            strategy_note: "Ciblage auto CSS / repo-map Aider".to_string(),
             cartographer_tokens: None,
         };
     }
 
     if all_files.len() > 400 {
+        let mut fallback = Vec::new();
+        if is_design_task {
+            augment_design_target_files(&all_files, &mut fallback);
+        }
+        let budgeted = filter_files_by_size_budget(project_root, fallback, 3, 20_480, 28_672);
         return CartographerPlan {
-            target_files: Vec::new(),
+            target_files: budgeted,
             explicit_match: false,
             strategy_note: "Dépôt volumineux (>400 fichiers) · repo-map Aider".to_string(),
             cartographer_tokens: None,
@@ -1493,7 +1712,7 @@ async fn run_cartographer(
         truncate_chars(user_prompt.trim(), 400)
     );
 
-    match call_ollama_oneshot(settings, sys, &user, 100, 0.0).await {
+    match providers::call_provider_oneshot(carto_provider, carto_model, settings, sys, &user, 100, 0.0).await {
         Ok((reply, p_tok, c_tok)) => {
             let mut routed = Vec::new();
             if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
@@ -1512,11 +1731,14 @@ async fn run_cartographer(
                     }
                 }
             }
+            if is_design_task {
+                augment_design_target_files(&all_files, &mut routed);
+            }
             let budgeted = filter_files_by_size_budget(project_root, routed, 3, 20_480, 28_672);
             let note = if budgeted.is_empty() {
                 "Routeur IA (aucun fichier ciblé)".to_string()
             } else {
-                "Routeur IA léger".to_string()
+                format!("Routeur IA ({carto_provider})")
             };
             CartographerPlan {
                 target_files: budgeted,
@@ -1525,12 +1747,19 @@ async fn run_cartographer(
                 cartographer_tokens: Some((p_tok, c_tok)),
             }
         }
-        Err(_) => CartographerPlan {
-            target_files: Vec::new(),
-            explicit_match: false,
-            strategy_note: "Repli repo-map Aider".to_string(),
-            cartographer_tokens: None,
-        },
+        Err(_) => {
+            let mut fallback = Vec::new();
+            if is_design_task {
+                augment_design_target_files(&all_files, &mut fallback);
+            }
+            let budgeted = filter_files_by_size_budget(project_root, fallback, 3, 20_480, 28_672);
+            CartographerPlan {
+                target_files: budgeted,
+                explicit_match: false,
+                strategy_note: "Repli repo-map Aider".to_string(),
+                cartographer_tokens: None,
+            }
+        }
     }
 }
 
@@ -1546,6 +1775,7 @@ pub fn choose_aider_strategy(
     project_root: &Path,
     target_files: &[String],
     explicit_match: bool,
+    provider: &str,
     settings: &AppSettings,
 ) -> AiderStrategy {
     let mut max_file_lines = 0usize;
@@ -1563,7 +1793,13 @@ pub fn choose_aider_strategy(
         "whole" => "whole".to_string(),
         "diff" => "diff".to_string(),
         _ => {
-            if target_files.is_empty() || (max_file_lines <= 250 && total_file_lines <= 350) {
+            if provider != "ollama" {
+                if !target_files.is_empty() && max_file_lines > 120 {
+                    "diff".to_string()
+                } else {
+                    "whole".to_string()
+                }
+            } else if target_files.is_empty() || (max_file_lines <= 250 && total_file_lines <= 350) {
                 "whole".to_string()
             } else {
                 "diff".to_string()
@@ -1579,7 +1815,7 @@ pub fn choose_aider_strategy(
         384
     };
 
-    let max_chat_history_tokens = if effective_num_ctx(settings) <= 8192 {
+    let max_chat_history_tokens = if provider == "ollama" && effective_num_ctx(settings) <= 8192 {
         1024
     } else {
         2048
@@ -1886,26 +2122,37 @@ fn append_modified_files_summary(narrative: &str, modified_files: &[ModifiedFile
     sections.join("\n\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn synthesize_final_response(
     app: &AppHandle,
+    state_lock: &Arc<Mutex<AppStateData>>,
     conversation_id: &str,
     user_prompt: &str,
     raw_output: &str,
     aider_ran: bool,
     ollama_running: bool,
+    synth_provider: &str,
+    synth_model: &str,
     settings: &AppSettings,
     modified_files: &[ModifiedFileDiff],
     verifier_note: &str,
-) -> (String, String, bool) {
+) -> (String, String, bool, usize) {
     let (cleaned_narrative, had_retries_or_errors) =
         clean_aider_output_for_display(raw_output, aider_ran, modified_files);
 
+    let can_call_synth = if synth_provider == "ollama" {
+        ollama_running
+    } else {
+        providers::find_provider_key(settings, synth_provider).is_some()
+    };
+
     let needs_llm_synthesis = aider_ran
-        && ollama_running
+        && can_call_synth
         && (had_retries_or_errors
             || cleaned_narrative.is_empty()
             || cleaned_narrative.chars().count() > 650);
 
+    let mut synth_tokens = 0usize;
     let core_narrative = if needs_llm_synthesis {
         let diff_summary = if modified_files.is_empty() {
             "Aucune modification appliquée sur le disque.".to_string()
@@ -1927,17 +2174,37 @@ async fn synthesize_final_response(
             truncate_chars(&cleaned_narrative, 700)
         );
 
-        match call_ollama_oneshot(settings, synth_sys, &synth_user, 220, 0.1).await {
+        match providers::call_provider_oneshot(
+            synth_provider,
+            synth_model,
+            settings,
+            synth_sys,
+            &synth_user,
+            220,
+            0.1,
+        )
+        .await
+        {
             Ok((summary, p_tok, c_tok)) => {
-                if p_tok + c_tok > 0 {
+                synth_tokens = p_tok + c_tok;
+                if synth_tokens > 0 {
+                    record_external_api_usage(app, state_lock, synth_provider, p_tok, c_tok).await;
                     let _ = app.emit(
                         "aider:tokens",
                         TokenUsageEvent {
                             conversation_id: conversation_id.to_string(),
-                            subagent: "5. Synthétiseur (Compte-rendu)".to_string(),
+                            subagent: "5. Synthétiseur".to_string(),
                             prompt_tokens: p_tok,
                             completion_tokens: c_tok,
-                            total_tokens: p_tok + c_tok,
+                            total_tokens: synth_tokens,
+                            role: "synthesizer".to_string(),
+                            provider: synth_provider.to_string(),
+                            model: synth_model.to_string(),
+                            context_limit: providers::resolve_model_context_limit(
+                                synth_provider,
+                                synth_model,
+                                settings,
+                            ),
                         },
                     );
                 }
@@ -1954,7 +2221,7 @@ async fn synthesize_final_response(
     };
 
     let final_markdown = append_modified_files_summary(&core_narrative, modified_files);
-    (final_markdown, cleaned_narrative, had_retries_or_errors)
+    (final_markdown, cleaned_narrative, had_retries_or_errors, synth_tokens)
 }
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
@@ -1991,22 +2258,124 @@ fn parse_aider_token_count(line: &str, marker: &str) -> usize {
     0
 }
 
+fn is_cancelled(cancel_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *cancel_rx.borrow()
+}
+
+async fn wait_cancelled(cancel_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+pub fn clean_generated_title(raw: &str) -> Option<String> {
+    let first_line = raw
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())?;
+
+    let mut cleaned = first_line.trim_start_matches('#').trim();
+    for prefix in [
+        "Titre :",
+        "Titre:",
+        "Title :",
+        "Title:",
+        "Sujet :",
+        "Sujet:",
+    ] {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.trim();
+        }
+    }
+
+    cleaned = cleaned.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '«' | '»' | '*' | '.' | '!' | '?' | ':' | ';')
+    });
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(cleaned, 46))
+    }
+}
+
+fn pick_title_provider_model(settings: &AppSettings, ollama_running: bool) -> Option<(String, String)> {
+    for role in ["synthesizer", "architect"] {
+        let (prov, mdl) = resolve_agent_slot(role, settings);
+        if mdl.trim().is_empty() {
+            continue;
+        }
+        if prov == "ollama" {
+            if ollama_running {
+                return Some((prov, mdl));
+            }
+        } else if providers::find_provider_key(settings, &prov).is_some() {
+            return Some((prov, mdl));
+        }
+    }
+
+    if let Some(cfg) = settings
+        .providers
+        .iter()
+        .find(|p| p.validated && !p.api_key.trim().is_empty() && !p.available_models.is_empty())
+    {
+        return Some((cfg.id.clone(), cfg.available_models[0].clone()));
+    }
+
+    if ollama_running && !settings.ollama_model.trim().is_empty() {
+        return Some(("ollama".to_string(), settings.ollama_model.trim().to_string()));
+    }
+
+    None
+}
+
+async fn generate_conversation_title(
+    settings: &AppSettings,
+    ollama_running: bool,
+    user_prompt: &str,
+) -> Option<String> {
+    let (prov, mdl) = pick_title_provider_model(settings, ollama_running)?;
+    let sys = "Tu génères un titre très court en français (3 à 6 mots maximum) résumant le sujet d'une discussion technique. Réponds UNIQUEMENT par le titre brut : sans guillemets, sans point final, sans préfixe.";
+    let prompt_excerpt = truncate_chars(user_prompt.trim(), 500);
+    let fut = providers::call_provider_oneshot(&prov, &mdl, settings, sys, &prompt_excerpt, 48, 0.2);
+    match tokio::time::timeout(std::time::Duration::from_secs(15), fut).await {
+        Ok(Ok((reply, _, _))) => clean_generated_title(&reply),
+        _ => None,
+    }
+}
+
+enum AiderWaitOutcome {
+    Finished(std::process::ExitStatus),
+    TimedOut,
+    RetryAborted,
+    Cancelled,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_aider_cli(
     app: &AppHandle,
     conversation_id: &str,
     aider_bin: &str,
     project_root: &str,
+    provider: &str,
+    model: &str,
+    role: &str,
     settings: &AppSettings,
     prompt: &str,
     target_files: &[String],
     strategy: &AiderStrategy,
-) -> anyhow::Result<String> {
-    let model_arg = if settings.ollama_model.starts_with("ollama") {
-        settings.ollama_model.clone()
-    } else {
-        format!("ollama_chat/{}", settings.ollama_model.trim())
-    };
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<(String, usize, usize)> {
+    if is_cancelled(cancel_rx) {
+        anyhow::bail!("CANCELLED_BY_USER");
+    }
+    let (model_arg, env_vars) = providers::aider_model_and_env(provider, model, settings)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let mut args = vec![
         "--model".to_string(),
@@ -2029,11 +2398,13 @@ async fn execute_aider_cli(
         strategy.map_tokens.to_string(),
     ];
 
-    if let Some(settings_path) =
-        write_aider_model_settings(&model_arg, effective_num_ctx(settings))
-    {
-        args.push("--model-settings-file".to_string());
-        args.push(settings_path.to_string_lossy().to_string());
+    if provider == "ollama" {
+        if let Some(settings_path) =
+            write_aider_model_settings(&model_arg, effective_num_ctx(settings))
+        {
+            args.push("--model-settings-file".to_string());
+            args.push(settings_path.to_string_lossy().to_string());
+        }
     }
 
     args.push("--chat-language".to_string());
@@ -2049,10 +2420,15 @@ async fn execute_aider_cli(
 
     let mut cmd = Command::new(aider_bin);
     cmd.current_dir(project_root)
-        .env("OLLAMA_API_BASE", settings.ollama_url.trim_end_matches('/'))
         .args(&args)
+        .env("AIDER_ANALYTICS", "false")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
 
     #[cfg(target_os = "windows")]
     cmd.creation_flags(0x08000000);
@@ -2066,20 +2442,41 @@ async fn execute_aider_cli(
     let c_out = Arc::clone(&collected);
     let app_out = app.clone();
     let conv_id_out = conversation_id.to_string();
-    let subagent_label = format!("3. Codeur ({})", strategy.edit_format);
+    let role_str = role.to_string();
+    let provider_str = provider.to_string();
+    let model_str = model.to_string();
+    let ctx_limit = providers::resolve_model_context_limit(provider, model, settings);
+    let subagent_label = format!("{} ({})", role_display_name(role), strategy.edit_format);
+    let billed_prompt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let billed_completion = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bp_task = Arc::clone(&billed_prompt);
+    let bc_task = Arc::clone(&billed_completion);
+    let retry_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let abort_notify = Arc::new(tokio::sync::Notify::new());
+    let retry_out = Arc::clone(&retry_hits);
+    let notify_out = Arc::clone(&abort_notify);
 
     let out_task = tokio::spawn(async move {
         if let Some(out) = stdout {
             let mut lines = BufReader::new(out).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("Retrying in ") {
+                    let count = retry_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if count >= 6 {
+                        notify_out.notify_one();
+                    }
+                }
                 let mut guard = c_out.lock().await;
                 guard.push_str(&line);
                 guard.push('\n');
+                drop(guard);
                 if line.trim().starts_with("Tokens:") {
                     let prompt_tokens = parse_aider_token_count(&line, "sent");
                     let completion_tokens = parse_aider_token_count(&line, "received");
                     let total_tokens = prompt_tokens + completion_tokens;
                     if total_tokens > 0 {
+                        bp_task.fetch_add(prompt_tokens, std::sync::atomic::Ordering::Relaxed);
+                        bc_task.fetch_add(completion_tokens, std::sync::atomic::Ordering::Relaxed);
                         let _ = app_out.emit(
                             "aider:tokens",
                             TokenUsageEvent {
@@ -2088,6 +2485,10 @@ async fn execute_aider_cli(
                                 prompt_tokens,
                                 completion_tokens,
                                 total_tokens,
+                                role: role_str.clone(),
+                                provider: provider_str.clone(),
+                                model: model_str.clone(),
+                                context_limit: ctx_limit,
                             },
                         );
                     }
@@ -2098,37 +2499,103 @@ async fn execute_aider_cli(
     });
 
     let c_err = Arc::clone(&collected);
+    let app_err = app.clone();
+    let conv_id_err = conversation_id.to_string();
+    let retry_err = Arc::clone(&retry_hits);
+    let notify_err = Arc::clone(&abort_notify);
     let err_task = tokio::spawn(async move {
         if let Some(err) = stderr {
             let mut lines = BufReader::new(err).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.trim().is_empty() {
+                    if line.contains("Retrying in ") {
+                        let count = retry_err.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if count >= 6 {
+                            notify_err.notify_one();
+                        }
+                    }
                     let mut guard = c_err.lock().await;
                     guard.push_str(&line);
                     guard.push('\n');
+                    drop(guard);
+                    let _ = app_err.emit("aider:stream", (&conv_id_err, &line));
                 }
             }
         }
     });
 
-    let status = tokio::time::timeout(std::time::Duration::from_secs(180), child.wait()).await??;
-    let _ = out_task.await;
-    let _ = err_task.await;
+    let wait_res = tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel_rx) => {
+            let _ = child.kill().await;
+            AiderWaitOutcome::Cancelled
+        }
+        timed = tokio::time::timeout(std::time::Duration::from_secs(180), child.wait()) => {
+            match timed {
+                Ok(status_res) => AiderWaitOutcome::Finished(status_res?),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    AiderWaitOutcome::TimedOut
+                }
+            }
+        }
+        _ = abort_notify.notified() => {
+            let _ = child.kill().await;
+            AiderWaitOutcome::RetryAborted
+        }
+    };
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), out_task).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await;
 
     let text = collected.lock().await.trim().to_string();
-    if !status.success() && text.is_empty() {
-        anyhow::bail!("Aider s'est terminé avec le code {:?}", status.code());
+    match wait_res {
+        AiderWaitOutcome::Cancelled => {
+            anyhow::bail!("CANCELLED_BY_USER");
+        }
+        AiderWaitOutcome::RetryAborted => {
+            let excerpt = tail_chars(&text, 900);
+            anyhow::bail!(
+                "Appels répétés en échec (quota/rate-limit ou modèle indisponible sur {provider}:{model}) :\n{excerpt}"
+            );
+        }
+        AiderWaitOutcome::TimedOut => {
+            if text.is_empty() {
+                anyhow::bail!("Délai dépassé (180s) sans réponse de {provider}:{model}.");
+            } else {
+                let excerpt = tail_chars(&text, 900);
+                anyhow::bail!(
+                    "Délai dépassé (180s) sur {provider}:{model}. Dernière sortie Aider :\n{excerpt}"
+                );
+            }
+        }
+        AiderWaitOutcome::Finished(status) => {
+            if !status.success() && text.is_empty() {
+                anyhow::bail!("Aider s'est terminé avec le code {:?}", status.code());
+            }
+        }
     }
-    Ok(text)
+    Ok((
+        text,
+        billed_prompt.load(std::sync::atomic::Ordering::Relaxed),
+        billed_completion.load(std::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_ollama_streaming(
     app: &AppHandle,
     conversation_id: &str,
     settings: &AppSettings,
+    model: &str,
+    role: &str,
     prompt: &str,
     image_base64_list: Vec<String>,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<String> {
+    if is_cancelled(cancel_rx) {
+        anyhow::bail!("CANCELLED_BY_USER");
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()?;
@@ -2141,7 +2608,7 @@ async fn execute_ollama_streaming(
     };
 
     let payload = OllamaChatRequest {
-        model: settings.ollama_model.trim(),
+        model: model.trim(),
         stream: true,
         messages: vec![
             OllamaChatMsg {
@@ -2157,12 +2624,14 @@ async fn execute_ollama_streaming(
         ],
         options: Some(OllamaOptions {
             num_ctx: Some(effective_num_ctx(settings)),
-            num_predict: None,
-            temperature: None,
         }),
     };
 
-    let mut resp = client.post(url).json(&payload).send().await?;
+    let mut resp = tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+        res = client.post(url).json(&payload).send() => res?,
+    };
     if !resp.status().is_success() {
         anyhow::bail!("Ollama HTTP {}", resp.status());
     }
@@ -2172,8 +2641,18 @@ async fn execute_ollama_streaming(
     let mut live_thinking = String::new();
     let mut live_content = String::new();
     let mut buffer = String::new();
+    let role_label = format!("{} (Ollama)", role_display_name(role));
+    let ctx_limit = providers::resolve_model_context_limit("ollama", model, settings);
 
-    while let Some(chunk_bytes) = resp.chunk().await? {
+    loop {
+        let chunk_opt = tokio::select! {
+            biased;
+            _ = wait_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+            res = resp.chunk() => res?,
+        };
+        let Some(chunk_bytes) = chunk_opt else {
+            break;
+        };
         let text_chunk = String::from_utf8_lossy(&chunk_bytes);
         buffer.push_str(&text_chunk);
 
@@ -2195,10 +2674,14 @@ async fn execute_ollama_streaming(
                             "aider:tokens",
                             TokenUsageEvent {
                                 conversation_id: conversation_id.to_string(),
-                                subagent: "3. Codeur Atomique (Ollama)".to_string(),
+                                subagent: role_label.clone(),
                                 prompt_tokens,
                                 completion_tokens,
                                 total_tokens,
+                                role: role.to_string(),
+                                provider: "ollama".to_string(),
+                                model: model.trim().to_string(),
+                                context_limit: ctx_limit,
                             },
                         );
                     }
@@ -2249,15 +2732,98 @@ async fn execute_ollama_streaming(
     Ok(full_accumulated.trim().to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finish_cancelled_pipeline(
+    app: &AppHandle,
+    state_lock: &Arc<Mutex<AppStateData>>,
+    conversation_id: &str,
+    project_root: &str,
+    agent_trace: &mut Vec<AgentTraceStep>,
+) -> anyhow::Result<SendPromptResult> {
+    for step in agent_trace.iter_mut() {
+        if step.status == "running" {
+            step.status = "error".to_string();
+            step.summary = "Interrompu par l'utilisateur".to_string();
+            let _ = app.emit(
+                "aider:trace",
+                AgentTraceEvent {
+                    conversation_id: conversation_id.to_string(),
+                    step: step.clone(),
+                },
+            );
+        }
+    }
+
+    git_diff::sanitize_backtick_paths(project_root).await;
+    let (modified_files, lines_added, lines_removed) =
+        git_diff::collect_project_diffs(project_root).await;
+
+    let result = {
+        let mut guard = state_lock.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let conv_idx = guard
+            .conversations
+            .iter()
+            .position(|c| c.id == conversation_id)
+            .ok_or_else(|| anyhow::anyhow!("Conversation introuvable"))?;
+
+        guard.conversations[conv_idx].messages.push(ChatMessage {
+            id: Uuid::new_v4().to_string(),
+            role: "assistant".to_string(),
+            content: "⏹️ **Traitement interrompu par l'utilisateur.**".to_string(),
+            thinking: None,
+            attachments: None,
+            created_at: now.clone(),
+            stage_summary: Some("Interrompu".to_string()),
+            files_changed: modified_files.len(),
+            lines_added,
+            lines_removed,
+            agent_trace: agent_trace.clone(),
+        });
+        guard.conversations[conv_idx].modified_files = modified_files;
+        guard.conversations[conv_idx].lines_added = lines_added;
+        guard.conversations[conv_idx].lines_removed = lines_removed;
+        guard.conversations[conv_idx].updated_at = now.clone();
+
+        let proj_id = guard.conversations[conv_idx].project_id.clone();
+        let proj_idx = guard
+            .projects
+            .iter()
+            .position(|p| p.id == proj_id)
+            .ok_or_else(|| anyhow::anyhow!("Projet introuvable"))?;
+        guard.projects[proj_idx].updated_at = now;
+
+        let updated_conv = guard.conversations[conv_idx].clone();
+        let updated_proj = guard.projects[proj_idx].clone();
+        let _ = storage::save_state(&guard).await;
+
+        SendPromptResult {
+            conversation: updated_conv,
+            project: updated_proj,
+        }
+    };
+
+    emit_stage(
+        app,
+        conversation_id,
+        5,
+        "Interrompu",
+        "Traitement arrêté à la demande de l'utilisateur.",
+        "error",
+    );
+    Ok(result)
+}
+
 pub async fn run_prompt_pipeline(
     app: &AppHandle,
     state_lock: &Arc<Mutex<AppStateData>>,
     conversation_id: String,
     user_prompt: String,
     attachments: Option<Vec<AttachedFile>>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<SendPromptResult> {
     // Snapshot inputs and record user message immediately
-    let (settings, project, conv_ctx, user_msg_time) = {
+    let (settings, project, conv_ctx, user_msg_time, is_first_message, initial_auto_title) = {
         let mut guard = state_lock.lock().await;
         let conv_idx = guard
             .conversations
@@ -2266,9 +2832,14 @@ pub async fn run_prompt_pipeline(
             .ok_or_else(|| anyhow::anyhow!("Conversation introuvable"))?;
 
         let now = Utc::now().to_rfc3339();
-        if guard.conversations[conv_idx].messages.is_empty() {
-            guard.conversations[conv_idx].title = truncate_chars(user_prompt.trim(), 38);
-        }
+        let is_first_message = guard.conversations[conv_idx].messages.is_empty();
+        let initial_auto_title = if is_first_message {
+            let t = truncate_chars(user_prompt.trim(), 38);
+            guard.conversations[conv_idx].title = t.clone();
+            t
+        } else {
+            guard.conversations[conv_idx].title.clone()
+        };
         guard.conversations[conv_idx].messages.push(ChatMessage {
             id: Uuid::new_v4().to_string(),
             role: "user".to_string(),
@@ -2280,6 +2851,7 @@ pub async fn run_prompt_pipeline(
             files_changed: 0,
             lines_added: 0,
             lines_removed: 0,
+            agent_trace: Vec::new(),
         });
         guard.conversations[conv_idx].updated_at = now.clone();
 
@@ -2294,7 +2866,7 @@ pub async fn run_prompt_pipeline(
         let conv_ctx = guard.conversations[conv_idx].conversation_context.clone();
         let settings = guard.settings.clone();
         let _ = storage::save_state(&guard).await;
-        (settings, project, conv_ctx, now)
+        (settings, project, conv_ctx, now, is_first_message, initial_auto_title)
     };
 
     // Extract image base64 if present
@@ -2336,15 +2908,178 @@ pub async fn run_prompt_pipeline(
     }
     let will_run_aider = image_base64_list.is_empty() && stack.aider_bin.is_some();
 
+    let mut agent_trace: Vec<AgentTraceStep> = Vec::new();
+    if is_cancelled(&cancel_rx) {
+        return finish_cancelled_pipeline(
+            app,
+            state_lock,
+            &conversation_id,
+            &project.root_path,
+            &mut agent_trace,
+        )
+        .await;
+    }
+
+    let mut title_handle = if is_first_message && !user_prompt.trim().is_empty() {
+        let t_app = app.clone();
+        let t_state = Arc::clone(state_lock);
+        let t_conv_id = conversation_id.clone();
+        let t_settings = settings.clone();
+        let t_prompt = user_prompt.clone();
+        let t_init_title = initial_auto_title.clone();
+        let t_ollama_running = stack.ollama_running;
+        Some(tokio::spawn(async move {
+            if let Some(new_title) =
+                generate_conversation_title(&t_settings, t_ollama_running, &t_prompt).await
+            {
+                let mut should_emit = false;
+                {
+                    let mut guard = t_state.lock().await;
+                    if let Some(conv) = guard.conversations.iter_mut().find(|c| c.id == t_conv_id) {
+                        if conv.title == t_init_title && conv.title != new_title {
+                            conv.title = new_title.clone();
+                            should_emit = true;
+                            let _ = storage::save_state(&guard).await;
+                        }
+                    }
+                }
+                if should_emit {
+                    let _ = t_app.emit("aider:conversation_titled", (&t_conv_id, &new_title));
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // SUB-AGENT 1/5: Architecte & Orchestrateur
+    let (arch_prov, arch_model) = resolve_agent_slot("architect", &settings);
+    let (mut exec_role, mut run_tests_after) = classify_prompt_role(&user_prompt);
+    let (base_exec_prov, base_exec_model) = resolve_agent_slot(exec_role, &settings);
+    let is_agent_mode =
+        settings.active_target.trim().is_empty() || settings.active_target.trim() == "agent";
+
     emit_stage(
         app,
         &conversation_id,
         1,
         "1. Architecte & Orchestrateur",
-        "Analyse de la demande, cadrage du contexte et optimisation 8K.",
+        &format!(
+            "Analyse de la demande et routage ({} · {}).",
+            arch_prov, arch_model
+        ),
         "running",
     );
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: "architect".to_string(),
+            role_label: "Architecte".to_string(),
+            provider: arch_prov.clone(),
+            model: arch_model.clone(),
+            summary: "Analyse de la demande et préparation du cadrage...".to_string(),
+            status: "running".to_string(),
+            tokens: 0,
+        },
+    );
+
+    let mut architect_spec: Option<String> = None;
+    let mut architect_llm_ran = false;
+    let mut architect_err: Option<String> = None;
+    let mut arch_tokens_used = 0usize;
+
+    if is_agent_mode
+        && (arch_prov != base_exec_prov || arch_model != base_exec_model)
+        && (arch_prov != "ollama" || stack.ollama_running)
+    {
+        let arch_sys = "Tu es l'Architecte logiciel d'AiderStudio. Analyse la demande utilisateur et décide du sous-agent d'exécution le plus adapté.\nRetourne UNIQUEMENT un objet JSON valide, sans texte ni markdown autour :\n{\"role\":\"designer|coder|refactoring|tester\",\"runTests\":false,\"spec\":\"3 à 6 consignes techniques précises et concises en français pour guider l'exécution\"}";
+        let arch_user = format!(
+            "[Contexte projet]\n{}\n\n[Session récente]\n{}\n\n[Demande utilisateur]\n{}",
+            truncate_chars(project.global_context.trim(), 500),
+            truncate_chars(conv_ctx.trim(), 500),
+            truncate_chars(user_prompt.trim(), 900)
+        );
+        let arch_call_res = tokio::select! {
+            biased;
+            _ = wait_cancelled(&mut cancel_rx) => {
+                if let Some(h) = title_handle.take() {
+                    h.abort();
+                }
+                return finish_cancelled_pipeline(
+                    app,
+                    state_lock,
+                    &conversation_id,
+                    &project.root_path,
+                    &mut agent_trace,
+                )
+                .await;
+            }
+            res = providers::call_provider_oneshot(
+                &arch_prov,
+                &arch_model,
+                &settings,
+                arch_sys,
+                &arch_user,
+                450,
+                0.2,
+            ) => res,
+        };
+        match arch_call_res
+        {
+            Ok((reply, p_tok, c_tok)) => {
+                if let (Some(start), Some(end)) = (reply.find('{'), reply.rfind('}')) {
+                    if start < end {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&reply[start..=end]) {
+                            if let Some(r) = val.get("role").and_then(|v| v.as_str()) {
+                                exec_role = match r.trim() {
+                                    "designer" => "designer",
+                                    "coder" => "coder",
+                                    "refactoring" => "refactoring",
+                                    "tester" => "tester",
+                                    _ => exec_role,
+                                };
+                            }
+                            if val.get("runTests").and_then(|v| v.as_bool()) == Some(true) {
+                                run_tests_after = true;
+                            }
+                            if let Some(spec) = val.get("spec").and_then(|v| v.as_str()) {
+                                let clean_spec = spec.trim();
+                                if !clean_spec.is_empty() {
+                                    architect_spec = Some(truncate_chars(clean_spec, 900));
+                                }
+                            }
+                        }
+                    }
+                }
+                architect_llm_ran = true;
+                arch_tokens_used = p_tok + c_tok;
+                record_external_api_usage(app, state_lock, &arch_prov, p_tok, c_tok).await;
+                let _ = app.emit(
+                    "aider:tokens",
+                    TokenUsageEvent {
+                        conversation_id: conversation_id.clone(),
+                        subagent: "1. Architecte".to_string(),
+                        prompt_tokens: p_tok,
+                        completion_tokens: c_tok,
+                        total_tokens: arch_tokens_used,
+                        role: "architect".to_string(),
+                        provider: arch_prov.clone(),
+                        model: arch_model.clone(),
+                        context_limit: providers::resolve_model_context_limit(
+                            &arch_prov,
+                            &arch_model,
+                            &settings,
+                        ),
+                    },
+                );
+            }
+            Err(e) => {
+                architect_err = Some(synthesize_error_log(&e.to_string()));
+            }
+        }
+    }
 
     let aider_prompt_opt = if will_run_aider {
         Some(build_aider_prompt(
@@ -2353,59 +3088,155 @@ pub async fn run_prompt_pipeline(
             &user_prompt,
             attachments.as_deref(),
             &project.shared_directories,
+            architect_spec.as_deref(),
         ))
     } else {
         None
     };
     let direct_prompt_opt = if !will_run_aider {
-        Some(build_augmented_prompt(
+        let mut p = build_augmented_prompt(
             &project.global_context,
             &conv_ctx,
             &user_prompt,
             attachments.as_deref(),
             &project.shared_directories,
-        ))
+        );
+        if let Some(spec) = architect_spec.as_deref() {
+            p.push_str(&format!("\n\n[Plan & Consignes Architecte]\n{spec}"));
+        }
+        Some(p)
     } else {
         None
     };
 
-    let init_prompt_ref = aider_prompt_opt
-        .as_deref()
-        .or(direct_prompt_opt.as_deref())
-        .unwrap_or("");
-    let init_prompt_tokens = (init_prompt_ref.len() as f64 / 3.8).ceil() as usize;
-    let _ = app.emit(
-        "aider:tokens",
-        TokenUsageEvent {
-            conversation_id: conversation_id.clone(),
-            subagent: "1. Architecte & Contexte".to_string(),
-            prompt_tokens: init_prompt_tokens,
-            completion_tokens: 0,
-            total_tokens: init_prompt_tokens,
+    if !architect_llm_ran {
+        let init_prompt_ref = aider_prompt_opt
+            .as_deref()
+            .or(direct_prompt_opt.as_deref())
+            .unwrap_or("");
+        let init_prompt_tokens = (init_prompt_ref.len() as f64 / 3.8).ceil() as usize;
+        arch_tokens_used = init_prompt_tokens;
+        let _ = app.emit(
+            "aider:tokens",
+            TokenUsageEvent {
+                conversation_id: conversation_id.clone(),
+                subagent: "1. Architecte & Contexte".to_string(),
+                prompt_tokens: init_prompt_tokens,
+                completion_tokens: 0,
+                total_tokens: init_prompt_tokens,
+                role: "architect".to_string(),
+                provider: arch_prov.clone(),
+                model: arch_model.clone(),
+                context_limit: providers::resolve_model_context_limit(
+                    &arch_prov,
+                    &arch_model,
+                    &settings,
+                ),
+            },
+        );
+    }
+
+    let (arch_status, arch_summary) = if architect_llm_ran {
+        let spec_note = architect_spec
+            .as_deref()
+            .map(|s| format!(" · {}", truncate_chars(s.replace('\n', " ").trim(), 120)))
+            .unwrap_or_default();
+        (
+            "done".to_string(),
+            format!(
+                "Routé vers **{}** · Plan technique généré{}",
+                role_display_name(exec_role),
+                spec_note
+            ),
+        )
+    } else if let Some(ref err_msg) = architect_err {
+        (
+            "fallback".to_string(),
+            format!(
+                "Repli cadrage déterministe (vers **{}**) · `{}`",
+                role_display_name(exec_role),
+                truncate_chars(&err_msg.replace('`', "'"), 110)
+            ),
+        )
+    } else {
+        (
+            "done".to_string(),
+            format!(
+                "Cadrage contexte et routage vers **{}**",
+                role_display_name(exec_role)
+            ),
+        )
+    };
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: "architect".to_string(),
+            role_label: "Architecte".to_string(),
+            provider: arch_prov.clone(),
+            model: arch_model.clone(),
+            summary: arch_summary,
+            status: arch_status,
+            tokens: arch_tokens_used,
         },
     );
 
     // SUB-AGENT 2/5: Cartographe & Analyseur
+    let (carto_prov, carto_model) = resolve_agent_slot("cartographer", &settings);
     emit_stage(
         app,
         &conversation_id,
         2,
         "2. Cartographe & Analyseur",
-        "Sélection des fichiers cibles et isolement des interfaces utiles.",
+        &format!("Sélection des fichiers cibles ({} · {}).", carto_prov, carto_model),
         "running",
+    );
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: "cartographer".to_string(),
+            role_label: "Cartographe".to_string(),
+            provider: carto_prov.clone(),
+            model: carto_model.clone(),
+            summary: "Identification des fichiers cibles...".to_string(),
+            status: "running".to_string(),
+            tokens: 0,
+        },
     );
 
     let carto = if will_run_aider {
-        let plan = run_cartographer(
-            &project_root_path,
-            &user_prompt,
-            attachments.as_deref(),
-            &settings,
-            stack.ollama_running,
-        )
-        .await;
+        let plan = tokio::select! {
+            biased;
+            _ = wait_cancelled(&mut cancel_rx) => {
+                if let Some(h) = title_handle.take() {
+                    h.abort();
+                }
+                return finish_cancelled_pipeline(
+                    app,
+                    state_lock,
+                    &conversation_id,
+                    &project.root_path,
+                    &mut agent_trace,
+                )
+                .await;
+            }
+            p = run_cartographer(
+                &project_root_path,
+                &user_prompt,
+                attachments.as_deref(),
+                &settings,
+                &carto_prov,
+                &carto_model,
+                stack.ollama_running,
+                exec_role == "designer",
+            ) => p,
+        };
         if let Some((p_tok, c_tok)) = plan.cartographer_tokens {
             if p_tok + c_tok > 0 {
+                record_external_api_usage(app, state_lock, &carto_prov, p_tok, c_tok).await;
                 let _ = app.emit(
                     "aider:tokens",
                     TokenUsageEvent {
@@ -2414,6 +3245,14 @@ pub async fn run_prompt_pipeline(
                         prompt_tokens: p_tok,
                         completion_tokens: c_tok,
                         total_tokens: p_tok + c_tok,
+                        role: "cartographer".to_string(),
+                        provider: carto_prov.clone(),
+                        model: carto_model.clone(),
+                        context_limit: providers::resolve_model_context_limit(
+                            &carto_prov,
+                            &carto_model,
+                            &settings,
+                        ),
                     },
                 );
             }
@@ -2436,43 +3275,95 @@ pub async fn run_prompt_pipeline(
         CartographerPlan {
             target_files: Vec::new(),
             explicit_match: false,
-            strategy_note: "Mode Ollama direct".to_string(),
+            strategy_note: "Mode direct".to_string(),
             cartographer_tokens: None,
         }
     };
 
+    let carto_tokens_used = carto.cartographer_tokens.map(|(p, c)| p + c).unwrap_or(0);
+    let carto_summary = if carto.target_files.is_empty() {
+        format!("Découverte automatique ({})", carto.strategy_note)
+    } else {
+        let file_tags: Vec<String> = carto
+            .target_files
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect();
+        format!("Ciblé : {} ({})", file_tags.join(", "), carto.strategy_note)
+    };
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: "cartographer".to_string(),
+            role_label: "Cartographe".to_string(),
+            provider: carto_prov.clone(),
+            model: carto_model.clone(),
+            summary: carto_summary,
+            status: "done".to_string(),
+            tokens: carto_tokens_used,
+        },
+    );
+
+    // SUB-AGENT 3/5: Exécution (Designer / Codeur / Refactoring / Testeur)
+    let (exec_prov, exec_model) = resolve_agent_slot(exec_role, &settings);
     let strategy = choose_aider_strategy(
         &project_root_path,
         &carto.target_files,
         carto.explicit_match,
+        &exec_prov,
         &settings,
     );
 
-    // SUB-AGENT 3/5: Codeur Atomique
+    let stage3_label = format!(
+        "3. {} ({} · {})",
+        role_display_name(exec_role),
+        exec_prov,
+        exec_model
+    );
     let stage3_detail = if will_run_aider {
         format!(
-            "Format {} · map {} tok · {} fichier(s) sur {}",
+            "Format {} · map {} tok · {} fichier(s) sur {}:{}",
             strategy.edit_format,
             strategy.map_tokens,
             carto.target_files.len(),
-            settings.ollama_model
+            exec_prov,
+            exec_model
         )
     } else {
         format!(
-            "Génération et application des modifications ciblées sur {}",
-            settings.ollama_model
+            "Génération et application des modifications ciblées sur {}:{}",
+            exec_prov, exec_model
         )
     };
     emit_stage(
         app,
         &conversation_id,
         3,
-        "3. Codeur Atomique (Aider & Ollama)",
+        &stage3_label,
         &stage3_detail,
         "running",
     );
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: exec_role.to_string(),
+            role_label: role_display_name(exec_role).to_string(),
+            provider: exec_prov.clone(),
+            model: exec_model.clone(),
+            summary: stage3_detail.clone(),
+            status: "running".to_string(),
+            tokens: 0,
+        },
+    );
 
     let mut aider_ran = false;
+    let mut exec_tokens_used = 0usize;
+    let mut exec_status = "done".to_string();
+    let exec_note: String;
     let (assistant_text, stage_note) = if will_run_aider {
         // Sanitize any existing conflict markers before Aider runs
         git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
@@ -2485,75 +3376,375 @@ pub async fn run_prompt_pipeline(
             &conversation_id,
             aider_bin,
             &project.root_path,
+            &exec_prov,
+            &exec_model,
+            exec_role,
             &settings,
             &aider_prompt,
             &carto.target_files,
             &strategy,
+            &mut cancel_rx,
         )
         .await
         {
-            Ok(output) if !output.is_empty() => {
+            Ok((output, bp, bc)) => {
                 aider_ran = true;
+                exec_tokens_used = bp + bc;
+                exec_note = format!(
+                    "Exécution Aider CLI (format `{}`, max {} l.)",
+                    strategy.edit_format, strategy.max_file_lines
+                );
+                record_external_api_usage(app, state_lock, &exec_prov, bp, bc).await;
+                let final_out = if output.is_empty() {
+                    "Aider a terminé l'opération sans sortie textuelle supplémentaire.".to_string()
+                } else {
+                    output
+                };
                 (
-                    output,
-                    format!("Aider {} · {}", strategy.edit_format, settings.ollama_model),
+                    final_out,
+                    format!(
+                        "{} · {} ({}:{})",
+                        role_display_name(exec_role),
+                        strategy.edit_format,
+                        exec_prov,
+                        exec_model
+                    ),
                 )
             }
-            Ok(_) => {
-                aider_ran = true;
+            Err(err) => {
+                if is_cancelled(&cancel_rx) || err.to_string().contains("CANCELLED_BY_USER") {
+                    if let Some(h) = title_handle.take() {
+                        h.abort();
+                    }
+                    return finish_cancelled_pipeline(
+                        app,
+                        state_lock,
+                        &conversation_id,
+                        &project.root_path,
+                        &mut agent_trace,
+                    )
+                    .await;
+                }
+                let aider_err_clean = synthesize_error_log(&err.to_string());
+                if exec_prov != "ollama" && providers::find_provider_key(&settings, &exec_prov).is_some() {
+                    emit_stage(
+                        app,
+                        &conversation_id,
+                        3,
+                        &stage3_label,
+                        &format!(
+                            "Aider CLI en échec sur {exec_prov}:{exec_model}, tentative via API directe..."
+                        ),
+                        "running",
+                    );
+
+                    let mut fallback_prompt = build_augmented_prompt(
+                        &project.global_context,
+                        &conv_ctx,
+                        &user_prompt,
+                        attachments.as_deref(),
+                        &project.shared_directories,
+                    );
+                    if let Some(spec) = architect_spec.as_deref() {
+                        fallback_prompt.push_str(&format!("\n\n[Plan & Consignes Architecte]\n{spec}"));
+                    }
+                    if !carto.target_files.is_empty() {
+                        let mut file_sections = Vec::new();
+                        for rel in carto.target_files.iter().take(3) {
+                            let full = project_root_path.join(rel);
+                            if let Ok(content) = tokio::fs::read_to_string(&full).await {
+                                let clipped = truncate_chars(&content, 12_000);
+                                file_sections.push(format!("### {rel}\n```\n{clipped}\n```"));
+                            }
+                        }
+                        if !file_sections.is_empty() {
+                            fallback_prompt.push_str(&format!(
+                                "\n\n[Contenu actuel des fichiers cibles]\n{}",
+                                file_sections.join("\n\n")
+                            ));
+                        }
+                    }
+
+                    let direct_sys = "Tu es AiderStudio, un expert en architecture logicielle et génération de code. RÈGLE STRICTE : Réponds TOUJOURS EN FRANÇAIS. Pour modifier ou créer un fichier, écris son chemin exact sans backtick suivi du bloc de code complet (ex: ### src/App.vue puis ```vue ... ```) ou un <tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"...\",\"content\":\"...\"}}</tool_call>.";
+                    let direct_fallback_res = tokio::select! {
+                        biased;
+                        _ = wait_cancelled(&mut cancel_rx) => {
+                            if let Some(h) = title_handle.take() {
+                                h.abort();
+                            }
+                            return finish_cancelled_pipeline(
+                                app,
+                                state_lock,
+                                &conversation_id,
+                                &project.root_path,
+                                &mut agent_trace,
+                            )
+                            .await;
+                        }
+                        res = providers::call_provider_oneshot(
+                            &exec_prov,
+                            &exec_model,
+                            &settings,
+                            direct_sys,
+                            &fallback_prompt,
+                            8192,
+                            0.2,
+                        ) => res,
+                    };
+                    match direct_fallback_res {
+                        Ok((reply, p_tok, c_tok)) if !reply.trim().is_empty() => {
+                            record_external_api_usage(app, state_lock, &exec_prov, p_tok, c_tok).await;
+                            let total_tok = p_tok + c_tok;
+                            exec_tokens_used = total_tok;
+                            exec_status = "fallback".to_string();
+                            exec_note = "Aider en échec → Repli API directe réussi".to_string();
+                            let _ = app.emit(
+                                "aider:tokens",
+                                TokenUsageEvent {
+                                    conversation_id: conversation_id.clone(),
+                                    subagent: format!("{} (API directe)", role_display_name(exec_role)),
+                                    prompt_tokens: p_tok,
+                                    completion_tokens: c_tok,
+                                    total_tokens: total_tok,
+                                    role: exec_role.to_string(),
+                                    provider: exec_prov.clone(),
+                                    model: exec_model.clone(),
+                                    context_limit: providers::resolve_model_context_limit(
+                                        &exec_prov,
+                                        &exec_model,
+                                        &settings,
+                                    ),
+                                },
+                            );
+                            (
+                                reply,
+                                format!(
+                                    "{} API directe ({}:{})",
+                                    role_display_name(exec_role),
+                                    exec_prov,
+                                    exec_model
+                                ),
+                            )
+                        }
+                        Ok(_) => {
+                            exec_status = "error".to_string();
+                            exec_note = format!("Aider + API directe vides (`{aider_err_clean}`)");
+                            (
+                                format!(
+                                    "⚠️ Aider a échoué (`{aider_err_clean}`) et l'API directe `{exec_prov}:{exec_model}` n'a retourné aucun contenu."
+                                ),
+                                format!("{exec_prov} erreur"),
+                            )
+                        }
+                        Err(direct_err) => {
+                            let direct_clean = synthesize_error_log(&direct_err.to_string());
+                            exec_status = "error".to_string();
+                            exec_note = direct_clean.clone();
+                            let a_note = if direct_clean != aider_err_clean {
+                                format!("\n\n**Détail Aider CLI :** `{aider_err_clean}`")
+                            } else {
+                                String::new()
+                            };
+                            (
+                                format!(
+                                    "⚠️ Erreur sur `{exec_prov}:{exec_model}` :\n`{direct_clean}`{a_note}\n\nVérifiez le modèle sélectionné, vos quotas API ou réessayez dans quelques instants."
+                                ),
+                                format!("{exec_prov} erreur"),
+                            )
+                        }
+                    }
+                } else {
+                    exec_status = "error".to_string();
+                    exec_note = aider_err_clean.clone();
+                    (
+                        format!(
+                            "⚠️ Erreur lors de l'exécution d'Aider (`{exec_prov}:{exec_model}`) :\n`{aider_err_clean}`\n\nVérifiez qu'Ollama est démarré (`ollama serve`) et que le modèle `{exec_model}` est téléchargé."
+                        ),
+                        format!("Aider CLI ({exec_prov} erreur)"),
+                    )
+                }
+            }
+        }
+    } else if exec_prov != "ollama" && providers::find_provider_key(&settings, &exec_prov).is_some() {
+        let augmented_prompt = direct_prompt_opt.unwrap_or_default();
+        let direct_sys = "Tu es AiderStudio, un expert en architecture logicielle et génération de code. RÈGLE STRICTE : Réponds TOUJOURS EN FRANÇAIS. Pour modifier ou créer un fichier, écris son chemin suivi d'un bloc de code complet (ex: ### src/App.vue puis ```vue ... ```).";
+        let direct_call_res = tokio::select! {
+            biased;
+            _ = wait_cancelled(&mut cancel_rx) => {
+                if let Some(h) = title_handle.take() {
+                    h.abort();
+                }
+                return finish_cancelled_pipeline(
+                    app,
+                    state_lock,
+                    &conversation_id,
+                    &project.root_path,
+                    &mut agent_trace,
+                )
+                .await;
+            }
+            res = providers::call_provider_oneshot(
+                &exec_prov,
+                &exec_model,
+                &settings,
+                direct_sys,
+                &augmented_prompt,
+                4096,
+                0.3,
+            ) => res,
+        };
+        match direct_call_res
+        {
+            Ok((reply, p_tok, c_tok)) => {
+                record_external_api_usage(app, state_lock, &exec_prov, p_tok, c_tok).await;
+                exec_tokens_used = p_tok + c_tok;
+                exec_note = "Exécution API directe".to_string();
+                let _ = app.emit(
+                    "aider:tokens",
+                    TokenUsageEvent {
+                        conversation_id: conversation_id.clone(),
+                        subagent: format!("{} ({})", role_display_name(exec_role), exec_prov),
+                        prompt_tokens: p_tok,
+                        completion_tokens: c_tok,
+                        total_tokens: exec_tokens_used,
+                        role: exec_role.to_string(),
+                        provider: exec_prov.clone(),
+                        model: exec_model.clone(),
+                        context_limit: providers::resolve_model_context_limit(
+                            &exec_prov,
+                            &exec_model,
+                            &settings,
+                        ),
+                    },
+                );
+                let out = if reply.is_empty() {
+                    format!("Le modèle `{exec_model}` ({exec_prov}) n'a retourné aucun contenu.")
+                } else {
+                    reply
+                };
                 (
-                    "Aider a terminé l'opération sans sortie textuelle supplémentaire.".to_string(),
-                    format!("Aider {} · {}", strategy.edit_format, settings.ollama_model),
+                    out,
+                    format!(
+                        "{} direct ({}:{})",
+                        role_display_name(exec_role),
+                        exec_prov,
+                        exec_model
+                    ),
                 )
             }
-            Err(err) => (
-                format!(
-                    "⚠️ Erreur lors de l'exécution d'Aider :\n`{}`\n\nVérifiez qu'Ollama est démarré (`ollama serve`) et que le modèle `{}` est téléchargé.",
-                    synthesize_error_log(&err.to_string()), settings.ollama_model
-                ),
-                "Aider CLI (erreur)".to_string(),
-            ),
+            Err(err) => {
+                let err_clean = synthesize_error_log(&err.to_string());
+                exec_status = "error".to_string();
+                exec_note = err_clean.clone();
+                (
+                    format!(
+                        "⚠️ Erreur de communication avec {} (`{}`) : `{}`",
+                        exec_prov, exec_model, err_clean
+                    ),
+                    format!("{exec_prov} erreur"),
+                )
+            }
         }
     } else if stack.ollama_running {
         let augmented_prompt = direct_prompt_opt.unwrap_or_default();
+        let stream_model = if exec_prov == "ollama" && !exec_model.trim().is_empty() {
+            exec_model.as_str()
+        } else {
+            settings.ollama_model.as_str()
+        };
         match execute_ollama_streaming(
             app,
             &conversation_id,
             &settings,
+            stream_model,
+            exec_role,
             &augmented_prompt,
             image_base64_list,
+            &mut cancel_rx,
         )
         .await
         {
-            Ok(reply) if !reply.is_empty() => (
-                reply,
-                format!("Ollama direct (stream) · {}", settings.ollama_model),
-            ),
-            Ok(_) => (
-                "Ollama n'a retourné aucun contenu.".to_string(),
-                "Ollama direct".to_string(),
-            ),
-            Err(err) => (
-                format!(
-                    "⚠️ Erreur de communication avec Ollama (`{}`) : `{}`",
-                    settings.ollama_url, synthesize_error_log(&err.to_string())
-                ),
-                "Ollama erreur".to_string(),
-            ),
+            Ok(reply) if !reply.is_empty() => {
+                exec_note = "Exécution Ollama stream direct".to_string();
+                (reply, format!("Ollama direct (stream) · {stream_model}"))
+            }
+            Ok(_) => {
+                exec_note = "Réponse vide Ollama".to_string();
+                (
+                    "Ollama n'a retourné aucun contenu.".to_string(),
+                    "Ollama direct".to_string(),
+                )
+            }
+            Err(err) => {
+                if is_cancelled(&cancel_rx) || err.to_string().contains("CANCELLED_BY_USER") {
+                    if let Some(h) = title_handle.take() {
+                        h.abort();
+                    }
+                    return finish_cancelled_pipeline(
+                        app,
+                        state_lock,
+                        &conversation_id,
+                        &project.root_path,
+                        &mut agent_trace,
+                    )
+                    .await;
+                }
+                let err_clean = synthesize_error_log(&err.to_string());
+                exec_status = "error".to_string();
+                exec_note = err_clean.clone();
+                (
+                    format!(
+                        "⚠️ Erreur de communication avec Ollama (`{}`) : `{}`",
+                        settings.ollama_url, err_clean
+                    ),
+                    "Ollama erreur".to_string(),
+                )
+            }
         }
     } else {
+        exec_status = "error".to_string();
+        exec_note = "Stack locale arrêtée et aucune clé API sélectionnée".to_string();
         let diag = format!(
-            "### Stack locale non démarrée\n\n- **Aider CLI** : {}\n- **Ollama** : {}\n- **Modèle cible** : `{}`\n\nLancez Ollama (`ollama serve` puis `ollama pull {}`) et installez `aider-chat` pour exécuter ce prompt directement sur le dépôt `{}`.",
+            "### Stack locale non démarrée\n\n- **Aider CLI** : {}\n- **Ollama** : {}\n- **Modèle cible** : `{}:{}`\n\nLancez Ollama (`ollama serve` puis `ollama pull {}`) et installez `aider-chat`, ou sélectionnez un fournisseur API externe validé dans les paramètres pour exécuter ce prompt sur `{}`.",
             if stack.aider_installed { "Détecté" } else { "Non détecté (`pipx install aider-chat`)" },
             if stack.ollama_installed { "Installé mais arrêté" } else { "Non détecté" },
-            settings.ollama_model,
+            exec_prov,
+            exec_model,
             settings.ollama_model,
             project.root_path
         );
         (diag, "Diagnostic stack".to_string())
     };
 
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: exec_role.to_string(),
+            role_label: role_display_name(exec_role).to_string(),
+            provider: exec_prov.clone(),
+            model: exec_model.clone(),
+            summary: exec_note.clone(),
+            status: exec_status.clone(),
+            tokens: exec_tokens_used,
+        },
+    );
+
     // Extract thinking and apply local tools directly to create/edit files in local
+    if is_cancelled(&cancel_rx) {
+        if let Some(h) = title_handle.take() {
+            h.abort();
+        }
+        return finish_cancelled_pipeline(
+            app,
+            state_lock,
+            &conversation_id,
+            &project.root_path,
+            &mut agent_trace,
+        )
+        .await;
+    }
     let (extracted_thinking, cleaned_content) = extract_thinking_and_content(&assistant_text);
     let tool_results =
         apply_tools_and_file_blocks(&project_root_path, &cleaned_content, &user_prompt, aider_ran)
@@ -2568,7 +3759,130 @@ pub async fn run_prompt_pipeline(
         "Validation de la syntaxe, compilation et vérifications automatisées.",
         "running",
     );
-    let test_res = run_test_verifier(&project_root_path).await;
+
+    let mut tester_note = String::new();
+    let mut tester_ran = false;
+    let mut tester_tokens_used = 0usize;
+    let (test_prov, test_model) = resolve_agent_slot("tester", &settings);
+    let mut tester_status = "done".to_string();
+    let mut tester_summary = String::new();
+
+    if run_tests_after && exec_role != "tester" && will_run_aider && is_agent_mode {
+        let (pre_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
+        let changed_paths: Vec<String> = pre_diffs.into_iter().map(|d| d.path).take(3).collect();
+        let can_run_tester = !changed_paths.is_empty()
+            && (test_prov != "ollama" || stack.ollama_running)
+            && (test_prov == "ollama"
+                || providers::find_provider_key(&settings, &test_prov).is_some());
+        if can_run_tester {
+            emit_stage(
+                app,
+                &conversation_id,
+                4,
+                "4. Testeur & Vérifieur",
+                &format!(
+                    "Sous-agent Testeur ({} · {}) sur {}...",
+                    test_prov,
+                    test_model,
+                    changed_paths.join(", ")
+                ),
+                "running",
+            );
+            record_trace_step(
+                app,
+                &conversation_id,
+                &mut agent_trace,
+                AgentTraceStep {
+                    role: "tester".to_string(),
+                    role_label: "Testeur".to_string(),
+                    provider: test_prov.clone(),
+                    model: test_model.clone(),
+                    summary: format!("Rédaction des tests pour `{}`...", changed_paths.join(", ")),
+                    status: "running".to_string(),
+                    tokens: 0,
+                },
+            );
+            let test_prompt = format!(
+                "À la suite de la demande : « {} »\nLes fichiers suivants viennent d'être modifiés : {}.\nÉcris ou complète uniquement les tests unitaires/d'intégration pertinents pour vérifier ces changements sans modifier la logique métier existante. Réponds brièvement en français.",
+                truncate_chars(user_prompt.trim(), 300),
+                changed_paths.join(", ")
+            );
+            let test_strategy = choose_aider_strategy(
+                &project_root_path,
+                &changed_paths,
+                true,
+                &test_prov,
+                &settings,
+            );
+            if let Some(aider_bin) = stack.aider_bin.as_deref() {
+                match execute_aider_cli(
+                    app,
+                    &conversation_id,
+                    aider_bin,
+                    &project.root_path,
+                    &test_prov,
+                    &test_model,
+                    "tester",
+                    &settings,
+                    &test_prompt,
+                    &changed_paths,
+                    &test_strategy,
+                    &mut cancel_rx,
+                )
+                .await
+                {
+                    Ok((_, bp, bc)) => {
+                        record_external_api_usage(app, state_lock, &test_prov, bp, bc).await;
+                        tester_ran = true;
+                        tester_tokens_used = bp + bc;
+                        tester_summary = format!("Tests générés/mis à jour pour `{}`", changed_paths.join(", "));
+                        tester_note = format!(
+                            "• 🧪 **Sous-agent Testeur ({} · {})** : tests générés/mis à jour pour `{}`.",
+                            test_prov,
+                            test_model,
+                            changed_paths.join(", ")
+                        );
+                    }
+                    Err(e) => {
+                        if is_cancelled(&cancel_rx) || e.to_string().contains("CANCELLED_BY_USER") {
+                            if let Some(h) = title_handle.take() {
+                                h.abort();
+                            }
+                            return finish_cancelled_pipeline(
+                                app,
+                                state_lock,
+                                &conversation_id,
+                                &project.root_path,
+                                &mut agent_trace,
+                            )
+                            .await;
+                        }
+                        tester_ran = true;
+                        tester_status = "error".to_string();
+                        tester_summary = format!("Échec rédaction tests : `{}`", synthesize_error_log(&e.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    let test_res = tokio::select! {
+        biased;
+        _ = wait_cancelled(&mut cancel_rx) => {
+            if let Some(h) = title_handle.take() {
+                h.abort();
+            }
+            return finish_cancelled_pipeline(
+                app,
+                state_lock,
+                &conversation_id,
+                &project.root_path,
+                &mut agent_trace,
+            )
+            .await;
+        }
+        res = run_test_verifier(&project_root_path) => res,
+    };
 
     let mut verifier_note = String::new();
     if test_res.ran {
@@ -2577,40 +3891,181 @@ pub async fn run_prompt_pipeline(
                 "• ✅ **Vérifieur ({})** : {}",
                 test_res.command, test_res.output_summary
             );
+            let verif_short = format!("✅ `{}` validé", test_res.command);
+            if tester_ran {
+                tester_summary = format!("{tester_summary} · {verif_short}");
+            } else {
+                record_trace_step(
+                    app,
+                    &conversation_id,
+                    &mut agent_trace,
+                    AgentTraceStep {
+                        role: "tester".to_string(),
+                        role_label: "Vérifieur".to_string(),
+                        provider: "ollama".to_string(),
+                        model: test_res.command.clone(),
+                        summary: format!("{verif_short} · {}", truncate_chars(&test_res.output_summary, 90)),
+                        status: "done".to_string(),
+                        tokens: 0,
+                    },
+                );
+            }
         } else {
             verifier_note = format!(
                 "• ⚠️ **Vérifieur ({})** : Compilation en erreur :\n```\n{}\n```",
                 test_res.command, test_res.output_summary
             );
+            let verif_short = format!("⚠️ `{}` en erreur", test_res.command);
+            if tester_ran {
+                tester_status = "error".to_string();
+                tester_summary = format!("{tester_summary} · {verif_short}");
+            } else {
+                record_trace_step(
+                    app,
+                    &conversation_id,
+                    &mut agent_trace,
+                    AgentTraceStep {
+                        role: "tester".to_string(),
+                        role_label: "Vérifieur".to_string(),
+                        provider: "ollama".to_string(),
+                        model: test_res.command.clone(),
+                        summary: format!("{verif_short} · {}", truncate_chars(&test_res.output_summary.replace('\n', " "), 90)),
+                        status: "error".to_string(),
+                        tokens: 0,
+                    },
+                );
+            }
         }
+    }
+    if tester_ran {
+        record_trace_step(
+            app,
+            &conversation_id,
+            &mut agent_trace,
+            AgentTraceStep {
+                role: "tester".to_string(),
+                role_label: "Testeur".to_string(),
+                provider: test_prov.clone(),
+                model: test_model.clone(),
+                summary: tester_summary,
+                status: tester_status,
+                tokens: tester_tokens_used,
+            },
+        );
     }
 
     // SUB-AGENT 5/5: Synthétiseur & Mémoire Globale
+    let (synth_prov, synth_model) = resolve_agent_slot("synthesizer", &settings);
     emit_stage(
         app,
         &conversation_id,
         5,
         "5. Synthétiseur & Mémoire Globale",
-        "Calcul du diff Git, synthèse architecte et enregistrement contextuel.",
+        &format!(
+            "Calcul du diff Git et synthèse ({} · {}).",
+            synth_prov, synth_model
+        ),
         "running",
+    );
+    record_trace_step(
+        app,
+        &conversation_id,
+        &mut agent_trace,
+        AgentTraceStep {
+            role: "synthesizer".to_string(),
+            role_label: "Synthétiseur".to_string(),
+            provider: synth_prov.clone(),
+            model: synth_model.clone(),
+            summary: "Calcul du diff Git et préparation de la synthèse...".to_string(),
+            status: "running".to_string(),
+            tokens: 0,
+        },
     );
 
     git_diff::sanitize_backtick_paths(&project.root_path).await;
     let (modified_files, lines_added, lines_removed) =
         git_diff::collect_project_diffs(&project.root_path).await;
 
-    let (mut synthesized_text, cleaned_narrative, had_retries_or_errors) = synthesize_final_response(
+    if !modified_files.is_empty() && exec_status != "error" {
+        let enriched_summary = format!(
+            "{} · **{} fichier(s)** modifié(s) (`+{}` / `-{}`)",
+            exec_note,
+            modified_files.len(),
+            lines_added,
+            lines_removed
+        );
+        record_trace_step(
+            app,
+            &conversation_id,
+            &mut agent_trace,
+            AgentTraceStep {
+                role: exec_role.to_string(),
+                role_label: role_display_name(exec_role).to_string(),
+                provider: exec_prov.clone(),
+                model: exec_model.clone(),
+                summary: enriched_summary,
+                status: exec_status.clone(),
+                tokens: exec_tokens_used,
+            },
+        );
+    }
+
+    let (mut synthesized_text, cleaned_narrative, had_retries_or_errors, synth_tokens) = tokio::select! {
+        biased;
+        _ = wait_cancelled(&mut cancel_rx) => {
+            if let Some(h) = title_handle.take() {
+                h.abort();
+            }
+            return finish_cancelled_pipeline(
+                app,
+                state_lock,
+                &conversation_id,
+                &project.root_path,
+                &mut agent_trace,
+            )
+            .await;
+        }
+        res = synthesize_final_response(
+            app,
+            state_lock,
+            &conversation_id,
+            &user_prompt,
+            &cleaned_content,
+            aider_ran,
+            stack.ollama_running,
+            &synth_prov,
+            &synth_model,
+            &settings,
+            &modified_files,
+            &verifier_note,
+        ) => res,
+    };
+
+    let synth_summary = if synth_tokens > 0 {
+        format!(
+            "Synthèse finale (**{} fichier(s)** modifié(s)) et mise à jour mémoire",
+            modified_files.len()
+        )
+    } else {
+        format!(
+            "Mise en forme finale (**{} fichier(s)** modifié(s)) sans appel LLM",
+            modified_files.len()
+        )
+    };
+    record_trace_step(
         app,
         &conversation_id,
-        &user_prompt,
-        &cleaned_content,
-        aider_ran,
-        stack.ollama_running,
-        &settings,
-        &modified_files,
-        &verifier_note,
-    )
-    .await;
+        &mut agent_trace,
+        AgentTraceStep {
+            role: "synthesizer".to_string(),
+            role_label: "Synthétiseur".to_string(),
+            provider: synth_prov.clone(),
+            model: synth_model.clone(),
+            summary: synth_summary,
+            status: "done".to_string(),
+            tokens: synth_tokens,
+        },
+    );
 
     let artifact_source = if aider_ran {
         cleaned_narrative.as_str()
@@ -2632,32 +4087,19 @@ pub async fn run_prompt_pipeline(
         );
     }
 
-    // Build structured collapsible AI Thinking drawer contents (Orchestration + Verifier + Raw Aider log)
+    // Build structured collapsible AI Thinking drawer contents (extracted thinking + Verifier + Raw Aider log)
     let mut thinking_sections: Vec<String> = Vec::new();
     if let Some(t) = extracted_thinking {
         thinking_sections.push(t);
     }
-    if will_run_aider {
-        let targeted_str = if carto.target_files.is_empty() {
-            "aucun (découverte repo-map)".to_string()
-        } else {
-            carto.target_files.join(", ")
-        };
-        thinking_sections.push(format!(
-            "### Orchestration & Ciblage\n• 🧭 **Cartographe** : `{}` ({})\n• ⚙️ **Stratégie Aider** : format `{}` · `--map-tokens {}` · `num_ctx {}` · historique {} tok (max {} lignes)",
-            targeted_str,
-            carto.strategy_note,
-            strategy.edit_format,
-            strategy.map_tokens,
-            effective_num_ctx(&settings),
-            strategy.max_chat_history_tokens,
-            strategy.max_file_lines
-        ));
-    }
-    if !tool_results.is_empty() || !verifier_note.is_empty() {
+
+    if !tool_results.is_empty() || !tester_note.is_empty() || !verifier_note.is_empty() {
         let mut notes = Vec::new();
         for r in &tool_results {
             notes.push(format!("• 🛠️ {}", r.message));
+        }
+        if !tester_note.is_empty() {
+            notes.push(tester_note);
         }
         if !verifier_note.is_empty() {
             notes.push(verifier_note);
@@ -2678,6 +4120,10 @@ pub async fn run_prompt_pipeline(
     } else {
         Some(thinking_sections.join("\n\n"))
     };
+
+    if let Some(h) = title_handle.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), h).await;
+    }
 
     let result = {
         let mut guard = state_lock.lock().await;
@@ -2700,6 +4146,7 @@ pub async fn run_prompt_pipeline(
             files_changed: modified_files.len(),
             lines_added,
             lines_removed,
+            agent_trace,
         });
 
         for art in new_artifacts {
@@ -2806,24 +4253,31 @@ mod tests {
         std::fs::write(dir.join("vite.config.js"), "export default {}\n").unwrap();
         let big_file = "const x = 1;\n".repeat(280);
         std::fs::write(dir.join("src/Large.ts"), big_file).unwrap();
+        let medium_file = "const y = 2;\n".repeat(150);
+        std::fs::write(dir.join("src/Medium.ts"), medium_file).unwrap();
 
         let settings = AppSettings::default();
 
         // Single small explicit file -> whole + map 0
-        let s1 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, &settings);
+        let s1 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, "ollama", &settings);
         assert_eq!(s1.edit_format, "whole");
         assert_eq!(s1.map_tokens, 0);
         assert_eq!(s1.max_chat_history_tokens, 1024);
 
         // Large single explicit file -> diff + map 0
-        let s2 = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], true, &settings);
+        let s2 = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], true, "ollama", &settings);
         assert_eq!(s2.edit_format, "diff");
         assert_eq!(s2.map_tokens, 0);
 
         // Non-explicit match -> diff + map 192
-        let s2b = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], false, &settings);
+        let s2b = choose_aider_strategy(&dir, &["src/Large.ts".to_string()], false, "ollama", &settings);
         assert_eq!(s2b.edit_format, "diff");
         assert_eq!(s2b.map_tokens, 192);
+
+        // Cloud provider on 150-line file (> 120 threshold) -> diff + 2048 chat history
+        let s_cloud = choose_aider_strategy(&dir, &["src/Medium.ts".to_string()], true, "gemini", &settings);
+        assert_eq!(s_cloud.edit_format, "diff");
+        assert_eq!(s_cloud.max_chat_history_tokens, 2048);
 
         // 2 small files -> whole + map 192
         std::fs::write(dir.join("package.json"), "{}\n").unwrap();
@@ -2831,6 +4285,7 @@ mod tests {
             &dir,
             &["vite.config.js".to_string(), "package.json".to_string()],
             true,
+            "ollama",
             &settings,
         );
         assert_eq!(s3.edit_format, "whole");
@@ -2839,10 +4294,74 @@ mod tests {
         // Manual override -> diff
         let mut s_diff_override = settings.clone();
         s_diff_override.aider_edit_format = "diff".to_string();
-        let s4 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, &s_diff_override);
+        let s4 = choose_aider_strategy(&dir, &["vite.config.js".to_string()], true, "ollama", &s_diff_override);
         assert_eq!(s4.edit_format, "diff");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_classify_prompt_role() {
+        assert_eq!(
+            classify_prompt_role("Crée un design moderne avec menu à gauche 100% hauteur"),
+            ("designer", false)
+        );
+        assert_eq!(
+            classify_prompt_role("Factorise et nettoie ce module TypeScript"),
+            ("refactoring", false)
+        );
+        assert_eq!(
+            classify_prompt_role("Écris des tests unitaires Vitest pour le store"),
+            ("tester", true)
+        );
+        assert_eq!(
+            classify_prompt_role("Implémente un endpoint avec tests unitaires"),
+            ("coder", true)
+        );
+    }
+
+    #[test]
+    fn test_designer_auto_includes_global_css() {
+        let all_files = vec![
+            "src/components/Sidebar.vue".to_string(),
+            "src/style.css".to_string(),
+            "src/App.vue".to_string(),
+            "package.json".to_string(),
+        ];
+        let mut matched = vec!["src/components/Sidebar.vue".to_string()];
+        augment_design_target_files(&all_files, &mut matched);
+        assert!(matched.contains(&"src/style.css".to_string()));
+        assert!(matched.contains(&"src/App.vue".to_string()));
+        assert!(matched.len() <= 3);
+    }
+
+    #[test]
+    fn test_resolve_agent_slot_override_vs_agent() {
+        let mut settings = AppSettings::default();
+        if let Some(gem) = settings.providers.iter_mut().find(|p| p.id == "gemini") {
+            gem.api_key = "test-gem-key".to_string();
+            gem.validated = true;
+            gem.available_models = vec!["gemini-2.5-flash".to_string()];
+        }
+        settings.agent_routing.designer.provider = "gemini".to_string();
+        settings.agent_routing.designer.model = "gemini-2.5-flash".to_string();
+        settings.active_target = "agent".to_string();
+
+        assert_eq!(
+            resolve_agent_slot("designer", &settings),
+            ("gemini".to_string(), "gemini-2.5-flash".to_string())
+        );
+        assert_eq!(
+            resolve_agent_slot("coder", &settings),
+            ("ollama".to_string(), settings.ollama_model.clone())
+        );
+
+        // Direct model override supersedes agent routing
+        settings.active_target = "ollama:qwen2.5-coder:7b".to_string();
+        assert_eq!(
+            resolve_agent_slot("designer", &settings),
+            ("ollama".to_string(), "qwen2.5-coder:7b".to_string())
+        );
     }
 
     #[test]
@@ -2951,5 +4470,18 @@ export function cleanHelper(x: number): number {
         assert!(!ctx.contains("étape 2"));
         assert!(ctx.contains("étape 3"));
         assert!(ctx.contains("étape 8"));
+    }
+
+    #[test]
+    fn test_clean_generated_title() {
+        assert_eq!(
+            clean_generated_title("\"Refactoring du menu latéral.\"\nAutre ligne").as_deref(),
+            Some("Refactoring du menu latéral")
+        );
+        assert_eq!(
+            clean_generated_title("## Titre : « Optimisation cache Vite! »").as_deref(),
+            Some("Optimisation cache Vite")
+        );
+        assert_eq!(clean_generated_title("   \n\"\"  "), None);
     }
 }

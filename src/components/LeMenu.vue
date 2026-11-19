@@ -92,7 +92,16 @@ function handleDeleteProject(proj: Project) {
               :class="{ 'is-selected': store.activeConversation?.id === conv.id }"
               @click="store.selectConversation(project.id, conv.id)"
             >
-              <span class="conv-dot" />
+              <span
+                class="conv-dot"
+                :class="{
+                  'is-working':
+                    store.isProcessing &&
+                    (store.processingConversationId
+                      ? store.processingConversationId === conv.id
+                      : store.activeConversation?.id === conv.id),
+                }"
+              />
               <span class="conv-title">{{ conv.title }}</span>
               <span
                 v-if="conv.linesAdded > 0 || conv.linesRemoved > 0"
@@ -399,6 +408,25 @@ function handleDeleteProject(proj: Project) {
 
 .conv-row.is-selected .conv-dot {
   background: var(--accent);
+}
+
+.conv-dot.is-working {
+  background: var(--accent);
+  animation: convDotSlowPulse 2.2s ease-in-out infinite;
+}
+
+@keyframes convDotSlowPulse {
+  0%,
+  100% {
+    transform: scale(0.95);
+    opacity: 0.72;
+    box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.65);
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 1;
+    box-shadow: 0 0 0 6px rgba(168, 85, 247, 0);
+  }
 }
 
 .conv-title {

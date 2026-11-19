@@ -163,7 +163,11 @@ const allMentions = computed<MentionItem[]>(() => {
   return [...fileItems, ...builtInTools, ...builtInPlugins, ...mcpMentions.value];
 });
 
-const availableModelChoices = computed(() => {
+const targetPickerRef = ref<HTMLElement | null>(null);
+const targetMenuOpen = ref(false);
+const hoveredProvider = ref<string | null>(null);
+
+const ollamaModelChoices = computed(() => {
   const list = new Set<string>();
   if (store.settings.ollamaModel) list.add(store.settings.ollamaModel);
   for (const m of store.stackStatus.availableModels) {
@@ -175,11 +179,112 @@ const availableModelChoices = computed(() => {
   return Array.from(list);
 });
 
-async function onModelChange(ev: Event) {
-  const target = ev.target as HTMLSelectElement;
-  if (target && target.value) {
-    store.settings.ollamaModel = target.value;
-    await store.saveSettings(store.settings);
+const providerColors: Record<string, string> = {
+  ollama: "#10b981",
+  gemini: "#3b82f6",
+  openai: "#22c55e",
+  anthropic: "#f59e0b",
+  deepseek: "#06b6d4",
+  openrouter: "#a855f7",
+  mistral: "#f97316",
+};
+
+function providerDotColor(id: string): string {
+  return providerColors[id] || "#94a3b8";
+}
+
+const roleTraceColors: Record<string, string> = {
+  architect: "#8b5cf6",
+  cartographer: "#06b6d4",
+  designer: "#ec4899",
+  coder: "#3b82f6",
+  refactoring: "#f59e0b",
+  tester: "#10b981",
+  synthesizer: "#94a3b8",
+};
+
+const providerShortLabels: Record<string, string> = {
+  ollama: "Ollama",
+  gemini: "Gemini",
+  openai: "OpenAI",
+  anthropic: "Claude",
+  deepseek: "DeepSeek",
+  openrouter: "OpenRouter",
+  mistral: "Mistral",
+};
+
+function roleTraceDotColor(role: string): string {
+  return roleTraceColors[role] || "#3b82f6";
+}
+
+function providerShortName(id: string): string {
+  return providerShortLabels[id] || id;
+}
+
+function formatCompactTok(n?: number): string {
+  if (!n || n <= 0) return "";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+const providerGroups = computed(() => {
+  const groups: {
+    id: string;
+    name: string;
+    color: string;
+    models: string[];
+  }[] = [
+    {
+      id: "ollama",
+      name: "Ollama (Local)",
+      color: providerColors.ollama,
+      models: ollamaModelChoices.value,
+    },
+  ];
+  for (const p of store.validatedExternalProviders) {
+    groups.push({
+      id: p.id,
+      name: p.name,
+      color: providerDotColor(p.id),
+      models: p.availableModels ?? [],
+    });
+  }
+  return groups;
+});
+
+function toggleTargetMenu() {
+  if (store.isProcessing) return;
+  targetMenuOpen.value = !targetMenuOpen.value;
+  if (!targetMenuOpen.value) {
+    hoveredProvider.value = null;
+  }
+}
+
+async function selectTarget(target: string) {
+  targetMenuOpen.value = false;
+  hoveredProvider.value = null;
+  await store.setActiveTarget(target);
+}
+
+function openTargetSettings() {
+  targetMenuOpen.value = false;
+  hoveredProvider.value = null;
+  store.openSettingsTab("providers");
+}
+
+function isTargetSelected(providerId: string, modelName: string): boolean {
+  const cur = (store.settings.activeTarget || "agent").trim();
+  return cur === `${providerId}:${modelName}`;
+}
+
+function handleTargetOutsideClick(ev: MouseEvent) {
+  if (
+    targetPickerRef.value &&
+    !targetPickerRef.value.contains(ev.target as Node)
+  ) {
+    targetMenuOpen.value = false;
+    hoveredProvider.value = null;
   }
 }
 
@@ -218,6 +323,7 @@ function scrollToBottom(force = false) {
 
 onMounted(() => {
   void refreshProjectFiles();
+  document.addEventListener("click", handleTargetOutsideClick);
   tickTimer = window.setInterval(() => {
     nowTick.value = Date.now();
   }, 30_000);
@@ -238,6 +344,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener("click", handleTargetOutsideClick);
   if (tickTimer !== null) {
     clearInterval(tickTimer);
     tickTimer = null;
@@ -258,6 +365,42 @@ watch(
 const conv = computed(() => store.activeConversation);
 const messages = computed(() => conv.value?.messages ?? []);
 const hasStarted = computed(() => messages.value.length > 0);
+
+const isRenamingTitle = ref(false);
+const titleDraft = ref("");
+const titleInputRef = ref<HTMLInputElement | null>(null);
+
+watch(
+  () => store.activeConversationId,
+  () => {
+    isRenamingTitle.value = false;
+  }
+);
+
+function startRenameTitle() {
+  if (!conv.value) return;
+  titleDraft.value = conv.value.title || "Nouvelle session";
+  isRenamingTitle.value = true;
+  nextTick(() => {
+    if (titleInputRef.value) {
+      titleInputRef.value.focus();
+      titleInputRef.value.select();
+    }
+  });
+}
+
+async function commitRenameTitle() {
+  if (!isRenamingTitle.value) return;
+  isRenamingTitle.value = false;
+  const targetConv = conv.value;
+  const trimmed = titleDraft.value.trim();
+  if (!targetConv || !trimmed || trimmed === targetConv.title) return;
+  await store.renameConversation(targetConv.id, trimmed);
+}
+
+function cancelRenameTitle() {
+  isRenamingTitle.value = false;
+}
 
 const lastAssistantIndex = computed(() => {
   for (let i = messages.value.length - 1; i >= 0; i--) {
@@ -362,13 +505,13 @@ function parseMarkdownProse(prose: string): MarkdownBlock[] {
     }
 
     // Unordered list
-    if (/^\s*[-*•]\s+/.test(line)) {
+    if (/^\s*[-*•◦▪]\s+/.test(line)) {
       const items: { indent: number; tokens: InlineToken[] }[] = [];
-      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
+      while (i < lines.length && /^\s*[-*•◦▪]\s+/.test(lines[i])) {
         const leadingSpaces = lines[i].match(/^(\s*)/)?.[1].length ?? 0;
-        const text = lines[i].replace(/^\s*[-*•]\s+/, "");
+        const text = lines[i].replace(/^\s*[-*•◦▪]\s+/, "");
         items.push({
-          indent: Math.min(2, Math.floor(leadingSpaces / 2)),
+          indent: Math.min(4, Math.floor(leadingSpaces / 2)),
           tokens: tokenizeInline(text),
         });
         i++;
@@ -396,7 +539,7 @@ function parseMarkdownProse(prose: string): MarkdownBlock[] {
       lines[i].trim() &&
       !/^#{1,3}\s+/.test(lines[i].trim()) &&
       !lines[i].trim().startsWith(">") &&
-      !/^\s*[-*•]\s+/.test(lines[i]) &&
+      !/^\s*[-*•◦▪]\s+/.test(lines[i]) &&
       !/^\s*\d+\.\s+/.test(lines[i])
     ) {
       paraLines.push(lines[i].trim());
@@ -738,7 +881,20 @@ function handleDrop(ev: DragEvent) {
   }
 }
 
+function bulletForLevel(level: number): string {
+  return level <= 0 ? "•" : level === 1 ? "◦" : "▪";
+}
+
+function autoResizeTextarea() {
+  const el = textareaRef.value;
+  if (!el) return;
+  el.style.height = "auto";
+  const nextHeight = Math.min(220, Math.max(48, el.scrollHeight));
+  el.style.height = `${nextHeight}px`;
+}
+
 function handleTextareaInput(ev: Event) {
+  autoResizeTextarea();
   const el = ev.target as HTMLTextAreaElement;
   const cursor = el.selectionStart;
   const textBefore = promptDraft.value.slice(0, cursor);
@@ -771,6 +927,7 @@ function selectMention(item?: MentionItem) {
       el.focus();
       const nextPos = newTextBefore.length;
       el.setSelectionRange(nextPos, nextPos);
+      autoResizeTextarea();
     }
   });
 }
@@ -783,6 +940,10 @@ async function handleSubmit() {
   promptDraft.value = "";
   attachedFiles.value = [];
   mentionOpen.value = false;
+  await nextTick();
+  if (textareaRef.value) {
+    textareaRef.value.style.height = "";
+  }
   scrollToBottom(true);
   await store.sendPrompt(text, files);
   scrollToBottom(true);
@@ -811,6 +972,125 @@ function handleKeydown(ev: KeyboardEvent) {
     if (ev.key === "Escape") {
       ev.preventDefault();
       mentionOpen.value = false;
+      return;
+    }
+  }
+
+  const el = textareaRef.value;
+
+  if (ev.key === "Tab" && el) {
+    ev.preventDefault();
+    const value = promptDraft.value;
+    const selStart = el.selectionStart;
+    const selEnd = el.selectionEnd;
+    const blockStart = value.lastIndexOf("\n", selStart - 1) + 1;
+    const rawBlockEnd = value.indexOf("\n", selEnd);
+    const blockEnd = rawBlockEnd === -1 ? value.length : rawBlockEnd;
+    const blockLines = value.slice(blockStart, blockEnd).split("\n");
+
+    const transformed = blockLines.map((line) => {
+      const m = /^(\s*)(?:-(?=\s|$)|[•◦▪])(\s*)(.*)$/.exec(line);
+      if (m) {
+        const curIndent = m[1];
+        const rest = m[3];
+        const nextIndent = ev.shiftKey
+          ? curIndent.slice(0, Math.max(0, curIndent.length - 2))
+          : curIndent.length < 8
+            ? curIndent + "  "
+            : curIndent;
+        const glyph = bulletForLevel(Math.floor(nextIndent.length / 2));
+        return `${nextIndent}${glyph} ${rest}`;
+      }
+      if (ev.shiftKey) {
+        return line.replace(/^ {1,2}/, "");
+      }
+      return `  ${line}`;
+    });
+
+    const newBlock = transformed.join("\n");
+    promptDraft.value = value.slice(0, blockStart) + newBlock + value.slice(blockEnd);
+
+    const delta = newBlock.length - (blockEnd - blockStart);
+    nextTick(() => {
+      el.focus();
+      if (blockLines.length === 1 && selStart === selEnd) {
+        const nextCaret = Math.max(
+          blockStart,
+          Math.min(blockStart + newBlock.length, selStart + delta)
+        );
+        el.setSelectionRange(nextCaret, nextCaret);
+      } else {
+        el.setSelectionRange(blockStart, blockStart + newBlock.length);
+      }
+      autoResizeTextarea();
+    });
+    return;
+  }
+
+  if (ev.key === "Enter" && ev.shiftKey && el) {
+    const value = promptDraft.value;
+    const selStart = el.selectionStart;
+    const selEnd = el.selectionEnd;
+    const lineStart = value.lastIndexOf("\n", selStart - 1) + 1;
+    const rawLineEnd = value.indexOf("\n", selEnd);
+    const lineEnd = rawLineEnd === -1 ? value.length : rawLineEnd;
+    const lineText = value.slice(lineStart, lineEnd);
+    const match = /^(\s*)(?:-(?=\s|$)|[•◦▪])(\s*)(.*)$/.exec(lineText);
+
+    if (match) {
+      ev.preventDefault();
+      const indent = match[1];
+      const rest = match[3];
+      const level = Math.floor(indent.length / 2);
+
+      if (rest.trim() === "") {
+        if (indent.length >= 2) {
+          const nextIndent = indent.slice(2);
+          const nextGlyph = bulletForLevel(Math.floor(nextIndent.length / 2));
+          const updatedLine = `${nextIndent}${nextGlyph} `;
+          promptDraft.value =
+            value.slice(0, lineStart) + updatedLine + value.slice(lineEnd);
+          const nextPos = lineStart + updatedLine.length;
+          nextTick(() => {
+            el.focus();
+            el.setSelectionRange(nextPos, nextPos);
+            autoResizeTextarea();
+          });
+        } else {
+          promptDraft.value = value.slice(0, lineStart) + value.slice(lineEnd);
+          nextTick(() => {
+            el.focus();
+            el.setSelectionRange(lineStart, lineStart);
+            autoResizeTextarea();
+          });
+        }
+        return;
+      }
+
+      const glyph = bulletForLevel(level);
+      const newPrefix = `${indent}${glyph} `;
+      const markerLen = lineText.length - rest.length;
+      const relStartInRest = Math.max(0, selStart - lineStart - markerLen);
+      const relEndInRest = Math.max(relStartInRest, selEnd - lineStart - markerLen);
+      const beforeRest = rest.slice(0, relStartInRest);
+      const afterRest = rest.slice(relEndInRest);
+      const updatedCurrentLine = `${newPrefix}${beforeRest}`;
+      const nextBulletPrefix = `\n${newPrefix}`;
+
+      promptDraft.value =
+        value.slice(0, lineStart) +
+        updatedCurrentLine +
+        nextBulletPrefix +
+        afterRest +
+        value.slice(lineEnd);
+
+      const nextPos =
+        lineStart + updatedCurrentLine.length + nextBulletPrefix.length;
+      nextTick(() => {
+        el.focus();
+        el.setSelectionRange(nextPos, nextPos);
+        autoResizeTextarea();
+      });
       return;
     }
   }
@@ -847,13 +1127,46 @@ async function copyCodeBlock(key: string, code: string) {
     <!-- Top bar -->
     <header class="disc-header">
       <div class="disc-header-left">
-        <span class="disc-title">{{ conv?.title || "Nouvelle session" }}</span>
         <button
-          class="ctx-pill"
+          type="button"
+          class="breadcrumb-project"
           title="Paramètres et contexte global du projet"
           @click="store.openProjectSettings(store.activeProject)"
         >
-          Contexte global lié
+          {{ store.activeProject?.name || "Projet" }}
+        </button>
+        <span class="breadcrumb-sep">/</span>
+        <input
+          v-if="isRenamingTitle"
+          ref="titleInputRef"
+          v-model="titleDraft"
+          type="text"
+          class="breadcrumb-title-input"
+          aria-label="Renommer la discussion"
+          @keydown.enter.prevent="commitRenameTitle"
+          @keydown.escape.prevent="cancelRenameTitle"
+          @blur="commitRenameTitle"
+        />
+        <button
+          v-else
+          type="button"
+          class="breadcrumb-title-btn"
+          title="Cliquer pour renommer la discussion"
+          @click="startRenameTitle"
+        >
+          <span class="disc-title">{{ conv?.title || "Nouvelle session" }}</span>
+          <svg
+            class="rename-pencil-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4Z" />
+          </svg>
         </button>
       </div>
 
@@ -879,7 +1192,13 @@ async function copyCodeBlock(key: string, code: string) {
         <h1 class="welcome-title">Qu'est-ce qu'on code patron?</h1>
         <div class="welcome-meta">
           <span class="meta-chip">{{ store.activeProject?.name }}</span>
-          <span class="meta-chip">Ollama · {{ store.settings.ollamaModel }}</span>
+          <span class="meta-chip">
+            {{
+              store.activeTargetLabel.isAgent
+                ? "Mode Agent (Multi-modèles)"
+                : `${store.activeTargetLabel.providerName} · ${store.activeTargetLabel.modelName}`
+            }}
+          </span>
           <span class="meta-chip">
             {{ store.stackStatus.aiderInstalled ? "Aider CLI prêt" : "Mode Ollama direct" }}
           </span>
@@ -989,7 +1308,7 @@ async function copyCodeBlock(key: string, code: string) {
           <!-- ASSISTANT MESSAGE -->
           <article v-else class="assistant-article">
             <!-- AI Thinking Section (presented right under user prompt) -->
-            <div v-if="msg.thinking" class="thinking-block">
+            <div v-if="msg.thinking || (msg.agentTrace && msg.agentTrace.length > 0)" class="thinking-block">
               <button
                 class="thinking-header"
                 :title="openThinkingIds.has(msg.id) ? 'Replier la réflexion' : 'Déplier la réflexion'"
@@ -1002,6 +1321,24 @@ async function copyCodeBlock(key: string, code: string) {
                   <span>Réflexion de l'IA</span>
                 </div>
                 <div class="thinking-meta">
+                  <div
+                    v-if="msg.agentTrace && msg.agentTrace.length > 0"
+                    class="trace-dots-preview"
+                    :title="msg.agentTrace.map((s) => `${s.roleLabel}: ${providerShortName(s.provider)} · ${s.model}`).join('\n')"
+                  >
+                    <span
+                      v-for="(st, sIdx) in msg.agentTrace"
+                      :key="sIdx"
+                      class="trace-preview-dot"
+                      :style="{ backgroundColor: providerDotColor(st.provider) }"
+                    />
+                  </div>
+                  <span
+                    v-if="msg.agentTrace && msg.agentTrace.length > 0"
+                    class="trace-steps-count"
+                  >
+                    {{ msg.agentTrace.length }} étape{{ msg.agentTrace.length > 1 ? "s" : "" }}
+                  </span>
                   <span class="thinking-badge done">Terminée</span>
                   <svg
                     class="chevron-icon"
@@ -1016,7 +1353,131 @@ async function copyCodeBlock(key: string, code: string) {
                 </div>
               </button>
               <div v-if="openThinkingIds.has(msg.id)" class="thinking-body custom-scroll">
-                <pre class="thinking-text">{{ msg.thinking }}</pre>
+                <div
+                  v-if="msg.agentTrace && msg.agentTrace.length > 0"
+                  class="trace-timeline"
+                >
+                  <div
+                    v-for="(step, sIdx) in msg.agentTrace"
+                    :key="`${step.role}-${sIdx}`"
+                    class="trace-step-card"
+                    :style="{ '--step-role-color': roleTraceDotColor(step.role) }"
+                  >
+                    <div class="trace-step-top">
+                      <div class="trace-role-wrap">
+                        <span
+                          class="trace-role-dot"
+                          :style="{ backgroundColor: roleTraceDotColor(step.role) }"
+                        />
+                        <strong class="trace-role-label">{{ step.roleLabel }}</strong>
+                      </div>
+                      <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
+                        <span
+                          class="trace-prov-dot"
+                          :style="{ backgroundColor: providerDotColor(step.provider) }"
+                        />
+                        <span class="trace-prov-name">{{ providerShortName(step.provider) }}</span>
+                        <span class="trace-model-name">{{ step.model }}</span>
+                      </span>
+                      <div class="trace-step-right">
+                        <span v-if="step.tokens && step.tokens > 0" class="trace-tok-pill">
+                          {{ formatCompactTok(step.tokens) }} tok
+                        </span>
+                        <span
+                          class="trace-status"
+                          :class="`is-${step.status}`"
+                          :title="step.status"
+                        >
+                          <span v-if="step.status === 'running'" class="pulse-dot" />
+                          <template v-else-if="step.status === 'done'">✓</template>
+                          <template v-else-if="step.status === 'fallback'">⚠</template>
+                          <template v-else>✕</template>
+                        </span>
+                      </div>
+                    </div>
+                    <div class="trace-step-summary">
+                      <template v-for="(tok, tIdx) in tokenizeInline(step.summary)" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="msg.thinking" class="thinking-md">
+                  <template
+                    v-for="(block, tbIdx) in parseMarkdownMessage(msg.thinking)"
+                    :key="tbIdx"
+                  >
+                    <h1 v-if="block.kind === 'heading' && block.level === 1" class="tmd-h1">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </h1>
+                    <h2 v-else-if="block.kind === 'heading' && block.level === 2" class="tmd-h2">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </h2>
+                    <h3 v-else-if="block.kind === 'heading' && block.level === 3" class="tmd-h3">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </h3>
+                    <blockquote v-else-if="block.kind === 'quote'" class="tmd-quote">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </blockquote>
+                    <ul v-else-if="block.kind === 'ul'" class="tmd-ul">
+                      <li
+                        v-for="(item, liIdx) in block.items"
+                        :key="liIdx"
+                        :style="{ marginLeft: `${item.indent * 14}px` }"
+                      >
+                        <template v-for="(tok, tIdx) in item.tokens" :key="tIdx">
+                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                          <template v-else>{{ tok.text }}</template>
+                        </template>
+                      </li>
+                    </ul>
+                    <ol v-else-if="block.kind === 'ol'" class="tmd-ol">
+                      <li v-for="(item, liIdx) in block.items" :key="liIdx">
+                        <template v-for="(tok, tIdx) in item" :key="tIdx">
+                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                          <template v-else>{{ tok.text }}</template>
+                        </template>
+                      </li>
+                    </ol>
+                    <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
+                    <p v-else-if="block.kind === 'paragraph'" class="tmd-p">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </p>
+                  </template>
+                </div>
               </div>
             </div>
 
@@ -1319,15 +1780,153 @@ async function copyCodeBlock(key: string, code: string) {
                     <span class="pulse-dot" />
                     {{ store.currentStage?.stageLabel || "En cours..." }}
                   </span>
+                  <button
+                    type="button"
+                    class="live-stop-pill"
+                    :disabled="store.isCancelling"
+                    title="Arrêter le traitement en cours"
+                    @click="store.cancelPrompt()"
+                  >
+                    ■ {{ store.isCancelling ? "Arrêt..." : "Stop" }}
+                  </button>
                 </div>
               </div>
 
               <div class="thinking-body live-body custom-scroll">
-                <!-- Vue Réflexion -->
-                <pre
-                  v-if="liveTab === 'thinking'"
-                  class="thinking-text"
-                >{{ store.liveThinking || "Analyse du prompt, sélection des outils et préparation du code..." }}</pre>
+                <!-- Vue Réflexion : Trace live + Markdown -->
+                <template v-if="liveTab === 'thinking'">
+                  <div
+                    v-if="store.liveAgentTrace.length > 0"
+                    class="trace-timeline"
+                  >
+                    <div
+                      v-for="(step, sIdx) in store.liveAgentTrace"
+                      :key="`live-${step.role}-${sIdx}`"
+                      class="trace-step-card"
+                      :style="{ '--step-role-color': roleTraceDotColor(step.role) }"
+                    >
+                      <div class="trace-step-top">
+                        <div class="trace-role-wrap">
+                          <span
+                            class="trace-role-dot"
+                            :style="{ backgroundColor: roleTraceDotColor(step.role) }"
+                          />
+                          <strong class="trace-role-label">{{ step.roleLabel }}</strong>
+                        </div>
+                        <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
+                          <span
+                            class="trace-prov-dot"
+                            :style="{ backgroundColor: providerDotColor(step.provider) }"
+                          />
+                          <span class="trace-prov-name">{{ providerShortName(step.provider) }}</span>
+                          <span class="trace-model-name">{{ step.model }}</span>
+                        </span>
+                        <div class="trace-step-right">
+                          <span v-if="step.tokens && step.tokens > 0" class="trace-tok-pill">
+                            {{ formatCompactTok(step.tokens) }} tok
+                          </span>
+                          <span
+                            class="trace-status"
+                            :class="`is-${step.status}`"
+                            :title="step.status"
+                          >
+                            <span v-if="step.status === 'running'" class="pulse-dot" />
+                            <template v-else-if="step.status === 'done'">✓</template>
+                            <template v-else-if="step.status === 'fallback'">⚠</template>
+                            <template v-else>✕</template>
+                          </span>
+                        </div>
+                      </div>
+                      <div class="trace-step-summary">
+                        <template v-for="(tok, tIdx) in tokenizeInline(step.summary)" :key="tIdx">
+                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                          <template v-else>{{ tok.text }}</template>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    v-if="store.liveThinking || store.liveAgentTrace.length === 0"
+                    class="thinking-md"
+                  >
+                    <template
+                      v-for="(block, lbIdx) in parseMarkdownMessage(
+                        store.liveThinking ||
+                          'Analyse du prompt, sélection des outils et préparation du code...'
+                      )"
+                      :key="lbIdx"
+                    >
+                    <h1 v-if="block.kind === 'heading' && block.level === 1" class="tmd-h1">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </h1>
+                    <h2 v-else-if="block.kind === 'heading' && block.level === 2" class="tmd-h2">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </h2>
+                    <h3 v-else-if="block.kind === 'heading' && block.level === 3" class="tmd-h3">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </h3>
+                    <blockquote v-else-if="block.kind === 'quote'" class="tmd-quote">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </blockquote>
+                    <ul v-else-if="block.kind === 'ul'" class="tmd-ul">
+                      <li
+                        v-for="(item, liIdx) in block.items"
+                        :key="liIdx"
+                        :style="{ marginLeft: `${item.indent * 14}px` }"
+                      >
+                        <template v-for="(tok, tIdx) in item.tokens" :key="tIdx">
+                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                          <template v-else>{{ tok.text }}</template>
+                        </template>
+                      </li>
+                    </ul>
+                    <ol v-else-if="block.kind === 'ol'" class="tmd-ol">
+                      <li v-for="(item, liIdx) in block.items" :key="liIdx">
+                        <template v-for="(tok, tIdx) in item" :key="tIdx">
+                          <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                          <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                          <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                          <template v-else>{{ tok.text }}</template>
+                        </template>
+                      </li>
+                    </ol>
+                    <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
+                    <p v-else-if="block.kind === 'paragraph'" class="tmd-p">
+                      <template v-for="(tok, tIdx) in block.tokens" :key="tIdx">
+                        <strong v-if="tok.kind === 'bold'">{{ tok.text }}</strong>
+                        <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+                        <code v-else-if="tok.kind === 'code'" class="tmd-inline-code">{{ tok.text }}</code>
+                        <template v-else>{{ tok.text }}</template>
+                      </template>
+                    </p>
+                  </template>
+                  </div>
+                </template>
 
                 <!-- Vue Flux Aider intégrée -->
                 <pre
@@ -1540,22 +2139,156 @@ async function copyCodeBlock(key: string, code: string) {
                   </svg>
                 </button>
 
-                <div class="model-picker-wrapper">
-                  <select
-                    class="model-select"
-                    :value="store.settings.ollamaModel"
+                <div ref="targetPickerRef" class="model-picker-wrapper">
+                  <button
+                    type="button"
+                    class="target-trigger-btn"
+                    :class="{ 'is-open': targetMenuOpen }"
                     :disabled="store.isProcessing"
-                    title="Changer de modèle Ollama"
-                    @change="onModelChange"
+                    :title="
+                      store.activeTargetLabel.isAgent
+                        ? 'Agent (Multi-agents selon vos paramètres)'
+                        : `${store.activeTargetLabel.providerName} · ${store.activeTargetLabel.modelName}`
+                    "
+                    @click.stop="toggleTargetMenu"
                   >
-                    <option
-                      v-for="modelName in availableModelChoices"
-                      :key="modelName"
-                      :value="modelName"
+                    <AppLogo
+                      v-if="store.activeTargetLabel.isAgent"
+                      :size="15"
+                    />
+                    <span
+                      v-else
+                      class="provider-dot"
+                      :style="{
+                        backgroundColor: providerDotColor(
+                          store.activeTargetLabel.providerId
+                        ),
+                      }"
+                    />
+                    <span class="target-model-label">
+                      {{
+                        store.activeTargetLabel.isAgent
+                          ? "Agent"
+                          : store.activeTargetLabel.modelName
+                      }}
+                    </span>
+                    <svg
+                      class="target-chevron"
+                      :class="{ rotated: targetMenuOpen }"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
                     >
-                      {{ modelName }}
-                    </option>
-                  </select>
+                      <path d="m18 15-6-6-6 6" />
+                    </svg>
+                  </button>
+
+                  <!-- Upward cascading popover menu -->
+                  <div v-if="targetMenuOpen" class="target-popover halo-hud">
+                    <button
+                      type="button"
+                      class="target-agent-item"
+                      :class="{ active: store.activeTargetLabel.isAgent }"
+                      @click="selectTarget('agent')"
+                    >
+                      <AppLogo :size="16" />
+                      <div class="target-item-copy">
+                        <strong>Agent</strong>
+                        <span>Multi-agents</span>
+                      </div>
+                      <span
+                        v-if="store.activeTargetLabel.isAgent"
+                        class="target-check"
+                      >
+                        ✓
+                      </span>
+                    </button>
+
+                    <div class="target-divider" />
+
+                    <div
+                      v-for="grp in providerGroups"
+                      :key="grp.id"
+                      class="target-provider-row"
+                      :class="{
+                        'is-active-sub': hoveredProvider === grp.id,
+                        'is-selected-prov':
+                          !store.activeTargetLabel.isAgent &&
+                          store.activeTargetLabel.providerId === grp.id,
+                      }"
+                      @mouseenter="hoveredProvider = grp.id"
+                      @click.stop="
+                        hoveredProvider =
+                          hoveredProvider === grp.id ? null : grp.id
+                      "
+                    >
+                      <span
+                        class="provider-dot"
+                        :style="{ backgroundColor: grp.color }"
+                      />
+                      <span class="target-prov-name">{{ grp.name }}</span>
+                      <span class="target-prov-count">
+                        {{ grp.models.length }}
+                      </span>
+                      <span class="target-arrow">›</span>
+
+                      <!-- Cascading submenu to the right (bridge padding prevents hover drop) -->
+                      <div
+                        v-if="hoveredProvider === grp.id"
+                        class="target-submenu-bridge"
+                        @click.stop
+                      >
+                        <div class="target-submenu halo-hud">
+                          <div class="target-submenu-header">
+                            <span
+                              class="provider-dot"
+                              :style="{ backgroundColor: grp.color }"
+                            />
+                            <span>{{ grp.name }}</span>
+                          </div>
+                          <div class="target-submenu-list custom-scroll">
+                            <div
+                              v-if="grp.models.length === 0"
+                              class="target-submenu-empty"
+                            >
+                              Aucun modèle détecté
+                            </div>
+                            <button
+                              v-for="mdl in grp.models"
+                              :key="mdl"
+                              type="button"
+                              class="target-model-item"
+                              :class="{
+                                active: isTargetSelected(grp.id, mdl),
+                              }"
+                              @click="selectTarget(`${grp.id}:${mdl}`)"
+                            >
+                              <span class="target-model-name">{{ mdl }}</span>
+                              <span
+                                v-if="isTargetSelected(grp.id, mdl)"
+                                class="target-check"
+                              >
+                                ✓
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="target-divider" />
+
+                    <button
+                      type="button"
+                      class="target-settings-btn"
+                      @click="openTargetSettings"
+                    >
+                      <span>⚙ Configurer fournisseurs & agents</span>
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1573,10 +2306,28 @@ async function copyCodeBlock(key: string, code: string) {
                   <span class="tool-perms-text">{{ store.autoToolsEnabled ? "Tools: Auto" : "Tools: Confirm" }}</span>
                 </button>
 
-                <!-- Bouton d'envoi avec simple flèche vers la droite -->
+                <!-- Bouton Stop (pendant l'exécution) ou Bouton d'envoi -->
                 <button
+                  v-if="store.isProcessing"
+                  type="button"
+                  class="stop-btn"
+                  :disabled="store.isCancelling"
+                  title="Arrêter le traitement en cours"
+                  aria-label="Arrêter le traitement en cours"
+                  @click="store.cancelPrompt()"
+                >
+                  <svg
+                    class="stop-square-icon"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                  >
+                    <rect x="6" y="6" width="12" height="12" rx="2.5" />
+                  </svg>
+                </button>
+                <button
+                  v-else
                   class="send-btn"
-                  :disabled="store.isProcessing || (!promptDraft.trim() && attachedFiles.length === 0)"
+                  :disabled="!promptDraft.trim() && attachedFiles.length === 0"
                   title="Envoyer le prompt"
                   @click="handleSubmit"
                 >
@@ -1669,8 +2420,57 @@ async function copyCodeBlock(key: string, code: string) {
 .disc-header-left {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
   min-width: 0;
+  flex: 1;
+}
+
+.breadcrumb-project {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.breadcrumb-project:hover {
+  background: var(--hover-bg);
+  color: var(--text-main);
+}
+
+.breadcrumb-sep {
+  color: var(--text-dim);
+  font-size: 13px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.breadcrumb-title-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-main);
+  padding: 3px 7px;
+  border-radius: 7px;
+  cursor: text;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+
+.breadcrumb-title-btn:hover {
+  background: var(--hover-bg);
+  border-color: var(--border-subtle);
 }
 
 .disc-title {
@@ -1681,15 +2481,33 @@ async function copyCodeBlock(key: string, code: string) {
   white-space: nowrap;
 }
 
-.ctx-pill {
-  border: 1px solid var(--border-subtle);
-  background: var(--active-bg);
+.rename-pencil-icon {
+  width: 12px;
+  height: 12px;
+  color: var(--text-dim);
+  opacity: 0;
+  flex-shrink: 0;
+  transition: opacity 0.14s ease, color 0.14s ease;
+}
+
+.breadcrumb-title-btn:hover .rename-pencil-icon {
+  opacity: 1;
   color: var(--accent);
-  border-radius: 999px;
-  padding: 2px 8px;
-  font-size: 11px;
-  font-weight: 500;
-  cursor: pointer;
+}
+
+.breadcrumb-title-input {
+  min-width: 180px;
+  max-width: 380px;
+  flex: 1;
+  border: 1px solid var(--accent);
+  background: var(--table-bg);
+  color: var(--text-main);
+  border-radius: 7px;
+  padding: 3px 8px;
+  font-size: 13.5px;
+  font-weight: 600;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(168, 85, 247, 0.18);
 }
 
 .restore-hud-btn {
@@ -2056,20 +2874,241 @@ async function copyCodeBlock(key: string, code: string) {
 
 .thinking-body {
   border-top: 1px solid var(--border-subtle);
-  padding: 8px 12px;
-  max-height: 240px;
+  padding: 10px 12px;
+  max-height: 290px;
   overflow-y: auto;
-  background: rgba(0, 0, 0, 0.15);
+  background: var(--table-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.thinking-text {
-  margin: 0;
-  font-family: var(--font-code);
+.trace-dots-preview {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.trace-preview-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.trace-steps-count {
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 0 5px;
+}
+
+.trace-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.trace-step-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  border-left: 2.5px solid var(--step-role-color, var(--accent));
+  background: var(--hover-bg);
+}
+
+.trace-step-top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.trace-role-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11.5px;
+  color: var(--text-main);
+}
+
+.trace-role-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.trace-role-label {
+  font-weight: 600;
+}
+
+.trace-model-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--discussion-bg);
+  font-size: 10.5px;
+  max-width: 240px;
+}
+
+.trace-prov-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.trace-prov-name {
+  font-weight: 600;
+  color: var(--text-main);
+  flex-shrink: 0;
+}
+
+.trace-model-name {
+  font-family: var(--font-code);
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-step-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trace-tok-pill {
+  font-family: var(--font-code);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.trace-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.trace-status.is-done {
+  background: rgba(16, 185, 129, 0.16);
+  color: #10b981;
+}
+
+.trace-status.is-fallback {
+  background: rgba(245, 158, 11, 0.18);
+  color: #f59e0b;
+}
+
+.trace-status.is-error {
+  background: rgba(239, 68, 68, 0.18);
+  color: #ef4444;
+}
+
+.trace-status.is-running {
+  background: var(--active-bg);
+}
+
+.trace-step-summary {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  word-break: break-word;
+  padding-left: 13px;
+}
+
+.thinking-md {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
   line-height: 1.5;
   color: var(--text-muted);
-  white-space: pre-wrap;
+}
+
+.tmd-h1,
+.tmd-h2,
+.tmd-h3 {
+  margin: 4px 0 1px;
+  font-weight: 600;
+  color: var(--text-main);
+  line-height: 1.3;
+}
+
+.tmd-h1 {
+  font-size: 13.5px;
+}
+
+.tmd-h2 {
+  font-size: 12.5px;
+}
+
+.tmd-h3 {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.tmd-p {
+  margin: 0;
   word-break: break-word;
+}
+
+.tmd-quote {
+  margin: 2px 0;
+  padding: 3px 8px;
+  border-left: 2px solid var(--accent);
+  background: var(--hover-bg);
+  border-radius: 0 5px 5px 0;
+  color: var(--text-dim);
+}
+
+.tmd-ul,
+.tmd-ol {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tmd-ul li,
+.tmd-ol li {
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.tmd-inline-code {
+  font-family: var(--font-code);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--hover-bg);
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-2);
+}
+
+.tmd-code-block {
+  margin: 2px 0;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border-subtle);
+  background: var(--discussion-bg);
+  font-family: var(--font-code);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-x: auto;
 }
 
 /* Live stream styling */
@@ -2931,7 +3970,7 @@ async function copyCodeBlock(key: string, code: string) {
 .composer-line-1 textarea {
   width: 100%;
   min-height: 48px;
-  max-height: 200px;
+  max-height: 220px;
   border: none;
   background: transparent;
   color: var(--text-main);
@@ -2995,7 +4034,7 @@ async function copyCodeBlock(key: string, code: string) {
   height: 16px;
 }
 
-/* Model selector (hauteur = 32px, identique au bouton PJ) */
+/* Model & Agent Target Cascading Dropdown (hauteur = 32px, identique au bouton PJ) */
 .model-picker-wrapper {
   position: relative;
   display: inline-flex;
@@ -3004,39 +4043,269 @@ async function copyCodeBlock(key: string, code: string) {
   box-sizing: border-box;
 }
 
-.model-select {
-  appearance: none;
-  -webkit-appearance: none;
+.target-trigger-btn {
   height: 32px;
   box-sizing: border-box;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11.5px;
-  color: var(--text-muted);
-  background: var(--table-bg);
-  padding: 0 24px 0 10px;
-  line-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
   border-radius: 8px;
   border: 1px solid var(--border-subtle);
+  background: var(--table-bg);
+  color: var(--text-main);
+  font-size: 12px;
+  font-weight: 500;
   cursor: pointer;
-  outline: none;
+  max-width: 195px;
   transition: all 0.15s ease;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 7px center;
-  max-width: 165px;
+}
+
+.target-trigger-btn:hover:not(:disabled),
+.target-trigger-btn.is-open {
+  border-color: var(--accent);
+  background: var(--hover-bg);
+}
+
+.target-trigger-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.target-model-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+}
+
+.provider-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.target-chevron {
+  width: 12px;
+  height: 12px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.target-chevron.rotated {
+  transform: rotate(180deg);
+}
+
+.target-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 60;
+  min-width: 230px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+}
+
+.target-agent-item {
+  width: 100%;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-main);
+  border-radius: 8px;
+  padding: 7px 8px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.12s ease;
+}
+
+.target-agent-item:hover {
+  background: var(--hover-bg);
+}
+
+.target-agent-item.active {
+  background: var(--active-bg);
+  border-color: var(--accent);
+}
+
+.target-item-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.target-item-copy strong {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.target-item-copy span {
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.target-divider {
+  height: 1px;
+  background: var(--border-subtle);
+  margin: 2px 4px;
+}
+
+.target-provider-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-main);
+  transition: background-color 0.12s ease;
+}
+
+.target-provider-row:hover,
+.target-provider-row.is-active-sub {
+  background: var(--hover-bg);
+}
+
+.target-provider-row.is-selected-prov {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.target-prov-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.target-prov-count {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--table-bg);
+}
+
+.target-arrow {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1;
+}
+
+.target-submenu-bridge {
+  position: absolute;
+  left: 100%;
+  bottom: -6px;
+  padding-left: 6px;
+  z-index: 65;
+}
+
+.target-submenu {
+  min-width: 225px;
+  max-width: 280px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+}
+
+.target-submenu-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.target-submenu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.target-submenu-empty {
+  padding: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.target-model-item {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text-main);
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  text-align: left;
+}
+
+.target-model-item:hover {
+  background: var(--hover-bg);
+}
+
+.target-model-item.active {
+  background: var(--active-bg);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.target-model-name {
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.model-select:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--text-main);
-  background-color: var(--hover-bg);
+.target-check {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
 }
 
-.model-select:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(168, 85, 247, 0.2);
+.target-settings-btn {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 7px;
+  padding: 6px 8px;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.target-settings-btn:hover {
+  background: var(--hover-bg);
+  color: var(--accent);
 }
 
 /* Permissions des tools (hauteur = 32px) */
@@ -3107,6 +4376,60 @@ async function copyCodeBlock(key: string, code: string) {
 .send-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.stop-btn {
+  height: 32px;
+  width: 34px;
+  box-sizing: border-box;
+  border: none;
+  background: #ef4444;
+  color: #fff;
+  border-radius: 8px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.stop-btn:hover:not(:disabled) {
+  background: #dc2626;
+  transform: scale(1.03);
+}
+
+.stop-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.stop-square-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.live-stop-pill {
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.14);
+  color: #ef4444;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.14s ease;
+}
+
+.live-stop-pill:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.24);
+  border-color: #ef4444;
+}
+
+.live-stop-pill:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 
 .send-arrow-icon {

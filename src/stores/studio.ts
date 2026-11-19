@@ -3,6 +3,10 @@ import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  AgentRoutingConfig,
+  AgentTraceEvent,
+  AgentTraceStep,
+  ApiUsageState,
   AppSettings,
   AppStateData,
   AttachedFile,
@@ -13,6 +17,7 @@ import type {
   McpToolInfo,
   Project,
   PromptStageEvent,
+  ProviderConfig,
   SendPromptResult,
   StackStatus,
   ThemePreference,
@@ -23,6 +28,94 @@ import type {
 const isTauri = () =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+export function defaultProvidersList(): ProviderConfig[] {
+  return [
+    {
+      id: "gemini",
+      name: "Gemini",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "openai",
+      name: "OpenAI",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: ["gpt-4.1", "gpt-4.1-mini", "o4-mini", "gpt-4o"],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "anthropic",
+      name: "Anthropic (Claude)",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-haiku-20241022",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "deepseek",
+      name: "DeepSeek",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: ["deepseek-chat", "deepseek-reasoner"],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "openrouter",
+      name: "OpenRouter",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "anthropic/claude-sonnet-4",
+        "google/gemini-2.5-flash",
+        "deepseek/deepseek-chat-v3-0324",
+        "qwen/qwen-2.5-coder-32b-instruct",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "mistral",
+      name: "Mistral",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "codestral-latest",
+        "devstral-small-2505",
+        "mistral-large-latest",
+      ],
+      dailyTokenLimit: 500000,
+    },
+  ];
+}
+
+export function defaultAgentRouting(): AgentRoutingConfig {
+  return {
+    architect: { provider: "ollama", model: "" },
+    cartographer: { provider: "ollama", model: "" },
+    designer: { provider: "ollama", model: "" },
+    coder: { provider: "ollama", model: "" },
+    refactoring: { provider: "ollama", model: "" },
+    tester: { provider: "ollama", model: "" },
+    synthesizer: { provider: "ollama", model: "" },
+  };
+}
+
 const defaultSettings: AppSettings = {
   theme: "system",
   ollamaUrl: "http://127.0.0.1:11434",
@@ -30,6 +123,9 @@ const defaultSettings: AppSettings = {
   aiderPath: "aider",
   autoStartOllama: true,
   aiderEditFormat: "auto",
+  activeTarget: "agent",
+  providers: defaultProvidersList(),
+  agentRouting: defaultAgentRouting(),
 };
 
 export const useStudioStore = defineStore("studio", () => {
@@ -74,7 +170,18 @@ export const useStudioStore = defineStore("studio", () => {
 
   // Modals
   const settingsOpen = ref<boolean>(false);
+  const settingsActiveTab = ref<"general" | "providers" | "agents">("general");
   const contextModalOpen = ref<boolean>(false);
+
+  function openSettingsTab(tab: "general" | "providers" | "agents" = "general") {
+    settingsActiveTab.value = tab;
+    settingsOpen.value = true;
+  }
+
+  const apiUsage = ref<ApiUsageState>({
+    date: new Date().toISOString().slice(0, 10),
+    byProvider: {},
+  });
   const projectSettingsModalOpen = ref<boolean>(false);
   const projectToEdit = ref<Project | null>(null);
   const newProjectModalOpen = ref<boolean>(false);
@@ -87,10 +194,13 @@ export const useStudioStore = defineStore("studio", () => {
 
   // Prompt processing state
   const isProcessing = ref<boolean>(false);
+  const isCancelling = ref<boolean>(false);
+  const processingConversationId = ref<string | null>(null);
   const currentStage = ref<PromptStageEvent | null>(null);
   const liveStreamLines = ref<string[]>([]);
   const liveThinking = ref<string>("");
   const liveContent = ref<string>("");
+  const liveAgentTrace = ref<AgentTraceStep[]>([]);
 
   // System dark/light tracking
   const systemPrefersLight = ref<boolean>(
@@ -217,6 +327,93 @@ export const useStudioStore = defineStore("studio", () => {
     return Math.min(100, Math.round((activeCallTokens.value / contextTokensMax.value) * 100));
   });
 
+  const validatedExternalProviders = computed<ProviderConfig[]>(() => {
+    return (settings.value.providers ?? []).filter(
+      (p) => p.validated && p.apiKey.trim().length > 0
+    );
+  });
+
+  const externalApiTokensTotal = computed<number>(() => {
+    const entries = Object.values(apiUsage.value.byProvider ?? {});
+    return entries.reduce((sum, e) => sum + (e.totalTokens || 0), 0);
+  });
+
+  const externalApiTokenLimit = computed<number>(() => {
+    const provs = settings.value.providers ?? [];
+    const activeIds = new Set<string>([
+      ...validatedExternalProviders.value.map((p) => p.id),
+      ...Object.keys(apiUsage.value.byProvider ?? {}),
+    ]);
+    let limit = 0;
+    for (const pid of activeIds) {
+      const cfg = provs.find((p) => p.id === pid);
+      limit += cfg?.dailyTokenLimit && cfg.dailyTokenLimit > 0 ? cfg.dailyTokenLimit : 500000;
+    }
+    return limit > 0 ? limit : 500000;
+  });
+
+  const externalApiPercent = computed<number>(() => {
+    return Math.min(
+      100,
+      Math.round((externalApiTokensTotal.value / Math.max(1, externalApiTokenLimit.value)) * 100)
+    );
+  });
+
+  const turnTotalTokens = computed<number>(() => {
+    return turnTokenSteps.value.reduce((sum, s) => sum + (s.totalTokens || 0), 0);
+  });
+
+  const localPeakTokens = computed<number>(() => {
+    let peak = 0;
+    for (const s of turnTokenSteps.value) {
+      if ((s.provider || "ollama") === "ollama") {
+        peak = Math.max(peak, s.totalTokens || 0);
+      }
+    }
+    return peak;
+  });
+
+  const localContextPercent = computed<number>(() => {
+    const denom = Math.max(1, contextTokensMax.value);
+    const localUsed = Math.max(contextTokensUsed.value, localPeakTokens.value);
+    return Math.min(100, Math.round((localUsed / denom) * 100));
+  });
+
+  const activeTargetLabel = computed<{
+    isAgent: boolean;
+    providerId: string;
+    providerName: string;
+    modelName: string;
+  }>(() => {
+    const raw = (settings.value.activeTarget || "agent").trim();
+    if (!raw || raw === "agent") {
+      return {
+        isAgent: true,
+        providerId: "agent",
+        providerName: "Agent",
+        modelName: "Multi-agents",
+      };
+    }
+    const colonIdx = raw.indexOf(":");
+    const provId = colonIdx !== -1 ? raw.slice(0, colonIdx) : "ollama";
+    const modelName = colonIdx !== -1 ? raw.slice(colonIdx + 1) : raw;
+    const providerNames: Record<string, string> = {
+      ollama: "Ollama",
+      gemini: "Gemini",
+      openai: "OpenAI",
+      anthropic: "Claude",
+      deepseek: "DeepSeek",
+      openrouter: "OpenRouter",
+      mistral: "Mistral",
+    };
+    return {
+      isAgent: false,
+      providerId: provId,
+      providerName: providerNames[provId] || provId,
+      modelName,
+    };
+  });
+
   const conversationsForProject = (projectId: string) =>
     conversations.value.filter((c) => c.projectId === projectId);
 
@@ -227,12 +424,28 @@ export const useStudioStore = defineStore("studio", () => {
   }
 
   function applyStateData(data: AppStateData) {
-    settings.value = data.settings;
+    settings.value = {
+      ...defaultSettings,
+      ...data.settings,
+      activeTarget: data.settings.activeTarget || "agent",
+      providers:
+        data.settings.providers && data.settings.providers.length > 0
+          ? data.settings.providers
+          : defaultProvidersList(),
+      agentRouting: {
+        ...defaultAgentRouting(),
+        ...(data.settings.agentRouting ?? {}),
+      },
+    };
     projects.value = data.projects;
     conversations.value = data.conversations;
     activeProjectId.value = data.activeProjectId;
     activeConversationId.value = data.activeConversationId;
     mcpServers.value = data.mcpServers ?? [];
+    apiUsage.value = data.apiUsage ?? {
+      date: new Date().toISOString().slice(0, 10),
+      byProvider: {},
+    };
     applyThemeToDom();
     void checkAiderignore();
   }
@@ -258,6 +471,30 @@ export const useStudioStore = defineStore("studio", () => {
         currentStage.value = event.payload;
       });
 
+      await listen<ApiUsageState>("aider:api_usage", (event) => {
+        if (event.payload) {
+          apiUsage.value = event.payload;
+        }
+      });
+
+      await listen<AgentTraceEvent>("aider:trace", (event) => {
+        const payload = event.payload;
+        if (!payload || !payload.step) return;
+        if (
+          payload.conversationId === activeConversationId.value ||
+          payload.conversationId === processingConversationId.value
+        ) {
+          const next = [...liveAgentTrace.value];
+          const idx = next.findIndex((s) => s.role === payload.step.role);
+          if (idx !== -1) {
+            next[idx] = payload.step;
+          } else {
+            next.push(payload.step);
+          }
+          liveAgentTrace.value = next;
+        }
+      });
+
       await listen<TokenUsageEvent>("aider:tokens", (event) => {
         const payload = event.payload;
         if (payload && payload.conversationId) {
@@ -268,12 +505,23 @@ export const useStudioStore = defineStore("studio", () => {
           };
 
           const existingSteps = conversationTokenSteps.value[cid] ?? [];
+          const stepKey = payload.role || payload.subagent;
           const stepIdx = existingSteps.findIndex(
-            (s) => s.subagent === payload.subagent
+            (s) => (s.role || s.subagent) === stepKey
           );
           const nextSteps = [...existingSteps];
           if (stepIdx !== -1) {
-            nextSteps[stepIdx] = payload;
+            const prev = nextSteps[stepIdx];
+            if (prev.provider === payload.provider && prev.model === payload.model) {
+              nextSteps[stepIdx] = {
+                ...payload,
+                promptTokens: prev.promptTokens + payload.promptTokens,
+                completionTokens: prev.completionTokens + payload.completionTokens,
+                totalTokens: prev.totalTokens + payload.totalTokens,
+              };
+            } else {
+              nextSteps[stepIdx] = payload;
+            }
           } else {
             nextSteps.push(payload);
           }
@@ -310,6 +558,17 @@ export const useStudioStore = defineStore("studio", () => {
         const [convId, text] = event.payload;
         if (convId === activeConversationId.value) {
           liveContent.value = text;
+        }
+      });
+
+      await listen<[string, string]>("aider:conversation_titled", (event) => {
+        const [convId, title] = event.payload;
+        const idx = conversations.value.findIndex((c) => c.id === convId);
+        if (idx !== -1 && title) {
+          conversations.value[idx] = {
+            ...conversations.value[idx],
+            title,
+          };
         }
       });
 
@@ -418,9 +677,78 @@ export const useStudioStore = defineStore("studio", () => {
     settings.value = { ...next };
     applyThemeToDom();
     if (isTauri()) {
-      await invoke<AppSettings>("save_settings", { settings: next });
+      const saved = await invoke<AppSettings>("save_settings", { settings: next });
+      settings.value = saved;
       await refreshStackStatus();
     }
+  }
+
+  async function validateProviderKey(
+    providerId: string,
+    apiKey: string,
+    baseUrl?: string | null
+  ): Promise<ProviderConfig> {
+    if (isTauri()) {
+      const updated = await invoke<ProviderConfig>("validate_provider_key", {
+        providerId,
+        apiKey,
+        baseUrl: baseUrl || null,
+      });
+      const currentProviders = [...(settings.value.providers ?? defaultProvidersList())];
+      const idx = currentProviders.findIndex((p) => p.id === updated.id);
+      if (idx !== -1) {
+        currentProviders[idx] = updated;
+      } else {
+        currentProviders.push(updated);
+      }
+      settings.value = {
+        ...settings.value,
+        providers: currentProviders,
+      };
+      return updated;
+    }
+    if (!apiKey.trim()) {
+      throw new Error("Clé API vide.");
+    }
+    const currentProviders = [...(settings.value.providers ?? defaultProvidersList())];
+    const idx = currentProviders.findIndex((p) => p.id === providerId);
+    const existing = idx !== -1 ? currentProviders[idx] : defaultProvidersList()[0];
+    const simulated: ProviderConfig = {
+      ...existing,
+      id: providerId,
+      apiKey: apiKey.trim(),
+      baseUrl: baseUrl || null,
+      validated: true,
+    };
+    if (idx !== -1) currentProviders[idx] = simulated;
+    settings.value = { ...settings.value, providers: currentProviders };
+    return simulated;
+  }
+
+  async function resetApiUsage() {
+    if (isTauri()) {
+      apiUsage.value = await invoke<ApiUsageState>("reset_api_usage");
+    } else {
+      apiUsage.value = {
+        date: new Date().toISOString().slice(0, 10),
+        byProvider: {},
+      };
+    }
+  }
+
+  async function setActiveTarget(target: string) {
+    const clean = target.trim() || "agent";
+    const next: AppSettings = {
+      ...settings.value,
+      activeTarget: clean,
+    };
+    if (clean.startsWith("ollama:")) {
+      const mdl = clean.slice("ollama:".length).trim();
+      if (mdl) {
+        next.ollamaModel = mdl;
+      }
+    }
+    await saveSettings(next);
   }
 
   async function setTheme(theme: ThemePreference) {
@@ -515,6 +843,50 @@ export const useStudioStore = defineStore("studio", () => {
     activeArtifactId.value = null;
     if (isTauri()) {
       await invoke("select_conversation", { projectId, conversationId });
+    }
+  }
+
+  async function renameConversation(conversationId: string, title: string) {
+    const clean = title.trim();
+    if (!clean) return;
+    const idx = conversations.value.findIndex((c) => c.id === conversationId);
+    if (idx !== -1) {
+      conversations.value[idx] = {
+        ...conversations.value[idx],
+        title: clean,
+      };
+    }
+    if (isTauri()) {
+      try {
+        const updated = await invoke<Conversation>("rename_conversation", {
+          conversationId,
+          title: clean,
+        });
+        const uIdx = conversations.value.findIndex((c) => c.id === updated.id);
+        if (uIdx !== -1) conversations.value[uIdx] = updated;
+      } catch {
+        // Ignore transient rename failure
+      }
+    }
+  }
+
+  async function cancelPrompt() {
+    if (!isProcessing.value || isCancelling.value) return;
+    isCancelling.value = true;
+    const targetConvId =
+      processingConversationId.value || activeConversationId.value || "";
+    if (currentStage.value) {
+      currentStage.value = {
+        ...currentStage.value,
+        detail: "Interruption du traitement en cours...",
+      };
+    }
+    if (isTauri() && targetConvId) {
+      try {
+        await invoke<boolean>("cancel_prompt", { conversationId: targetConvId });
+      } catch {
+        // Ignore cancel invoke error
+      }
     }
   }
 
@@ -710,6 +1082,8 @@ export const useStudioStore = defineStore("studio", () => {
     }
 
     isProcessing.value = true;
+    isCancelling.value = false;
+    processingConversationId.value = conv.id;
     const nextPeak = { ...conversationPeakTokens.value };
     delete nextPeak[conv.id];
     conversationPeakTokens.value = nextPeak;
@@ -720,6 +1094,7 @@ export const useStudioStore = defineStore("studio", () => {
     liveStreamLines.value = [];
     liveThinking.value = "";
     liveContent.value = "";
+    liveAgentTrace.value = [];
     currentStage.value = {
       conversationId: conv.id,
       stageIndex: 1,
@@ -764,6 +1139,9 @@ export const useStudioStore = defineStore("studio", () => {
       };
     } finally {
       isProcessing.value = false;
+      isCancelling.value = false;
+      processingConversationId.value = null;
+      liveAgentTrace.value = [];
       void refreshStackStatus();
     }
   }
@@ -998,6 +1376,9 @@ export const useStudioStore = defineStore("studio", () => {
     activeDiffFilePath,
     activeArtifactId,
     settingsOpen,
+    settingsActiveTab,
+    openSettingsTab,
+    apiUsage,
     contextModalOpen,
     projectSettingsModalOpen,
     projectToEdit,
@@ -1007,10 +1388,13 @@ export const useStudioStore = defineStore("studio", () => {
     mcpModalOpen,
     mcpServers,
     isProcessing,
+    isCancelling,
+    processingConversationId,
     currentStage,
     liveStreamLines,
     liveThinking,
     liveContent,
+    liveAgentTrace,
     listProjectFiles,
     executeTool,
     effectiveTheme,
@@ -1020,6 +1404,9 @@ export const useStudioStore = defineStore("studio", () => {
     refreshStackStatus,
     startOllama,
     saveSettings,
+    validateProviderKey,
+    resetApiUsage,
+    setActiveTarget,
     setTheme,
     pickProjectDirectory,
     createProject,
@@ -1027,6 +1414,8 @@ export const useStudioStore = defineStore("studio", () => {
     updateProjectContext,
     createConversation,
     selectConversation,
+    renameConversation,
+    cancelPrompt,
     deleteConversation,
     deleteConvModalOpen,
     convToDelete,
@@ -1053,6 +1442,14 @@ export const useStudioStore = defineStore("studio", () => {
     lastCallTokens,
     peakCallTokens,
     turnTokenSteps,
+    turnTotalTokens,
+    localPeakTokens,
+    localContextPercent,
+    validatedExternalProviders,
+    externalApiTokensTotal,
+    externalApiTokenLimit,
+    externalApiPercent,
+    activeTargetLabel,
     displayedCallTokenEvent,
     activeCallTokens,
     contextTokensMax,

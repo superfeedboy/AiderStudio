@@ -8,6 +8,103 @@ fn default_edit_format() -> String {
     "auto".to_string()
 }
 
+fn default_active_target() -> String {
+    "agent".to_string()
+}
+
+fn default_ollama_provider() -> String {
+    "ollama".to_string()
+}
+
+fn default_daily_token_limit() -> usize {
+    500_000
+}
+
+pub fn today_date_string() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub validated: bool,
+    #[serde(default)]
+    pub available_models: Vec<String>,
+    #[serde(default = "default_daily_token_limit")]
+    pub daily_token_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelSlot {
+    #[serde(default = "default_ollama_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+impl Default for AgentModelSlot {
+    fn default() -> Self {
+        Self {
+            provider: default_ollama_provider(),
+            model: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRoutingConfig {
+    #[serde(default)]
+    pub architect: AgentModelSlot,
+    #[serde(default)]
+    pub cartographer: AgentModelSlot,
+    #[serde(default)]
+    pub designer: AgentModelSlot,
+    #[serde(default)]
+    pub coder: AgentModelSlot,
+    #[serde(default)]
+    pub refactoring: AgentModelSlot,
+    #[serde(default)]
+    pub tester: AgentModelSlot,
+    #[serde(default)]
+    pub synthesizer: AgentModelSlot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageEntry {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub calls: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsageState {
+    #[serde(default = "today_date_string")]
+    pub date: String,
+    #[serde(default)]
+    pub by_provider: std::collections::HashMap<String, ProviderUsageEntry>,
+}
+
+impl Default for ApiUsageState {
+    fn default() -> Self {
+        Self {
+            date: today_date_string(),
+            by_provider: std::collections::HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -20,6 +117,12 @@ pub struct AppSettings {
     pub context_window_tokens: usize,
     #[serde(default = "default_edit_format")]
     pub aider_edit_format: String, // "auto" | "whole" | "diff"
+    #[serde(default = "default_active_target")]
+    pub active_target: String, // "agent" | "<provider>:<model>"
+    #[serde(default = "crate::providers::default_providers")]
+    pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub agent_routing: AgentRoutingConfig,
 }
 
 impl Default for AppSettings {
@@ -32,6 +135,9 @@ impl Default for AppSettings {
             auto_start_ollama: true,
             context_window_tokens: 8192,
             aider_edit_format: "auto".to_string(),
+            active_target: "agent".to_string(),
+            providers: crate::providers::default_providers(),
+            agent_routing: AgentRoutingConfig::default(),
         }
     }
 }
@@ -103,6 +209,26 @@ pub struct ToolExecutionResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentTraceStep {
+    pub role: String,
+    pub role_label: String,
+    pub provider: String,
+    pub model: String,
+    pub summary: String,
+    pub status: String, // "running" | "done" | "fallback" | "error"
+    #[serde(default)]
+    pub tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTraceEvent {
+    pub conversation_id: String,
+    pub step: AgentTraceStep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
     pub role: String, // "user" | "assistant" | "system"
@@ -119,6 +245,8 @@ pub struct ChatMessage {
     pub lines_added: usize,
     #[serde(default)]
     pub lines_removed: usize,
+    #[serde(default)]
+    pub agent_trace: Vec<AgentTraceStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +302,8 @@ pub struct AppStateData {
     pub active_conversation_id: Option<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub api_usage: ApiUsageState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +326,14 @@ pub struct TokenUsageEvent {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub context_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

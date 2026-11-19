@@ -2,13 +2,14 @@ mod engine;
 mod git_diff;
 mod mcp;
 mod models;
+mod providers;
 mod storage;
 mod telemetry;
 
 use chrono::Utc;
 use models::{
-    AppSettings, AppStateData, Conversation, HardwareTelemetry, Project, SendPromptResult,
-    StackStatus,
+    ApiUsageState, AppSettings, AppStateData, Conversation, HardwareTelemetry, Project,
+    ProviderConfig, SendPromptResult, StackStatus,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
@@ -16,24 +17,102 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub struct ManagedState(pub Arc<Mutex<AppStateData>>);
+pub struct ActivePipelines(
+    pub Arc<Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+);
 
 #[tauri::command]
 async fn get_initial_state(state: State<'_, ManagedState>) -> Result<AppStateData, String> {
-    let guard = state.0.lock().await;
+    let mut guard = state.0.lock().await;
+    let merged_providers = providers::merge_with_default_providers(&guard.settings.providers);
+    let mut changed = merged_providers.len() != guard.settings.providers.len();
+    guard.settings.providers = merged_providers;
+    if guard.settings.active_target.trim().is_empty() {
+        guard.settings.active_target = "agent".to_string();
+        changed = true;
+    }
+
+    let today = models::today_date_string();
+    if guard.api_usage.date != today {
+        guard.api_usage = ApiUsageState {
+            date: today,
+            by_provider: std::collections::HashMap::new(),
+        };
+        changed = true;
+    }
+
+    if changed {
+        let _ = storage::save_state(&guard).await;
+    }
     Ok(guard.clone())
 }
 
 #[tauri::command]
 async fn save_settings(
     state: State<'_, ManagedState>,
-    settings: AppSettings,
+    mut settings: AppSettings,
 ) -> Result<AppSettings, String> {
+    settings.providers = providers::merge_with_default_providers(&settings.providers);
+    if settings.active_target.trim().is_empty() {
+        settings.active_target = "agent".to_string();
+    }
     let mut guard = state.0.lock().await;
     guard.settings = settings.clone();
     storage::save_state(&guard)
         .await
         .map_err(|e| e.to_string())?;
     Ok(settings)
+}
+
+#[tauri::command]
+async fn validate_provider_key(
+    state: State<'_, ManagedState>,
+    provider_id: String,
+    api_key: String,
+    base_url: Option<String>,
+) -> Result<ProviderConfig, String> {
+    let models = providers::validate_provider_api_key(
+        &provider_id,
+        &api_key,
+        base_url.as_deref(),
+    )
+    .await?;
+
+    let mut guard = state.0.lock().await;
+    guard.settings.providers = providers::merge_with_default_providers(&guard.settings.providers);
+
+    let updated_cfg = if let Some(slot) = guard
+        .settings
+        .providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+    {
+        slot.api_key = api_key.trim().to_string();
+        slot.base_url = base_url
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+        slot.validated = true;
+        slot.available_models = models;
+        slot.clone()
+    } else {
+        return Err(format!("Fournisseur inconnu : {provider_id}"));
+    };
+
+    storage::save_state(&guard)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(updated_cfg)
+}
+
+#[tauri::command]
+async fn reset_api_usage(state: State<'_, ManagedState>) -> Result<ApiUsageState, String> {
+    let mut guard = state.0.lock().await;
+    guard.api_usage = ApiUsageState::default();
+    let updated = guard.api_usage.clone();
+    storage::save_state(&guard)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -257,16 +336,80 @@ async fn update_conversation_context(
 }
 
 #[tauri::command]
+async fn rename_conversation(
+    state: State<'_, ManagedState>,
+    conversation_id: String,
+    title: String,
+) -> Result<Conversation, String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("Le titre ne peut pas être vide.".to_string());
+    }
+    let mut guard = state.0.lock().await;
+    let conv_idx = guard
+        .conversations
+        .iter()
+        .position(|c| c.id == conversation_id)
+        .ok_or_else(|| "Conversation introuvable".to_string())?;
+    guard.conversations[conv_idx].title = trimmed.to_string();
+    guard.conversations[conv_idx].updated_at = Utc::now().to_rfc3339();
+    let updated = guard.conversations[conv_idx].clone();
+    storage::save_state(&guard)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn cancel_prompt(
+    pipelines: State<'_, ActivePipelines>,
+    conversation_id: String,
+) -> Result<bool, String> {
+    let guard = pipelines.0.lock().await;
+    if let Some(tx) = guard.get(&conversation_id) {
+        let _ = tx.send(true);
+        return Ok(true);
+    }
+    let mut any = false;
+    for tx in guard.values() {
+        let _ = tx.send(true);
+        any = true;
+    }
+    Ok(any)
+}
+
+#[tauri::command]
 async fn send_prompt(
     app: AppHandle,
     state: State<'_, ManagedState>,
+    pipelines: State<'_, ActivePipelines>,
     conversation_id: String,
     prompt: String,
     attachments: Option<Vec<models::AttachedFile>>,
 ) -> Result<SendPromptResult, String> {
-    engine::run_prompt_pipeline(&app, &state.0, conversation_id, prompt, attachments)
-        .await
-        .map_err(|e| e.to_string())
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    {
+        let mut guard = pipelines.0.lock().await;
+        guard.insert(conversation_id.clone(), cancel_tx);
+    }
+
+    let res = engine::run_prompt_pipeline(
+        &app,
+        &state.0,
+        conversation_id.clone(),
+        prompt,
+        attachments,
+        cancel_rx,
+    )
+    .await
+    .map_err(|e| e.to_string());
+
+    {
+        let mut guard = pipelines.0.lock().await;
+        guard.remove(&conversation_id);
+    }
+
+    res
 }
 
 #[tauri::command]
@@ -652,17 +795,24 @@ pub fn run() {
         .setup(|app| {
             let loaded = tauri::async_runtime::block_on(storage::load_state());
             app.manage(ManagedState(Arc::new(Mutex::new(loaded))));
+            app.manage(ActivePipelines(Arc::new(Mutex::new(
+                std::collections::HashMap::new(),
+            ))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_initial_state,
             save_settings,
+            validate_provider_key,
+            reset_api_usage,
             create_project,
             update_project,
             delete_project,
             update_project_context,
             create_conversation,
             select_conversation,
+            rename_conversation,
+            cancel_prompt,
             delete_conversation,
             clear_conversation_context,
             update_conversation_context,

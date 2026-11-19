@@ -1,6 +1,60 @@
 export type ThemePreference = "system" | "dark" | "light";
 export type CodeDrawerMode = "review" | "artifact";
 export type AiderEditFormat = "auto" | "whole" | "diff";
+export type ProviderId =
+  | "ollama"
+  | "gemini"
+  | "openai"
+  | "anthropic"
+  | "deepseek"
+  | "openrouter"
+  | "mistral";
+export type ExternalProviderId = Exclude<ProviderId, "ollama">;
+export type AgentRoleKey =
+  | "architect"
+  | "cartographer"
+  | "designer"
+  | "coder"
+  | "refactoring"
+  | "tester"
+  | "synthesizer";
+
+export interface ProviderConfig {
+  id: ExternalProviderId | string;
+  name: string;
+  apiKey: string;
+  baseUrl?: string | null;
+  validated: boolean;
+  availableModels: string[];
+  dailyTokenLimit: number;
+}
+
+export interface AgentModelSlot {
+  provider: ProviderId | string;
+  model: string;
+}
+
+export interface AgentRoutingConfig {
+  architect: AgentModelSlot;
+  cartographer: AgentModelSlot;
+  designer: AgentModelSlot;
+  coder: AgentModelSlot;
+  refactoring: AgentModelSlot;
+  tester: AgentModelSlot;
+  synthesizer: AgentModelSlot;
+}
+
+export interface ProviderUsageEntry {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  calls: number;
+}
+
+export interface ApiUsageState {
+  date: string;
+  byProvider: Record<string, ProviderUsageEntry>;
+}
 
 export interface AppSettings {
   theme: ThemePreference;
@@ -10,6 +64,9 @@ export interface AppSettings {
   autoStartOllama: boolean;
   contextWindowTokens?: number;
   aiderEditFormat?: AiderEditFormat;
+  activeTarget?: string;
+  providers?: ProviderConfig[];
+  agentRouting?: AgentRoutingConfig;
 }
 
 export interface Project {
@@ -62,6 +119,21 @@ export interface ToolExecutionResult {
   path?: string | null;
 }
 
+export interface AgentTraceStep {
+  role: AgentRoleKey | string;
+  roleLabel: string;
+  provider: string;
+  model: string;
+  summary: string;
+  status: "running" | "done" | "fallback" | "error";
+  tokens?: number;
+}
+
+export interface AgentTraceEvent {
+  conversationId: string;
+  step: AgentTraceStep;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
@@ -73,6 +145,7 @@ export interface ChatMessage {
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  agentTrace?: AgentTraceStep[];
 }
 
 export interface Conversation {
@@ -115,6 +188,7 @@ export interface AppStateData {
   activeProjectId: string | null;
   activeConversationId: string | null;
   mcpServers?: McpServerConfig[];
+  apiUsage?: ApiUsageState;
 }
 
 export interface HardwareTelemetry {
@@ -133,6 +207,10 @@ export interface TokenUsageEvent {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  role?: AgentRoleKey | string;
+  provider?: string;
+  model?: string;
+  contextLimit?: number;
 }
 
 export interface PromptStageEvent {
