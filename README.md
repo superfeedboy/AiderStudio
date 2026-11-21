@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="src-tauri/icons/icon.png" alt="Logo AiderStudio" width="128" />
+<img src="src-tauri/icons/icon.png" alt="Logo &gt;AIx STUDIO" width="128" />
 
-<h1>AiderStudio</h1>
+<h1>&gt;AIx STUDIO</h1>
 
 <p><strong>IDE desktop de pair-programming IA doté d'un moteur natif Rust multi-agents, avec Ollama en local et fournisseurs cloud externes.</strong></p>
 
@@ -24,7 +24,7 @@
 
 ## Présentation
 
-**AiderStudio** est une application desktop native (**macOS Universal** et **Windows x64**) conçue pour le pair-programming assisté par IA. Elle embarque un **moteur d'exécution et d'édition de code 100 % natif en Rust** (zéro dépendance Python ou Aider CLI), une interface moderne en 3 volets, une orchestration multi-agents et un fonctionnement hybride combinant des modèles locaux via **[Ollama](https://ollama.com/)** et des fournisseurs cloud externes (**Gemini**, **OpenAI**, **Anthropic**, **DeepSeek**, **OpenRouter**, **Mistral**).
+**>AIx STUDIO** est une application desktop native (**macOS Universal** et **Windows x64**) conçue pour le pair-programming assisté par IA. Elle embarque un **moteur d'exécution et d'édition de code 100 % natif en Rust** (zéro dépendance Python ou Aider CLI), une interface moderne en 3 volets, une orchestration multi-agents et un fonctionnement hybride combinant des modèles locaux via **[Ollama](https://ollama.com/)** et des fournisseurs cloud externes (**Gemini**, **OpenAI**, **Anthropic**, **DeepSeek**, **OpenRouter**, **Mistral**).
 
 L'application est optimisée pour tirer le meilleur parti des modèles locaux à fenêtre de contexte contrainte (8K–16K) tout en permettant de déléguer certains rôles spécialisés à des modèles cloud lorsque c'est nécessaire.
 
@@ -54,7 +54,7 @@ L'application est optimisée pour tirer le meilleur parti des modèles locaux à
 
 ### Dépendances runtime
 
-**AiderStudio** est un binaire autonome qui ne nécessite plus Python ni Aider CLI. Seuls les outils suivants sont utilisés selon votre mode :
+**>AIx STUDIO** est un binaire autonome qui ne nécessite plus Python ni Aider CLI. Seuls les outils suivants sont utilisés selon votre mode :
 
 - **[Git](https://git-scm.com/)** : indispensable pour le suivi des diffs et les fonctions d'annulation (`Undo`).
 - **[Ollama](https://ollama.com/)** *(optionnel si vous utilisez uniquement des API cloud)* — [Téléchargement](https://ollama.com/download) · [Modèle Qwen2.5-Coder](https://ollama.com/library/qwen2.5-coder) · [Dépôt GitHub](https://github.com/ollama/ollama) : moteur d'inférence LLM local utilisé par défaut et comme repli.
@@ -69,13 +69,13 @@ npx tauri build  # Build du binaire et des installeurs (.dmg / .msi / .exe)
 
 ## Paramétrage et build de Qwen2.5-Coder 7B (`q5_K_M`) dans Ollama
 
-Le modèle local recommandé pour AiderStudio est **`qwen2.5-coder:7b-instruct-q5_K_M`** (~7,6B paramètres, quantification 5-bit `Q5_K_M`, ~5,4 Go).
+Le modèle local recommandé pour **>AIx STUDIO** est **`qwen2.5-coder:7b-instruct-q5_K_M`** (~7,6B paramètres, quantification 5-bit `Q5_K_M`, ~5,4 Go).
 
 > **Note sur le nom du tag Ollama :** dans le registre officiel Ollama, la quantification `Q5_K_M` utilise un tiret (`qwen2.5-coder:7b-instruct-q5_K_M`) et non un second `:` (`:5q_K_M`). Utilisez bien `qwen2.5-coder:7b-instruct-q5_K_M` dans vos commandes `ollama pull` et votre `Modelfile`.
 
 ### 1. Optimiser les variables d'environnement Ollama (Flash Attention & KV Cache)
 
-Comme documenté dans les paramètres d'AiderStudio, activer **Flash Attention** et la **quantification `q8_0` du KV Cache** permet de faire tenir une fenêtre de contexte **16K (`16384` tokens) à 100 % en VRAM** sur un GPU de 8 Go (ex. NVIDIA RTX 4060 Ti 8 Go) avec la version `q5_K_M` :
+Comme documenté dans les paramètres de **>AIx STUDIO**, activer **Flash Attention** et la **quantification `q8_0` du KV Cache** permet de faire tenir une fenêtre de contexte **16K (`16384` tokens) à 100 % en VRAM** sur un GPU de 8 Go (ex. NVIDIA RTX 4060 Ti 8 Go) avec la version `q5_K_M` :
 
 - **macOS (zsh / bash)** — définir les variables pour l'application GUI Ollama puis redémarrer Ollama :
 
@@ -127,7 +127,7 @@ PARAMETER repeat_penalty 1.05
 Depuis le répertoire contenant votre `Modelfile`, compilez l'image du modèle :
 
 ```bash
-ollama create qwen2.5-coder-7b-aider -f Modelfile
+ollama create qwen2.5-coder-7b-studio -f Modelfile
 ```
 
 ### 5. Vérifier le build et l'exécution GPU
@@ -135,10 +135,10 @@ ollama create qwen2.5-coder-7b-aider -f Modelfile
 ```bash
 # Lister les modèles installés et inspecter les paramètres compilés
 ollama list
-ollama show qwen2.5-coder-7b-aider
+ollama show qwen2.5-coder-7b-studio
 
 # Tester l'inférence
-ollama run qwen2.5-coder-7b-aider "Bonjour, confirme que tu es prêt."
+ollama run qwen2.5-coder-7b-studio "Bonjour, confirme que tu es prêt."
 ```
 
 Dans un second terminal (pendant ou juste après l'exécution), vérifiez la répartition mémoire et la taille de contexte active :
@@ -149,12 +149,12 @@ ollama ps
 
 Assurez-vous que la colonne **`PROCESSOR`** affiche **`100% GPU`** (sans débordement CPU) et que **`CONTEXT`** correspond bien à **`16384`** (ou **`8192`** selon votre profil).
 
-### 6. Configurer le modèle dans AiderStudio (`Paramètres → Général`)
+### 6. Configurer le modèle dans **>AIx STUDIO** (`Paramètres → Général`)
 
-Renseignez les champs suivants dans **Paramètres → Général** d'AiderStudio :
+Renseignez les champs suivants dans **Paramètres → Général** de **>AIx STUDIO** :
 
 - **URL API Ollama** : `http://127.0.0.1:11434`
-- **Modèle Ollama par défaut (local / repli)** : `qwen2.5-coder-7b-aider` (vous pouvez aussi sélectionner directement `qwen2.5-coder:7b-instruct-q5_K_M`, AiderStudio transmettant automatiquement `num_ctx` directement à Ollama via le moteur natif)
+- **Modèle Ollama par défaut (local / repli)** : `qwen2.5-coder-7b-studio` (vous pouvez aussi sélectionner directement `qwen2.5-coder:7b-instruct-q5_K_M`, **>AIx STUDIO** transmettant automatiquement `num_ctx` directement à Ollama via le moteur natif)
 - **Fenêtre de contexte cible Ollama (tokens)** : `16384` (`16K`) ou `8192` (`8K`), alignée sur la valeur `num_ctx` du `Modelfile`
 - **Format d'édition (Moteur natif)** : `Auto (8K)`
 - Cochez **Démarrer Ollama automatiquement si arrêté**
