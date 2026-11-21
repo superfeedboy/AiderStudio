@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AiderStudio",
+  "productName": "vAIx STUDIO",
   "version": "0.1.0",
-  "identifier": "com.aiderstudio.app",
+  "identifier": "com.vaixstudio.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1430",
@@ -12,12 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "AiderStudio",
+        "title": ">AIx STUDIO",
         "width": 1340,
         "height": 860,
         "minWidth": 900,
         "minHeight": 620,
-        "maximized": true
+        "maximized": true,
+        "backgroundColor": "#0b0f19"
       }
     ],
     "security": {

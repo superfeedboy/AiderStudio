@@ -256,6 +256,10 @@ pub struct ChatMessage {
     pub files_summary: Vec<FileChangeSummary>,
     #[serde(default)]
     pub agent_trace: Vec<AgentTraceStep>,
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    #[serde(default)]
+    pub commit_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +362,18 @@ pub struct PromptStageEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ToolApprovalRequestEvent {
+    pub request_id: String,
+    pub conversation_id: String,
+    pub tool: String,
+    pub title: String,
+    pub target: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StackStatus {
     pub native_engine_ready: bool,
     pub ollama_installed: bool,
@@ -371,4 +387,298 @@ pub struct StackStatus {
 pub struct SendPromptResult {
     pub conversation: Conversation,
     pub project: Project,
+}
+
+pub fn create_default_evolution_artifact(now: &str) -> ArtifactItem {
+    ArtifactItem {
+        id: "evolution-journal".to_string(),
+        title: "Journal d'évolution".to_string(),
+        language: "markdown".to_string(),
+        file_path: Some("CHANGELOG.md".to_string()),
+        content: "# 🚀 Journal d'évolution du projet\n\n*Recensement chronologique des fonctionnalités et modifications de code de la conversation.*\n".to_string(),
+        created_at: now.to_string(),
+    }
+}
+
+pub fn classify_modification_emote(role: &str, user_prompt: &str, file_paths: &[&str]) -> &'static str {
+    let p_low = user_prompt.to_lowercase();
+    let has_style_ext = file_paths.iter().any(|p| {
+        let low = p.to_lowercase();
+        low.ends_with(".css") || low.ends_with(".scss") || low.ends_with(".sass") || low.ends_with(".less")
+    });
+    let is_style_prompt = p_low.contains("style")
+        || p_low.contains("css")
+        || p_low.contains("couleur")
+        || p_low.contains("padding")
+        || p_low.contains("margin")
+        || p_low.contains("thème")
+        || p_low.contains("theme")
+        || p_low.contains("design")
+        || p_low.contains("ui")
+        || p_low.contains("halo")
+        || p_low.contains("logo")
+        || p_low.contains("palette")
+        || p_low.contains("police")
+        || p_low.contains("font")
+        || p_low.contains("layout")
+        || p_low.contains("visuel")
+        || p_low.contains("bouton")
+        || p_low.contains("bulle")
+        || p_low.contains("animation");
+
+    if role == "designer" || has_style_ext || is_style_prompt {
+        "🎨"
+    } else if role == "refactor"
+        || role == "debugger"
+        || file_paths.iter().any(|p| {
+            let low = p.to_lowercase();
+            low.ends_with(".json")
+                || low.ends_with(".toml")
+                || low.ends_with(".yaml")
+                || low.ends_with(".yml")
+                || low.ends_with(".sh")
+                || low.ends_with("cargo.toml")
+                || low.contains("config")
+        })
+        || p_low.contains("fix")
+        || p_low.contains("bug")
+        || p_low.contains("corrige")
+        || p_low.contains("erreur")
+        || p_low.contains("refactor")
+        || p_low.contains("optim")
+        || p_low.contains("perf")
+        || p_low.contains("mcp")
+        || p_low.contains("provider")
+        || p_low.contains("api")
+        || p_low.contains("config")
+        || p_low.contains("setup")
+        || p_low.contains("install")
+        || p_low.contains("tool")
+        || p_low.contains("test")
+        || p_low.contains("outil")
+        || p_low.contains("script")
+        || p_low.contains("package")
+    {
+        "🛠️"
+    } else {
+        "📦"
+    }
+}
+
+pub fn update_conversation_evolution_artifact(
+    conversation: &mut Conversation,
+    commit_id: &str,
+    assistant_msg_id: &str,
+    user_prompt: &str,
+    exec_role: &str,
+    file_paths: &[&str],
+    turn_added: usize,
+    turn_removed: usize,
+    commit_summary: &str,
+    now: &str,
+) {
+    let emote = classify_modification_emote(exec_role, user_prompt, file_paths);
+    let raw_title = user_prompt.lines().next().unwrap_or("Nouvelle fonctionnalité").trim();
+    let section_title = if raw_title.chars().count() > 75 {
+        let s: String = raw_title.chars().take(72).collect();
+        format!("{s}…")
+    } else {
+        raw_title.to_string()
+    };
+
+    let files_summary_str = if file_paths.is_empty() {
+        String::new()
+    } else if file_paths.len() == 1 {
+        let base = file_paths[0].split(['/', '\\']).last().unwrap_or(file_paths[0]);
+        format!("`{base}`")
+    } else {
+        let names: Vec<String> = file_paths
+            .iter()
+            .map(|p| {
+                let base = p.split(['/', '\\']).last().unwrap_or(*p);
+                format!("`{base}`")
+            })
+            .collect();
+        names.join(", ")
+    };
+
+    let commit_line = format!(
+        "- {} [{}](#msg-{}) {} : {} (+{}/-{})",
+        emote, commit_id, assistant_msg_id, files_summary_str, commit_summary, turn_added, turn_removed
+    );
+
+    if let Some(art) = conversation
+        .artifacts
+        .iter_mut()
+        .find(|a| a.id == "evolution-journal" || a.title == "Journal d'évolution")
+    {
+        // Éviter les doublons
+        let link_marker = format!("[{commit_id}](#msg-{assistant_msg_id})");
+        if art.content.contains(&link_marker) {
+            return;
+        }
+
+        let section_header = format!("## {section_title}");
+        if art.content.contains(&section_header) {
+            if let Some(pos) = art.content.find(&section_header) {
+                let rest_start = pos + section_header.len();
+                if let Some(newline_offset) = art.content[rest_start..].find('\n') {
+                    let insert_pos = rest_start + newline_offset + 1;
+                    art.content.insert_str(insert_pos, &format!("{}\n", commit_line));
+                } else {
+                    art.content.push_str(&format!("\n{}\n", commit_line));
+                }
+            } else {
+                art.content.push_str(&format!("\n{}\n", commit_line));
+            }
+        } else {
+            art.content.push_str(&format!("\n\n## {}\n{}\n", section_title, commit_line));
+        }
+        art.created_at = now.to_string();
+    } else {
+        let initial_content = format!(
+            "# 🚀 Journal d'évolution du projet\n\n*Recensement chronologique des fonctionnalités et modifications de code de la conversation.*\n\n## {}\n{}\n",
+            section_title, commit_line
+        );
+        conversation.artifacts.push(ArtifactItem {
+            id: "evolution-journal".to_string(),
+            title: "Journal d'évolution".to_string(),
+            language: "markdown".to_string(),
+            file_path: Some("CHANGELOG.md".to_string()),
+            content: initial_content,
+            created_at: now.to_string(),
+        });
+    }
+}
+
+pub fn backfill_conversation_evolution_artifact(conversation: &mut Conversation) {
+    let now = chrono::Utc::now().to_rfc3339();
+    if !conversation
+        .artifacts
+        .iter()
+        .any(|a| a.id == "evolution-journal" || a.title == "Journal d'évolution")
+    {
+        conversation.artifacts.push(create_default_evolution_artifact(&now));
+    }
+
+    let msgs = conversation.messages.clone();
+    for (i, msg) in msgs.iter().enumerate() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        if let Some(commit_id) = &msg.commit_id {
+            let mut user_prompt = String::new();
+            for prev in msgs[..i].iter().rev() {
+                if prev.role == "user" {
+                    user_prompt = prev.content.clone();
+                    break;
+                }
+            }
+            if user_prompt.is_empty() {
+                user_prompt = "Modification de code".to_string();
+            }
+
+            let file_paths: Vec<&str> = msg.files_summary.iter().map(|f| f.path.as_str()).collect();
+            let summary = msg.commit_summary.clone().unwrap_or_else(|| {
+                msg.stage_summary.clone().unwrap_or_else(|| "Modifications appliquées".to_string())
+            });
+
+            update_conversation_evolution_artifact(
+                conversation,
+                commit_id,
+                &msg.id,
+                &user_prompt,
+                "coder",
+                &file_paths,
+                msg.lines_added,
+                msg.lines_removed,
+                &summary,
+                &msg.created_at,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_modification_emote() {
+        assert_eq!(classify_modification_emote("designer", "change button background", &[]), "🎨");
+        assert_eq!(classify_modification_emote("coder", "ajoute du padding et refais le style", &[]), "🎨");
+        assert_eq!(classify_modification_emote("coder", "modifie styles", &["src/index.css"]), "🎨");
+        assert_eq!(classify_modification_emote("coder", "corrige le bug du parser", &[]), "🛠️");
+        assert_eq!(classify_modification_emote("coder", "met à jour la config cargo", &["Cargo.toml"]), "🛠️");
+        assert_eq!(classify_modification_emote("coder", "ajoute une nouvelle page d'accueil", &["src/Home.vue"]), "📦");
+    }
+
+    #[test]
+    fn test_evolution_artifact_creation_and_backfill() {
+        let mut conv = Conversation {
+            id: "conv-1".to_string(),
+            project_id: "proj-1".to_string(),
+            title: "Test".to_string(),
+            conversation_context: String::new(),
+            messages: vec![
+                ChatMessage {
+                    id: "u1".to_string(),
+                    role: "user".to_string(),
+                    content: "Ajoute le logo de l'app".to_string(),
+                    thinking: None,
+                    attachments: None,
+                    created_at: "2026-11-20T20:00:00Z".to_string(),
+                    stage_summary: None,
+                    files_changed: 1,
+                    lines_added: 12,
+                    lines_removed: 0,
+                    files_summary: vec![FileChangeSummary {
+                        path: "src/Logo.vue".to_string(),
+                        added: 12,
+                        removed: 0,
+                        modified: 0,
+                    }],
+                    agent_trace: vec![],
+                    commit_id: None,
+                    commit_summary: None,
+                },
+                ChatMessage {
+                    id: "a1".to_string(),
+                    role: "assistant".to_string(),
+                    content: "Logo ajouté avec succès.".to_string(),
+                    thinking: None,
+                    attachments: None,
+                    created_at: "2026-11-20T20:00:10Z".to_string(),
+                    stage_summary: Some("Ajout du composant Logo.vue".to_string()),
+                    files_changed: 1,
+                    lines_added: 12,
+                    lines_removed: 0,
+                    files_summary: vec![FileChangeSummary {
+                        path: "src/Logo.vue".to_string(),
+                        added: 12,
+                        removed: 0,
+                        modified: 0,
+                    }],
+                    agent_trace: vec![],
+                    commit_id: Some("vAIx #1".to_string()),
+                    commit_summary: Some("Ajout composant Logo".to_string()),
+                },
+            ],
+            artifacts: vec![],
+            modified_files: vec![],
+            lines_added: 12,
+            lines_removed: 0,
+            created_at: "2026-11-20T20:00:00Z".to_string(),
+            updated_at: "2026-11-20T20:00:10Z".to_string(),
+        };
+
+        backfill_conversation_evolution_artifact(&mut conv);
+
+        assert_eq!(conv.artifacts.len(), 1);
+        let art = &conv.artifacts[0];
+        assert_eq!(art.id, "evolution-journal");
+        assert_eq!(art.language, "markdown");
+        assert!(art.content.contains("## Ajoute le logo de l'app"));
+        assert!(art.content.contains("- 🎨 [vAIx #1](#msg-a1) `Logo.vue` : Ajout composant Logo (+12/-0)"));
+    }
 }

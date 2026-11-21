@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { resolveFileLinkTarget, type InlineToken, type ResolvedFileTarget } from "../utils/markdownInline";
+import { useStudioStore } from "../stores/studio";
 
 defineOptions({ name: "MarkdownInline" });
+
+const store = useStudioStore();
 
 const props = withDefaults(
   defineProps<{
@@ -23,6 +26,17 @@ const emit = defineEmits<{
 
 function isExternalHref(href: string): boolean {
   return /^https?:\/\//i.test(href.trim());
+}
+
+function isMessageLink(href: string): boolean {
+  return /^#msg-|^msg:|^#commit-/i.test(href.trim());
+}
+
+function handleMessageLinkClick(href: string) {
+  const msgId = href.replace(/^#msg-|^msg:|^#commit-/i, "").trim();
+  if (msgId) {
+    store.scrollToMessage(msgId);
+  }
 }
 
 function resolveLink(href: string) {
@@ -67,6 +81,15 @@ function formatCodeFileLabel(codeText: string, resolvedPath: string): string {
       >
         {{ tok.label }}
       </a>
+      <button
+        v-else-if="isMessageLink(tok.href)"
+        type="button"
+        class="md-commit-pill-btn"
+        :title="`Aller à la réponse associée (${tok.label})`"
+        @click.stop="handleMessageLinkClick(tok.href)"
+      >
+        <span class="commit-pill-tag">{{ tok.label }}</span>
+      </button>
       <button
         v-else-if="resolveLink(tok.href)"
         type="button"
@@ -170,5 +193,34 @@ function formatCodeFileLabel(codeText: string, resolvedPath: string): string {
   background: var(--hover-bg);
   border: 1px solid var(--border-subtle);
   color: var(--accent-2);
+}
+.md-commit-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  margin: 0 3px;
+  border-radius: 9999px;
+  background: rgba(99, 102, 241, 0.18);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  color: #a5b4fc;
+  font-size: 0.88em;
+  font-weight: 600;
+  font-family: var(--font-code);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  vertical-align: middle;
+}
+
+.md-commit-pill-btn:hover {
+  background: rgba(99, 102, 241, 0.32);
+  border-color: rgba(99, 102, 241, 0.7);
+  color: #ffffff;
+  transform: translateY(-0.5px);
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.35);
+}
+
+.md-commit-pill-btn:active {
+  transform: translateY(0);
 }
 </style>

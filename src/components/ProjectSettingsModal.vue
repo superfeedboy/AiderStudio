@@ -145,7 +145,7 @@ function handleDeleteProject() {
               </svg>
               <span class="path-text">{{ store.projectToEdit?.rootPath }}</span>
             </div>
-            <span class="field-hint">Dépôt Git suivi par AiderStudio et espace de création de vos fichiers.</span>
+            <span class="field-hint">Dépôt Git suivi par vAIx STUDIO et espace de création de vos fichiers.</span>
           </div>
 
           <!-- Optimization & .aiderignore status card -->
@@ -259,7 +259,7 @@ function handleDeleteProject() {
               <div>
                 <h4>Supprimer le projet de l'interface</h4>
                 <p>
-                  Cette action retire définitivement le projet « {{ store.projectToEdit?.name }} » ainsi que tout l'historique de ses conversations d'AiderStudio. Vos fichiers source sur le disque resteront intacts.
+                  Cette action retire définitivement le projet « {{ store.projectToEdit?.name }} » ainsi que tout l'historique de ses conversations de vAIx STUDIO. Vos fichiers source sur le disque resteront intacts.
                 </p>
               </div>
             </div>
@@ -273,7 +273,7 @@ function handleDeleteProject() {
             </div>
             <div v-else class="danger-confirm-row">
               <span class="danger-confirm-warning">
-                ⚠️ Confirmez-vous le retrait définitif de ce projet d'AiderStudio ?
+                ⚠️ Confirmez-vous le retrait définitif de ce projet de vAIx STUDIO ?
               </span>
               <div class="danger-btns">
                 <button class="btn-danger-action" @click="handleDeleteProject">

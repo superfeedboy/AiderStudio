@@ -11,9 +11,11 @@ pub fn default_providers() -> Vec<ProviderConfig> {
             base_url: None,
             validated: false,
             available_models: vec![
-                "gemini-2.5-pro".to_string(),
-                "gemini-2.5-flash".to_string(),
+                "gemini-3.8-flash".to_string(),
+                "gemini-3.8-pro".to_string(),
                 "gemini-2.0-flash".to_string(),
+                "gemini-2.5-flash".to_string(),
+                "gemini-2.5-pro".to_string(),
             ],
             daily_token_limit: 500_000,
         },
@@ -63,12 +65,43 @@ pub fn default_providers() -> Vec<ProviderConfig> {
             base_url: None,
             validated: false,
             available_models: vec![
+                "deepseek/deepseek-r1:free".to_string(),
+                "deepseek/deepseek-chat-v3-0324:free".to_string(),
+                "qwen/qwen3-coder:free".to_string(),
+                "google/gemini-2.0-flash-exp:free".to_string(),
                 "anthropic/claude-sonnet-4".to_string(),
                 "google/gemini-2.5-flash".to_string(),
                 "deepseek/deepseek-chat-v3-0324".to_string(),
                 "qwen/qwen-2.5-coder-32b-instruct".to_string(),
             ],
             daily_token_limit: 500_000,
+        },
+        ProviderConfig {
+            id: "groq".to_string(),
+            name: "Groq".to_string(),
+            api_key: String::new(),
+            base_url: None,
+            validated: false,
+            available_models: vec![
+                "llama-3.3-70b-versatile".to_string(),
+                "qwen/qwen3-32b".to_string(),
+                "moonshotai/kimi-k2-instruct".to_string(),
+                "llama-3.1-8b-instant".to_string(),
+            ],
+            daily_token_limit: 500_000,
+        },
+        ProviderConfig {
+            id: "cerebras".to_string(),
+            name: "Cerebras".to_string(),
+            api_key: String::new(),
+            base_url: None,
+            validated: false,
+            available_models: vec![
+                "qwen-3-235b-a22b".to_string(),
+                "llama-3.3-70b".to_string(),
+                "qwen-3-32b".to_string(),
+            ],
+            daily_token_limit: 1_000_000,
         },
         ProviderConfig {
             id: "mistral".to_string(),
@@ -119,6 +152,8 @@ pub fn resolve_model_context_limit(provider: &str, model: &str, settings: &AppSe
         "gemini" => 1_000_000,
         "anthropic" => 200_000,
         "deepseek" => 64_000,
+        "groq" => 8_192,
+        "cerebras" => 65_536,
         "mistral" => {
             if model.to_lowercase().contains("codestral") {
                 256_000
@@ -148,6 +183,20 @@ pub fn find_provider_key(settings: &AppSettings, provider_id: &str) -> Option<St
     })
 }
 
+pub fn map_gemini_model_alias(model: &str) -> String {
+    let low = model.to_lowercase();
+    if low == "gemini-2.5-flash" {
+        return "gemini-3.8-flash".to_string();
+    }
+    if low == "gemini-pro-latest" || low == "gemini-pro" {
+        return "gemini-2.5-pro".to_string();
+    }
+    if low == "gemini-flash" || low == "gemini-flash-latest" {
+        return "gemini-2.0-flash".to_string();
+    }
+    model.to_string()
+}
+
 fn clean_model_name(provider: &str, model: &str) -> String {
     let trimmed = model.trim();
     if provider == "ollama" {
@@ -156,6 +205,13 @@ fn clean_model_name(provider: &str, model: &str) -> String {
             .or_else(|| trimmed.strip_prefix("ollama/"))
             .unwrap_or(trimmed)
             .to_string();
+    }
+    if provider == "gemini" {
+        let bare = trimmed
+            .strip_prefix("gemini/")
+            .or_else(|| trimmed.strip_prefix("models/"))
+            .unwrap_or(trimmed);
+        return map_gemini_model_alias(bare);
     }
     let prefix = format!("{provider}/");
     trimmed.strip_prefix(&prefix).unwrap_or(trimmed).to_string()
@@ -391,6 +447,7 @@ pub async fn validate_provider_api_key(
                 .send()
                 .await
                 .map_err(|e| format!("Erreur récupération modèles OpenRouter : {e}"))?;
+            let mut free_models = Vec::new();
             let mut prioritized = Vec::new();
             let mut others = Vec::new();
             if models_resp.status().is_success() {
@@ -399,13 +456,14 @@ pub async fn validate_provider_api_key(
                         for item in arr {
                             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                                 let lower = id.to_lowercase();
-                                let priority = lower.starts_with("anthropic/claude")
+                                if lower.ends_with(":free") {
+                                    free_models.push(id.to_string());
+                                } else if lower.starts_with("anthropic/claude")
                                     || lower.starts_with("google/gemini")
                                     || lower.starts_with("openai/gpt")
                                     || lower.starts_with("deepseek/")
                                     || lower.starts_with("qwen/")
-                                    || lower.ends_with(":free");
-                                if priority {
+                                {
                                     prioritized.push(id.to_string());
                                 } else {
                                     others.push(id.to_string());
@@ -415,9 +473,91 @@ pub async fn validate_provider_api_key(
                     }
                 }
             }
-            prioritized.extend(others);
-            prioritized.truncate(30);
-            prioritized
+            free_models.sort();
+            free_models.extend(prioritized);
+            free_models.extend(others);
+            free_models.truncate(45);
+            free_models
+        }
+        "groq" => {
+            let base = custom_base
+                .as_deref()
+                .unwrap_or("https://api.groq.com/openai/v1");
+            let url = format!("{base}/models");
+            let resp = client
+                .get(url)
+                .bearer_auth(key)
+                .send()
+                .await
+                .map_err(|e| format!("Erreur réseau Groq : {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Clé API Groq refusée (HTTP {})", resp.status().as_u16()));
+            }
+            let json: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Réponse Groq invalide : {e}"))?;
+            let excluded = ["whisper", "tts", "guard", "prompt-guard", "safeguard", "orpheus"];
+            let mut list: Vec<String> = json
+                .get("data")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let id = item.get("id")?.as_str()?;
+                            let low = id.to_lowercase();
+                            if excluded.iter().any(|k| low.contains(k)) {
+                                None
+                            } else {
+                                Some(id.to_string())
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            list.sort();
+            list.truncate(25);
+            list
+        }
+        "cerebras" => {
+            let base = custom_base
+                .as_deref()
+                .unwrap_or("https://api.cerebras.ai/v1");
+            let url = format!("{base}/models");
+            let resp = client
+                .get(url)
+                .bearer_auth(key)
+                .send()
+                .await
+                .map_err(|e| format!("Erreur réseau Cerebras : {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Clé API Cerebras refusée (HTTP {})", resp.status().as_u16()));
+            }
+            let json: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Réponse Cerebras invalide : {e}"))?;
+            let excluded = ["whisper", "tts", "guard"];
+            let mut list: Vec<String> = json
+                .get("data")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let id = item.get("id")?.as_str()?;
+                            let low = id.to_lowercase();
+                            if excluded.iter().any(|k| low.contains(k)) {
+                                None
+                            } else {
+                                Some(id.to_string())
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            list.sort();
+            list.truncate(25);
+            list
         }
         "mistral" => {
             let base = custom_base
@@ -652,8 +792,10 @@ pub async fn call_provider_oneshot(
     max_tokens: usize,
     temperature: f32,
 ) -> anyhow::Result<(String, usize, usize)> {
+    let timeout_secs = if provider == "ollama" { 300 } else { 90 };
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;
 
     let clean_model = clean_model_name(provider, model);
@@ -792,37 +934,61 @@ pub async fn call_provider_oneshot(
                 .unwrap_or(0) as usize;
             Ok((text, p_tok, c_tok))
         }
-        "openai" | "deepseek" | "openrouter" | "mistral" => {
+        "openai" | "deepseek" | "openrouter" | "mistral" | "groq" | "cerebras" => {
             let default_base = match provider {
                 "openai" => "https://api.openai.com/v1",
                 "deepseek" => "https://api.deepseek.com/v1",
                 "openrouter" => "https://openrouter.ai/api/v1",
                 "mistral" => "https://api.mistral.ai/v1",
+                "groq" => "https://api.groq.com/openai/v1",
+                "cerebras" => "https://api.cerebras.ai/v1",
                 _ => "https://api.openai.com/v1",
             };
             let base = custom_base.unwrap_or(default_base);
             let url = format!("{base}/chat/completions");
             let reasoning = is_reasoning_model(provider, &clean_model);
+            let capped_tokens = if provider == "groq" {
+                max_tokens.min(2048)
+            } else {
+                max_tokens
+            };
+            let (sys_content, usr_content) = if provider == "groq" {
+                let max_sys = 12_000;
+                let max_usr = 8_000;
+                let s = if system_prompt.len() > max_sys {
+                    format!("{}... [tronqué pour Groq]", &system_prompt[..max_sys])
+                } else {
+                    system_prompt.to_string()
+                };
+                let u = if user_prompt.len() > max_usr {
+                    format!("{}... [tronqué pour Groq]", &user_prompt[..max_usr])
+                } else {
+                    user_prompt.to_string()
+                };
+                (s, u)
+            } else {
+                (system_prompt.to_string(), user_prompt.to_string())
+            };
             let mut body = serde_json::json!({
                 "model": clean_model,
                 "messages": [
-                    { "role": if reasoning { "developer" } else { "system" }, "content": system_prompt },
-                    { "role": "user", "content": user_prompt }
+                    { "role": if reasoning { "developer" } else { "system" }, "content": sys_content },
+                    { "role": "user", "content": usr_content }
                 ]
             });
             if let Some(obj) = body.as_object_mut() {
                 if reasoning {
-                    obj.insert("max_completion_tokens".to_string(), Value::from(max_tokens.max(1024)));
+                    obj.insert("max_completion_tokens".to_string(), Value::from(capped_tokens.max(512)));
                 } else {
-                    obj.insert("max_tokens".to_string(), Value::from(max_tokens));
+                    obj.insert("max_tokens".to_string(), Value::from(capped_tokens.max(512)));
                     obj.insert("temperature".to_string(), Value::from(temperature));
                 }
             }
             let mut req = client.post(url).bearer_auth(key).json(&body);
             if provider == "openrouter" {
                 req = req
-                    .header("HTTP-Referer", "https://aiderstudio.local")
-                    .header("X-Title", "AiderStudio");
+                    .header("HTTP-Referer", "https://vaixstudio.local")
+                    .header("X-Title", "vAIx STUDIO");
             }
             let resp = req.send().await?;
             if !resp.status().is_success() {
@@ -903,6 +1069,7 @@ pub struct LlmRequestOptions {
     pub max_tokens: usize,
     pub temperature: f32,
     pub enable_cache: bool,
+    pub tools: Option<Vec<Value>>,
 }
 
 impl Default for LlmRequestOptions {
@@ -911,6 +1078,7 @@ impl Default for LlmRequestOptions {
             max_tokens: 8192,
             temperature: 0.2,
             enable_cache: true,
+            tools: None,
         }
     }
 }
@@ -921,6 +1089,13 @@ pub enum StreamDelta {
     Content(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LlmStreamResult {
     pub content: String,
@@ -929,6 +1104,7 @@ pub struct LlmStreamResult {
     pub completion_tokens: usize,
     pub cache_read_tokens: usize,
     pub finish_reason: Option<String>,
+    pub tool_calls: Vec<NativeToolCall>,
 }
 
 /// Tampon octet par octet pour découper des lignes sans jamais couper un caractère UTF-8 multi-octets.
@@ -1085,6 +1261,42 @@ fn normalize_finish_reason(raw: &str) -> String {
     }
 }
 
+fn truncate_messages_for_small_context(api_msgs: &mut Vec<Value>, max_total_chars: usize) {
+    let mut total_chars: usize = api_msgs
+        .iter()
+        .map(|m| {
+            if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                s.len()
+            } else {
+                0
+            }
+        })
+        .sum();
+
+    if total_chars <= max_total_chars || api_msgs.len() <= 2 {
+        return;
+    }
+
+    let mut i = 1;
+    while i < api_msgs.len().saturating_sub(1) && total_chars > max_total_chars {
+        if let Some(content) = api_msgs[i].get_mut("content") {
+            if let Some(s) = content.as_str() {
+                let s_len = s.len();
+                if s_len > 300 {
+                    let truncated = format!("{}... [historique tronqué pour respecter la limite du modèle]", &s[..250]);
+                    total_chars = total_chars.saturating_sub(s_len).saturating_add(truncated.len());
+                    *content = Value::String(truncated);
+                } else {
+                    total_chars = total_chars.saturating_sub(s_len);
+                    api_msgs.remove(i);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 pub fn build_openai_stream_payload(
     provider: &str,
     clean_model: &str,
@@ -1127,6 +1339,10 @@ pub fn build_openai_stream_payload(
         }
     }
 
+    if provider == "groq" {
+        truncate_messages_for_small_context(&mut api_msgs, 20_000);
+    }
+
     let mut body = serde_json::json!({
         "model": clean_model,
         "stream": true,
@@ -1134,15 +1350,20 @@ pub fn build_openai_stream_payload(
     });
 
     if let Some(obj) = body.as_object_mut() {
+        let capped_tokens = if provider == "groq" {
+            options.max_tokens.min(2048)
+        } else {
+            options.max_tokens
+        };
         if reasoning {
             obj.insert(
                 "max_completion_tokens".to_string(),
-                Value::from(options.max_tokens.max(1024)),
+                Value::from(capped_tokens.max(512)),
             );
         } else {
             obj.insert(
                 "max_tokens".to_string(),
-                Value::from(options.max_tokens.max(1024)),
+                Value::from(capped_tokens.max(512)),
             );
             obj.insert("temperature".to_string(), Value::from(options.temperature));
         }
@@ -1151,6 +1372,12 @@ pub fn build_openai_stream_payload(
                 "stream_options".to_string(),
                 serde_json::json!({ "include_usage": true }),
             );
+        }
+        if let Some(tools) = &options.tools {
+            if !tools.is_empty() {
+                obj.insert("tools".to_string(), Value::Array(tools.clone()));
+                obj.insert("tool_choice".to_string(), Value::from("auto"));
+            }
         }
     }
 
@@ -1240,6 +1467,49 @@ pub fn build_anthropic_stream_payload(
     body
 }
 
+fn strip_additional_properties(val: &Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let mut clean = serde_json::Map::new();
+            for (k, v) in map {
+                if k == "additionalProperties" {
+                    continue;
+                }
+                clean.insert(k.clone(), strip_additional_properties(v));
+            }
+            Value::Object(clean)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(strip_additional_properties).collect()),
+        other => other.clone(),
+    }
+}
+
+fn to_gemini_function_declarations(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|t| {
+            let fn_obj = t.get("function").unwrap_or(t);
+            let name = fn_obj.get("name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let desc = fn_obj
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let params = fn_obj
+                .get("parameters")
+                .map(strip_additional_properties)
+                .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+            Some(serde_json::json!({
+                "name": name,
+                "description": desc,
+                "parameters": params
+            }))
+        })
+        .collect()
+}
+
 pub fn build_gemini_stream_payload(
     messages: &[LlmMessage],
     options: &LlmRequestOptions,
@@ -1290,6 +1560,15 @@ pub fn build_gemini_stream_payload(
             }),
         );
     }
+    if let Some(tools) = &options.tools {
+        let decls = to_gemini_function_declarations(tools);
+        if !decls.is_empty() {
+            body.as_object_mut().unwrap().insert(
+                "tools".to_string(),
+                serde_json::json!([{ "functionDeclarations": decls }]),
+            );
+        }
+    }
     body
 }
 
@@ -1301,6 +1580,8 @@ struct StreamAccumulator {
     completion_tokens: usize,
     cache_read_tokens: usize,
     finish_reason: Option<String>,
+    pending_tool_calls: std::collections::BTreeMap<usize, (String, String, String)>,
+    ready_tool_calls: Vec<NativeToolCall>,
 }
 
 impl StreamAccumulator {
@@ -1320,6 +1601,24 @@ impl StreamAccumulator {
 
     fn into_result(self) -> LlmStreamResult {
         let trimmed_think = self.thinking.trim().to_string();
+        let mut tool_calls = self.ready_tool_calls;
+        for (_, (id, name, raw_args)) in self.pending_tool_calls {
+            let clean_name = name.trim();
+            if clean_name.is_empty() {
+                continue;
+            }
+            let args_trimmed = raw_args.trim();
+            let arguments = if args_trimmed.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str::<Value>(args_trimmed).unwrap_or_else(|_| serde_json::json!({}))
+            };
+            tool_calls.push(NativeToolCall {
+                id,
+                name: clean_name.to_string(),
+                arguments,
+            });
+        }
         LlmStreamResult {
             content: self.content.trim().to_string(),
             thinking: if trimmed_think.is_empty() {
@@ -1331,6 +1630,7 @@ impl StreamAccumulator {
             completion_tokens: self.completion_tokens,
             cache_read_tokens: self.cache_read_tokens,
             finish_reason: self.finish_reason,
+            tool_calls,
         }
     }
 }
@@ -1387,6 +1687,27 @@ fn process_openai_sse_data<F: FnMut(StreamDelta)>(
             {
                 if !rc.is_empty() {
                     acc.emit(StreamDelta::Thinking(rc.to_string()), on_delta);
+                }
+            }
+            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                for tc in tcs {
+                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let entry = acc.pending_tool_calls.entry(idx).or_default();
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() {
+                            entry.0 = id.to_string();
+                        }
+                    }
+                    if let Some(func) = tc.get("function") {
+                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                            if !name.is_empty() {
+                                entry.1.push_str(name);
+                            }
+                        }
+                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                            entry.2.push_str(args);
+                        }
+                    }
                 }
             }
             if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
@@ -1518,6 +1839,23 @@ fn process_gemini_sse_data<F: FnMut(StreamDelta)>(
             .and_then(|p| p.as_array())
         {
             for part in parts {
+                if let Some(fc) = part.get("functionCall") {
+                    if let Some(name) = fc.get("name").and_then(|v| v.as_str()) {
+                        let clean_name = name.trim();
+                        if !clean_name.is_empty() {
+                            let args = fc
+                                .get("args")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            acc.ready_tool_calls.push(NativeToolCall {
+                                id: String::new(),
+                                name: clean_name.to_string(),
+                                arguments: args,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 let Some(text) = part.get("text").and_then(|t| t.as_str()) else {
                     continue;
                 };
@@ -1553,7 +1891,40 @@ fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504 | 529)
 }
 
-/// Appel unifié multi-tours en streaming SSE / NDJSON pour les 7 fournisseurs avec retry et annulation.
+fn extract_ollama_tool_calls(msg: &Value, acc: &mut StreamAccumulator) {
+    if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+        for tc in tcs {
+            let func = tc.get("function").unwrap_or(tc);
+            let name = func
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if name.is_empty() {
+                continue;
+            }
+            let raw_args = func.get("arguments");
+            let arguments = match raw_args {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s.trim())
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                Some(v) if !v.is_null() => v.clone(),
+                _ => serde_json::json!({}),
+            };
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            acc.ready_tool_calls.push(NativeToolCall {
+                id,
+                name: name.to_string(),
+                arguments,
+            });
+        }
+    }
+}
+
+/// Appel unifié multi-tours en streaming SSE / NDJSON pour tous les fournisseurs avec retry, tools natifs et annulation.
 pub async fn call_provider_streaming<F>(
     provider: &str,
     model: &str,
@@ -1575,9 +1946,17 @@ where
         anyhow::bail!("Modèle vide pour le fournisseur {provider}");
     }
 
+    let timeout_secs = if provider == "ollama" { 600 } else { 180 };
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;
+
+    let mut include_tools = options
+        .tools
+        .as_ref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
 
     if provider == "ollama" {
         let url = format!("{}/api/chat", settings.ollama_url.trim_end_matches('/'));
@@ -1601,28 +1980,52 @@ where
                 obj
             })
             .collect();
-        let payload = serde_json::json!({
-            "model": clean_model,
-            "stream": true,
-            "messages": api_msgs,
-            "options": {
-                "num_ctx": effective_ollama_num_ctx(settings),
-                "num_predict": options.max_tokens.max(1024),
-                "temperature": options.temperature
-            }
-        });
 
-        let mut resp = tokio::select! {
-            biased;
-            _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
-            res = client.post(url).json(&payload).send() => res?,
-        };
-        if !resp.status().is_success() {
-            let st = resp.status();
-            let err_txt = resp.text().await.unwrap_or_default();
+        let mut resp = None;
+        for _attempt in 0..2 {
+            let mut payload = serde_json::json!({
+                "model": clean_model,
+                "stream": true,
+                "messages": api_msgs,
+                "options": {
+                    "num_ctx": effective_ollama_num_ctx(settings),
+                    "num_predict": options.max_tokens.max(1024),
+                    "temperature": options.temperature
+                }
+            });
+            if include_tools {
+                if let Some(tools) = &options.tools {
+                    if !tools.is_empty() {
+                        payload
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("tools".to_string(), Value::Array(tools.clone()));
+                    }
+                }
+            }
+
+            let candidate_resp = tokio::select! {
+                biased;
+                _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                res = client.post(&url).json(&payload).send() => res?,
+            };
+            if candidate_resp.status().is_success() {
+                resp = Some(candidate_resp);
+                break;
+            }
+            let st = candidate_resp.status();
+            let err_txt = candidate_resp.text().await.unwrap_or_default();
+            if st.as_u16() == 400
+                && include_tools
+                && err_txt.to_lowercase().contains("tool")
+            {
+                include_tools = false;
+                continue;
+            }
             let clean = extract_api_error_message(&err_txt).unwrap_or(err_txt);
             anyhow::bail!("Ollama HTTP {st} : {clean}");
         }
+        let mut resp = resp.ok_or_else(|| anyhow::anyhow!("Ollama : aucune réponse reçue."))?;
 
         let mut line_buf = ByteLineBuffer::default();
         let mut splitter = ThinkStreamSplitter::default();
@@ -1649,6 +2052,7 @@ where
                                 acc.emit(StreamDelta::Thinking(th.to_string()), &mut on_delta);
                             }
                         }
+                        extract_ollama_tool_calls(msg, &mut acc);
                         if let Some(delta) = msg.get("content").and_then(|v| v.as_str()) {
                             for d in splitter.push(delta) {
                                 acc.emit(d, &mut on_delta);
@@ -1674,13 +2078,12 @@ where
         if let Some(last) = line_buf.flush() {
             let t = last.trim();
             if let Ok(parsed) = serde_json::from_str::<Value>(t) {
-                if let Some(delta) = parsed
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|v| v.as_str())
-                {
-                    for d in splitter.push(delta) {
-                        acc.emit(d, &mut on_delta);
+                if let Some(msg) = parsed.get("message") {
+                    extract_ollama_tool_calls(msg, &mut acc);
+                    if let Some(delta) = msg.get("content").and_then(|v| v.as_str()) {
+                        for d in splitter.push(delta) {
+                            acc.emit(d, &mut on_delta);
+                        }
                     }
                 }
             }
@@ -1711,7 +2114,12 @@ where
                 let base =
                     custom_base.unwrap_or("https://generativelanguage.googleapis.com/v1beta");
                 let url = format!("{base}/models/{clean_model}:streamGenerateContent?alt=sse&key={key}");
-                let body = build_gemini_stream_payload(messages, options);
+                let mut body = build_gemini_stream_payload(messages, options);
+                if !include_tools {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove("tools");
+                    }
+                }
                 tokio::select! {
                     biased;
                     _ = wait_stream_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
@@ -1733,28 +2141,36 @@ where
                         .send() => res,
                 }
             }
-            "openai" | "deepseek" | "openrouter" | "mistral" => {
+            "openai" | "deepseek" | "openrouter" | "mistral" | "groq" | "cerebras" => {
                 let default_base = match provider {
                     "openai" => "https://api.openai.com/v1",
                     "deepseek" => "https://api.deepseek.com/v1",
                     "openrouter" => "https://openrouter.ai/api/v1",
                     "mistral" => "https://api.mistral.ai/v1",
+                    "groq" => "https://api.groq.com/openai/v1",
+                    "cerebras" => "https://api.cerebras.ai/v1",
                     _ => "https://api.openai.com/v1",
                 };
                 let base = custom_base.unwrap_or(default_base);
                 let url = format!("{base}/chat/completions");
-                let body = build_openai_stream_payload(
+                let mut body = build_openai_stream_payload(
                     provider,
                     &clean_model,
                     messages,
                     options,
                     include_stream_options,
                 );
+                if !include_tools {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove("tools");
+                        obj.remove("tool_choice");
+                    }
+                }
                 let mut req = client.post(url).bearer_auth(&key).json(&body);
                 if provider == "openrouter" {
                     req = req
-                        .header("HTTP-Referer", "https://aiderstudio.local")
-                        .header("X-Title", "AiderStudio");
+                        .header("HTTP-Referer", "https://vaixstudio.local")
+                        .header("X-Title", "vAIx STUDIO");
                 }
                 tokio::select! {
                     biased;
@@ -1785,17 +2201,32 @@ where
             let status = resp.status();
             let code = status.as_u16();
             let err_txt = resp.text().await.unwrap_or_default();
+            let err_low = err_txt.to_lowercase();
 
-            // Repli transparent si le fournisseur OpenAI-compatible refuse `stream_options`
+            // Repli transparent si le fournisseur refuse `stream_options`
             if code == 400
                 && include_stream_options
-                && err_txt.to_lowercase().contains("stream_options")
+                && err_low.contains("stream_options")
             {
                 include_stream_options = false;
                 continue;
             }
 
-            if is_retryable_status(code) && attempt < 2 {
+            // Repli transparent si le modèle/fournisseur refuse le schema `tools`
+            if code == 400
+                && include_tools
+                && (err_low.contains("tool") || err_low.contains("function"))
+            {
+                include_tools = false;
+                continue;
+            }
+
+            let should_retry = if code == 429 {
+                attempt == 0
+            } else {
+                is_retryable_status(code) && attempt < 2
+            };
+            if should_retry {
                 let delay = std::time::Duration::from_secs(backoff_secs[attempt]);
                 tokio::select! {
                     biased;
@@ -1898,6 +2329,231 @@ where
     anyhow::bail!("Échec de l'appel en streaming vers {provider}:{model} après tentatives.")
 }
 
+pub fn is_quota_or_fallback_error(err_msg: &str) -> bool {
+    if err_msg.contains("CANCELLED_BY_USER") {
+        return false;
+    }
+    let low = err_msg.to_lowercase();
+    let markers = [
+        "429",
+        "too many requests",
+        "resource_exhausted",
+        "quota",
+        "rate limit",
+        "rate_limit",
+        "402",
+        "insufficient_quota",
+        "insufficient balance",
+        "billing",
+        "credits",
+        "503",
+        "overloaded",
+        "capacity",
+        "temporarily unavailable",
+        "clé api absente",
+        "service indisponible",
+        "reduce the length",
+        "context_length_exceeded",
+        "maximum context length",
+        "max_tokens must be less than",
+        "not available",
+        "not found",
+        "404",
+        "no longer available",
+        "invalid_request_error",
+    ];
+    markers.iter().any(|m| low.contains(m))
+}
+
+fn pick_preferred_model_for_fallback(cfg: &ProviderConfig) -> Option<String> {
+    if cfg.id == "openrouter" {
+        if let Some(free_mdl) = cfg
+            .available_models
+            .iter()
+            .find(|m| m.to_lowercase().ends_with(":free") && !m.trim().is_empty())
+        {
+            return Some(free_mdl.clone());
+        }
+    }
+    cfg.available_models
+        .iter()
+        .find(|m| !m.trim().is_empty())
+        .cloned()
+        .or_else(|| default_models_for(&cfg.id).into_iter().next())
+}
+
+pub fn build_fallback_candidates(
+    primary_provider: &str,
+    primary_model: &str,
+    role: &str,
+    settings: &AppSettings,
+    ollama_running: bool,
+) -> Vec<(String, String)> {
+    let mut out = vec![(primary_provider.to_string(), primary_model.to_string())];
+
+    let priority: &[&str] = match role {
+        "architect" | "designer" => &[
+            "gemini",
+            "openrouter",
+            "cerebras",
+            "deepseek",
+            "groq",
+            "anthropic",
+            "openai",
+            "mistral",
+        ],
+        _ => &[
+            "openrouter",
+            "groq",
+            "cerebras",
+            "gemini",
+            "deepseek",
+            "openai",
+            "anthropic",
+            "mistral",
+        ],
+    };
+
+    let mut external_added = 0usize;
+    for &pid in priority {
+        if pid == primary_provider || external_added >= 3 {
+            continue;
+        }
+        if let Some(cfg) = find_provider_config(settings, pid) {
+            if cfg.validated && !cfg.api_key.trim().is_empty() {
+                if let Some(mdl) = pick_preferred_model_for_fallback(cfg) {
+                    out.push((pid.to_string(), mdl));
+                    external_added += 1;
+                }
+            }
+        }
+    }
+
+    if primary_provider != "ollama" && ollama_running {
+        let ol_model = settings.ollama_model.trim();
+        if !ol_model.is_empty() {
+            out.push(("ollama".to_string(), ol_model.to_string()));
+        }
+    }
+
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn call_provider_oneshot_with_fallback(
+    primary_provider: &str,
+    primary_model: &str,
+    role: &str,
+    ollama_running: bool,
+    settings: &AppSettings,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+) -> anyhow::Result<(String, usize, usize, String, String, Option<String>)> {
+    let candidates =
+        build_fallback_candidates(primary_provider, primary_model, role, settings, ollama_running);
+    let mut first_err_reason: Option<String> = None;
+
+    for (idx, (prov, mdl)) in candidates.iter().enumerate() {
+        match call_provider_oneshot(
+            prov,
+            mdl,
+            settings,
+            system_prompt,
+            user_prompt,
+            max_tokens,
+            temperature,
+        )
+        .await
+        {
+            Ok((text, p_tok, c_tok)) => {
+                let fb_reason = if idx > 0 { first_err_reason.clone() } else { None };
+                return Ok((text, p_tok, c_tok, prov.clone(), mdl.clone(), fb_reason));
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if first_err_reason.is_none() {
+                    first_err_reason = Some(err_str.clone());
+                }
+                if idx + 1 < candidates.len() && is_quota_or_fallback_error(&err_str) {
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    anyhow::bail!("Aucun fournisseur disponible pour '{primary_provider}:{primary_model}'.")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_chat_completion_with_fallback<F, G>(
+    primary_provider: &str,
+    primary_model: &str,
+    role: &str,
+    ollama_running: bool,
+    settings: &AppSettings,
+    messages: &[LlmMessage],
+    options: &LlmRequestOptions,
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    mut on_delta: F,
+    mut on_fallback: G,
+) -> anyhow::Result<(LlmStreamResult, String, String, Option<String>)>
+where
+    F: FnMut(StreamDelta),
+    G: FnMut(&str, &str, &str, &str, &str),
+{
+    let candidates =
+        build_fallback_candidates(primary_provider, primary_model, role, settings, ollama_running);
+    let mut first_err_reason: Option<String> = None;
+
+    for (idx, (prov, mdl)) in candidates.iter().enumerate() {
+        if idx > 0 {
+            let reason_preview = first_err_reason.as_deref().unwrap_or("quota/indisponible");
+            let prev = &candidates[idx - 1];
+            on_fallback(&prev.0, &prev.1, prov, mdl, reason_preview);
+        }
+
+        let mut emitted_any = false;
+        let res = call_provider_streaming(
+            prov,
+            mdl,
+            settings,
+            messages,
+            options,
+            cancel_rx,
+            |delta| {
+                emitted_any = true;
+                on_delta(delta);
+            },
+        )
+        .await;
+
+        match res {
+            Ok(stream_res) => {
+                let fb_reason = if idx > 0 { first_err_reason.clone() } else { None };
+                return Ok((stream_res, prov.clone(), mdl.clone(), fb_reason));
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if first_err_reason.is_none() {
+                    first_err_reason = Some(err_str.clone());
+                }
+                if !emitted_any
+                    && idx + 1 < candidates.len()
+                    && is_quota_or_fallback_error(&err_str)
+                {
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    anyhow::bail!("Aucun fournisseur disponible pour '{primary_provider}:{primary_model}'.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1952,6 +2608,7 @@ mod tests {
             max_tokens: 4096,
             temperature: 0.2,
             enable_cache: true,
+            tools: None,
         };
         let o4_payload = build_openai_stream_payload("openai", "o4-mini", &msgs, &opts, true);
         assert!(o4_payload.get("max_completion_tokens").is_some());
@@ -2059,6 +2716,8 @@ mod tests {
         assert_eq!(resolve_model_context_limit("anthropic", "claude-sonnet-4", &s), 200_000);
         assert_eq!(resolve_model_context_limit("openai", "gpt-4.1", &s), 128_000);
         assert_eq!(resolve_model_context_limit("deepseek", "deepseek-chat", &s), 64_000);
+        assert_eq!(resolve_model_context_limit("groq", "llama-3.3-70b-versatile", &s), 8_192);
+        assert_eq!(resolve_model_context_limit("cerebras", "qwen-3-235b-a22b", &s), 65_536);
         assert_eq!(resolve_model_context_limit("mistral", "codestral-latest", &s), 256_000);
     }
 
@@ -2074,12 +2733,14 @@ mod tests {
             daily_token_limit: 900_000,
         }];
         let merged = merge_with_default_providers(&saved);
-        assert_eq!(merged.len(), 6);
+        assert_eq!(merged.len(), 8);
         let gem = merged.iter().find(|p| p.id == "gemini").unwrap();
         assert_eq!(gem.api_key, "AIza-secret");
         assert!(gem.validated);
         assert_eq!(gem.daily_token_limit, 900_000);
         assert!(merged.iter().any(|p| p.id == "openrouter" && !p.validated));
+        assert!(merged.iter().any(|p| p.id == "groq" && !p.validated));
+        assert!(merged.iter().any(|p| p.id == "cerebras" && !p.validated));
     }
 
     #[test]
@@ -2122,5 +2783,70 @@ mod tests {
         let truncated = r#"Retrying in 0.2 seconds... litellm.ServiceUnavailableError: Vertex_ai_betaException - b'{\n "error": {\n"#;
         let msg = extract_api_error_message(truncated).unwrap();
         assert!(msg.contains("503"));
+    }
+
+    #[test]
+    fn test_is_quota_or_fallback_error() {
+        assert!(is_quota_or_fallback_error("gemini HTTP 429 Too Many Requests : RESOURCE_EXHAUSTED"));
+        assert!(is_quota_or_fallback_error("openrouter HTTP 402 : Insufficient credits"));
+        assert!(is_quota_or_fallback_error("groq HTTP 503 : Service overloaded"));
+        assert!(!is_quota_or_fallback_error("CANCELLED_BY_USER"));
+        assert!(!is_quota_or_fallback_error("JSON syntax error at line 3"));
+    }
+
+    #[test]
+    fn test_build_fallback_candidates_prefers_free_and_ollama() {
+        let mut s = AppSettings::default();
+        s.ollama_model = "qwen2.5-coder:7b".to_string();
+        for p in &mut s.providers {
+            if matches!(
+                p.id.as_str(),
+                "gemini" | "openrouter" | "groq" | "cerebras" | "mistral"
+            ) {
+                p.validated = true;
+                p.api_key = format!("key-{}", p.id);
+            }
+            if p.id == "openrouter" {
+                p.available_models = vec![
+                    "anthropic/claude-sonnet-4".to_string(),
+                    "qwen/qwen3-coder:free".to_string(),
+                ];
+            }
+        }
+        let cands = build_fallback_candidates("gemini", "gemini-2.5-pro", "coder", &s, true);
+        assert_eq!(cands[0], ("gemini".to_string(), "gemini-2.5-pro".to_string()));
+        assert_eq!(cands[1], ("openrouter".to_string(), "qwen/qwen3-coder:free".to_string()));
+        assert_eq!(cands[2].0, "groq");
+        assert_eq!(cands[3].0, "cerebras");
+        assert!(!cands.iter().any(|(p, _)| p == "mistral"));
+        assert_eq!(cands.last().unwrap(), &("ollama".to_string(), "qwen2.5-coder:7b".to_string()));
+    }
+
+    #[test]
+    fn test_openai_sse_tool_calls_streaming() {
+        let mut sp = ThinkStreamSplitter::default();
+        let mut acc = StreamAccumulator::default();
+        process_openai_sse_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_","arguments":"{\"path\":\"src/"}}]}}]}"#,
+            &mut sp,
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        process_openai_sse_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"App.vue\",\"start_line\":10,\"end_line\":20}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut sp,
+            &mut acc,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(process_openai_sse_data("[DONE]", &mut sp, &mut acc, &mut |_| {}).unwrap());
+        let res = acc.into_result();
+        assert_eq!(res.tool_calls.len(), 1);
+        assert_eq!(res.tool_calls[0].id, "call_1");
+        assert_eq!(res.tool_calls[0].name, "read_file");
+        assert_eq!(res.tool_calls[0].arguments["path"], "src/App.vue");
+        assert_eq!(res.tool_calls[0].arguments["start_line"], 10);
+        assert_eq!(res.tool_calls[0].arguments["end_line"], 20);
     }
 }

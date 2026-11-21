@@ -335,9 +335,18 @@ pub fn extract_file_signatures(rel_path: &str, content: &str) -> Vec<String> {
         .next()
         .unwrap_or("")
         .to_lowercase();
+    let base_low = rel_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(rel_path)
+        .to_lowercase();
 
     let mut sigs = Vec::new();
-    let max_sigs = 16usize;
+    let max_sigs = if matches!(ext.as_str(), "css" | "scss") {
+        8usize
+    } else {
+        16usize
+    };
 
     for raw_line in content.lines() {
         if sigs.len() >= max_sigs {
@@ -378,7 +387,10 @@ pub fn extract_file_signatures(rel_path: &str, content: &str) -> Vec<String> {
                         && (t.contains("=>") || t.contains("defineStore")))
             }
             "vue" => {
-                t.starts_with("defineProps")
+                t.starts_with("import ")
+                    || t.starts_with("export default")
+                    || t.starts_with("<style")
+                    || t.starts_with("defineProps")
                     || t.starts_with("defineEmits")
                     || t.starts_with("function ")
                     || t.starts_with("async function ")
@@ -388,6 +400,36 @@ pub fn extract_file_signatures(rel_path: &str, content: &str) -> Vec<String> {
                         && (t.contains("= ref")
                             || t.contains("= computed")
                             || t.contains("=>")))
+            }
+            "css" | "scss" => {
+                t.starts_with("@import")
+                    || t.starts_with("@tailwind")
+                    || t.starts_with(":root")
+                    || ((t.starts_with('.')
+                        || t.starts_with('#')
+                        || t.starts_with("html")
+                        || t.starts_with("body"))
+                        && t.contains('{'))
+            }
+            "html" => {
+                t.starts_with("<title") || t.starts_with("<link ") || t.starts_with("<script ")
+            }
+            "json" if base_low == "package.json" => {
+                t.starts_with("\"name\":")
+                    || [
+                        "\"vue\"",
+                        "\"react\"",
+                        "\"svelte\"",
+                        "\"next\"",
+                        "\"nuxt\"",
+                        "\"vite\"",
+                        "\"tailwindcss\"",
+                        "\"@tailwindcss/vite\"",
+                        "\"@tailwindcss/postcss\"",
+                        "\"postcss\"",
+                    ]
+                    .iter()
+                    .any(|dep| t.contains(dep))
             }
             "py" => {
                 !t.starts_with('#')
@@ -706,5 +748,37 @@ export function normalizePath(p: string): string { return p; }
         assert!(filtered.contains("Aucun résultat"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_signatures_frontend_files() {
+        let vue_src = "<script setup>\nimport Sidebar from './components/Sidebar.vue';\nconst open = ref(true);\nexport default {}\n</script>\n<style scoped>\n.app { display: flex; }\n</style>";
+        let vue_sigs = extract_file_signatures("src/App.vue", vue_src);
+        assert!(vue_sigs.iter().any(|s| s.contains("import Sidebar")));
+        assert!(vue_sigs.iter().any(|s| s.contains("const open = ref(true);")));
+        assert!(vue_sigs.iter().any(|s| s.contains("export default")));
+        assert!(vue_sigs.iter().any(|s| s.contains("<style scoped>")));
+
+        let css_src = "@import \"tailwindcss\";\n:root {\n  --bg: #111;\n}\nbody {\n  margin: 0;\n}\n.sidebar {\n  width: 170px;\n}\n";
+        let css_sigs = extract_file_signatures("src/index.css", css_src);
+        assert!(css_sigs.iter().any(|s| s.contains("@import \"tailwindcss\"")));
+        assert!(css_sigs.iter().any(|s| s.contains(":root")));
+        assert!(css_sigs.iter().any(|s| s.contains("body")));
+        assert!(css_sigs.iter().any(|s| s.contains(".sidebar")));
+
+        let html_src = "<html><head>\n<title>Minou AI</title>\n<link rel=\"stylesheet\" href=\"/style.css\">\n</head><body>\n<script type=\"module\" src=\"/src/main.js\"></script>\n</body></html>";
+        let html_sigs = extract_file_signatures("index.html", html_src);
+        assert_eq!(html_sigs.len(), 3);
+
+        let pkg_src = "{\n  \"name\": \"minou-ai\",\n  \"dependencies\": {\n    \"vue\": \"^3.5.0\",\n    \"lodash\": \"^4.17.21\"\n  },\n  \"devDependencies\": {\n    \"vite\": \"^6.0.0\",\n    \"tailwindcss\": \"^4.0.0\"\n  }\n}\n";
+        let pkg_sigs = extract_file_signatures("package.json", pkg_src);
+        assert!(pkg_sigs.iter().any(|s| s.contains("\"name\": \"minou-ai\"")));
+        assert!(pkg_sigs.iter().any(|s| s.contains("\"vue\"")));
+        assert!(pkg_sigs.iter().any(|s| s.contains("\"vite\"")));
+        assert!(pkg_sigs.iter().any(|s| s.contains("\"tailwindcss\"")));
+        assert!(!pkg_sigs.iter().any(|s| s.contains("\"lodash\"")));
+
+        let other_json = "{ \"vue\": true }\n";
+        assert!(extract_file_signatures("tsconfig.json", other_json).is_empty());
     }
 }

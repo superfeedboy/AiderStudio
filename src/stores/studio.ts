@@ -22,6 +22,7 @@ import type {
   StackStatus,
   ThemePreference,
   TokenUsageEvent,
+  ToolApprovalRequest,
   ToolExecutionResult,
 } from "../types/studio";
 
@@ -37,9 +38,11 @@ export function defaultProvidersList(): ProviderConfig[] {
       baseUrl: null,
       validated: false,
       availableModels: [
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
+        "gemini-3.8-flash",
+        "gemini-3.8-pro",
         "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
       ],
       dailyTokenLimit: 500000,
     },
@@ -81,10 +84,41 @@ export function defaultProvidersList(): ProviderConfig[] {
       baseUrl: null,
       validated: false,
       availableModels: [
+        "deepseek/deepseek-r1:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "qwen/qwen3-coder:free",
+        "google/gemini-2.0-flash-exp:free",
         "anthropic/claude-sonnet-4",
         "google/gemini-2.5-flash",
         "deepseek/deepseek-chat-v3-0324",
         "qwen/qwen-2.5-coder-32b-instruct",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "groq",
+      name: "Groq",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+        "moonshotai/kimi-k2-instruct",
+        "llama-3.1-8b-instant",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "cerebras",
+      name: "Cerebras",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "qwen-3-235b-a22b",
+        "llama-3.3-70b",
+        "qwen-3-32b",
       ],
       dailyTokenLimit: 500000,
     },
@@ -161,6 +195,7 @@ export const useStudioStore = defineStore("studio", () => {
   const activeDiffFilePath = ref<string | null>(null);
   const activeDiffTargetLine = ref<number | null>(null);
   const activeArtifactId = ref<string | null>(null);
+  const targetScrollMsgId = ref<string>("");
 
   // Screen aspect ratio & ultra-wide 50/50 detection (ratio > standard 16:9, e.g. ratio >= 2.05 & width >= 1550)
   const isWideScreen = ref<boolean>(false);
@@ -200,6 +235,7 @@ export const useStudioStore = defineStore("studio", () => {
   const liveThinking = ref<string>("");
   const liveContent = ref<string>("");
   const liveAgentTrace = ref<AgentTraceStep[]>([]);
+  const pendingToolApprovals = ref<ToolApprovalRequest[]>([]);
 
   // System dark/light tracking
   const systemPrefersLight = ref<boolean>(
@@ -403,6 +439,8 @@ export const useStudioStore = defineStore("studio", () => {
       anthropic: "Claude",
       deepseek: "DeepSeek",
       openrouter: "OpenRouter",
+      groq: "Groq",
+      cerebras: "Cerebras",
       mistral: "Mistral",
     };
     return {
@@ -571,6 +609,22 @@ export const useStudioStore = defineStore("studio", () => {
         }
       });
 
+      await listen<ToolApprovalRequest>("aider:tool_approval_request", (event) => {
+        const req = event.payload;
+        if (!req || !req.requestId) return;
+        if (!pendingToolApprovals.value.some((item) => item.requestId === req.requestId)) {
+          pendingToolApprovals.value = [...pendingToolApprovals.value, req];
+        }
+      });
+
+      await listen<[string, boolean]>("aider:tool_approval_resolved", (event) => {
+        const [requestId] = event.payload || [];
+        if (!requestId) return;
+        pendingToolApprovals.value = pendingToolApprovals.value.filter(
+          (item) => item.requestId !== requestId
+        );
+      });
+
       await Promise.all([refreshTelemetry(), refreshStackStatus()]);
 
       telemetryTimer = window.setInterval(() => {
@@ -586,7 +640,7 @@ export const useStudioStore = defineStore("studio", () => {
         projects: [
           {
             id: pid,
-            name: "AiderStudio",
+            name: "vAIx STUDIO",
             rootPath: "/Users/gilles/Documents/Dev/AiderStudio",
             globalContext:
               "Application Tauri v2 + Vue 3 + Rust avec moteur natif multi-agents (Ollama & fournisseurs cloud).",
@@ -1064,6 +1118,19 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
+  async function resolveToolApproval(requestId: string, approved: boolean) {
+    pendingToolApprovals.value = pendingToolApprovals.value.filter(
+      (item) => item.requestId !== requestId
+    );
+    if (isTauri()) {
+      try {
+        await invoke("resolve_tool_approval", { requestId, approved });
+      } catch {
+        // Ignore if request already expired or pipeline cancelled
+      }
+    }
+  }
+
   async function sendPrompt(prompt: string, attachments?: AttachedFile[]) {
     const conv = activeConversation.value;
     const hasAttachments = Boolean(attachments && attachments.length > 0);
@@ -1083,6 +1150,9 @@ export const useStudioStore = defineStore("studio", () => {
     isProcessing.value = true;
     isCancelling.value = false;
     processingConversationId.value = conv.id;
+    pendingToolApprovals.value = pendingToolApprovals.value.filter(
+      (item) => item.conversationId !== conv.id
+    );
     const nextPeak = { ...conversationPeakTokens.value };
     delete nextPeak[conv.id];
     conversationPeakTokens.value = nextPeak;
@@ -1141,6 +1211,9 @@ export const useStudioStore = defineStore("studio", () => {
       isCancelling.value = false;
       processingConversationId.value = null;
       liveAgentTrace.value = [];
+      pendingToolApprovals.value = pendingToolApprovals.value.filter(
+        (item) => item.conversationId !== conv.id
+      );
       void refreshStackStatus();
     }
   }
@@ -1263,6 +1336,13 @@ export const useStudioStore = defineStore("studio", () => {
       activeArtifactId.value = activeConversation.value.artifacts[0].id;
     }
     codeOpen.value = true;
+  }
+
+  function scrollToMessage(msgId: string) {
+    targetScrollMsgId.value = msgId;
+    if (!isWideScreen.value) {
+      codeOpen.value = false;
+    }
   }
 
   async function clearGlobalContext(projectId: string) {
@@ -1405,6 +1485,8 @@ export const useStudioStore = defineStore("studio", () => {
     liveThinking,
     liveContent,
     liveAgentTrace,
+    pendingToolApprovals,
+    resolveToolApproval,
     listProjectFiles,
     executeTool,
     effectiveTheme,
@@ -1440,6 +1522,8 @@ export const useStudioStore = defineStore("studio", () => {
     undoAll,
     openReview,
     openArtifact,
+    scrollToMessage,
+    targetScrollMsgId,
     closeCode,
     saveMcpServer,
     deleteMcpServer,

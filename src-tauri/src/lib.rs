@@ -7,6 +7,7 @@ mod providers;
 mod repo_map;
 mod storage;
 mod telemetry;
+mod tools;
 
 use chrono::Utc;
 use models::{
@@ -144,7 +145,7 @@ async fn create_project(
         title: "Nouvelle session".to_string(),
         conversation_context: String::new(),
         messages: Vec::new(),
-        artifacts: Vec::new(),
+        artifacts: vec![models::create_default_evolution_artifact(&now)],
         modified_files: Vec::new(),
         lines_added: 0,
         lines_removed: 0,
@@ -234,7 +235,7 @@ async fn create_conversation(
             .unwrap_or_else(|| "Nouvelle session".to_string()),
         conversation_context: String::new(),
         messages: Vec::new(),
-        artifacts: Vec::new(),
+        artifacts: vec![models::create_default_evolution_artifact(&now)],
         modified_files: Vec::new(),
         lines_added: 0,
         lines_removed: 0,
@@ -459,6 +460,16 @@ async fn execute_local_tool(
         &arguments,
     )
     .await
+}
+
+#[tauri::command]
+async fn resolve_tool_approval(
+    app: AppHandle,
+    approvals: State<'_, tools::approval::PendingToolApprovals>,
+    request_id: String,
+    approved: bool,
+) -> Result<bool, String> {
+    Ok(tools::approval::resolve_and_emit(&approvals, &app, &request_id, approved).await)
 }
 
 #[tauri::command]
@@ -800,6 +811,7 @@ pub fn run() {
             app.manage(ActivePipelines(Arc::new(Mutex::new(
                 std::collections::HashMap::new(),
             ))));
+            app.manage(tools::approval::PendingToolApprovals::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -828,6 +840,7 @@ pub fn run() {
             pick_project_directory,
             list_project_files,
             execute_local_tool,
+            resolve_tool_approval,
             get_mcp_servers,
             save_mcp_server,
             delete_mcp_server,

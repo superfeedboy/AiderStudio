@@ -8,6 +8,8 @@ export type ProviderId =
   | "anthropic"
   | "deepseek"
   | "openrouter"
+  | "groq"
+  | "cerebras"
   | "mistral";
 export type ExternalProviderId = Exclude<ProviderId, "ollama">;
 export type AgentRoleKey =
@@ -153,6 +155,8 @@ export interface ChatMessage {
   linesRemoved?: number;
   filesSummary?: FileChangeSummary[];
   agentTrace?: AgentTraceStep[];
+  commitId?: string;
+  commitSummary?: string;
 }
 
 export interface Conversation {
@@ -227,6 +231,15 @@ export interface PromptStageEvent {
   stageLabel: string;
   detail: string;
   status: "running" | "done" | "error";
+}
+
+export interface ToolApprovalRequest {
+  requestId: string;
+  conversationId: string;
+  tool: string;
+  title: string;
+  target: string;
+  reason?: string | null;
 }
 
 export interface StackStatus {

@@ -55,6 +55,7 @@ const providerFeedback = ref<
 
 const expandedAgentRole = ref<AgentRoleKey | null>(null);
 const agentModelSearch = ref("");
+const noCostPresetFeedback = ref("");
 
 const providerBrandColors: Record<string, string> = {
   ollama: "#10b981",
@@ -63,6 +64,8 @@ const providerBrandColors: Record<string, string> = {
   anthropic: "#f59e0b",
   deepseek: "#06b6d4",
   openrouter: "#a855f7",
+  groq: "#f43f5e",
+  cerebras: "#ec4899",
   mistral: "#f97316",
 };
 
@@ -73,8 +76,12 @@ const providerShortNames: Record<string, string> = {
   anthropic: "Claude",
   deepseek: "DeepSeek",
   openrouter: "OpenRouter",
+  groq: "Groq",
+  cerebras: "Cerebras",
   mistral: "Mistral",
 };
+
+const freeTierProviderIds = new Set(["gemini", "openrouter", "groq", "cerebras"]);
 
 function agentProviderColor(providerId: string): string {
   return providerBrandColors[providerId] || "#94a3b8";
@@ -91,6 +98,7 @@ watch(
   (open) => {
     expandedAgentRole.value = null;
     agentModelSearch.value = "";
+    noCostPresetFeedback.value = "";
     if (open) {
       Object.assign(draft, {
         ...store.settings,
@@ -224,6 +232,81 @@ function selectAgentModel(role: AgentRoleKey, model: string) {
   agentModelSearch.value = "";
 }
 
+function pickFreeModel(provId: string, preferredSubstrings: string[]): string {
+  const cfg = (draft.providers ?? []).find((p) => p.id === provId);
+  if (!cfg || !cfg.validated || cfg.apiKey.trim().length === 0) return "";
+  const pool =
+    provId === "openrouter"
+      ? (cfg.availableModels ?? []).filter((m) =>
+          m.toLowerCase().endsWith(":free")
+        )
+      : (cfg.availableModels ?? []);
+  if (pool.length === 0) return "";
+  for (const sub of preferredSubstrings) {
+    const lowSub = sub.toLowerCase();
+    const match = pool.find((m) => m.toLowerCase().includes(lowSub));
+    if (match) return match;
+  }
+  return pool[0] ?? "";
+}
+
+function assignFirstAvailableFreeSlot(
+  candidates: { prov: string; prefs: string[] }[]
+): AgentModelSlot {
+  for (const c of candidates) {
+    const mdl = pickFreeModel(c.prov, c.prefs);
+    if (mdl) {
+      return { provider: c.prov, model: mdl };
+    }
+  }
+  return { provider: "ollama", model: "" };
+}
+
+function applyNoCostPreset() {
+  if (!draft.agentRouting) {
+    draft.agentRouting = defaultAgentRouting();
+  }
+  draft.agentRouting.architect = assignFirstAvailableFreeSlot([
+    { prov: "gemini", prefs: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.0-flash", "gemini-2.5-flash"] },
+    { prov: "openrouter", prefs: ["deepseek-r1:free", ":free"] },
+    { prov: "cerebras", prefs: ["qwen-3-235b", "llama-3.3-70b"] },
+    { prov: "groq", prefs: ["qwen3-32b", "llama-3.3-70b"] },
+  ]);
+  draft.agentRouting.designer = assignFirstAvailableFreeSlot([
+    { prov: "gemini", prefs: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.0-flash", "gemini-2.5-flash"] },
+    { prov: "openrouter", prefs: ["deepseek-chat", "qwen3-coder", ":free"] },
+    { prov: "cerebras", prefs: ["qwen-3-235b", "qwen-3-32b"] },
+    { prov: "groq", prefs: ["llama-3.3-70b", "qwen3-32b"] },
+  ]);
+  draft.agentRouting.coder = assignFirstAvailableFreeSlot([
+    { prov: "openrouter", prefs: ["qwen3-coder:free", "deepseek-chat", ":free"] },
+    { prov: "cerebras", prefs: ["qwen-3-235b", "qwen-3-32b"] },
+    { prov: "groq", prefs: ["qwen3-32b", "llama-3.3-70b"] },
+    { prov: "gemini", prefs: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.0-flash", "gemini-2.5-flash"] },
+  ]);
+  draft.agentRouting.refactoring = { ...draft.agentRouting.coder };
+
+  const fastFreeCandidates = [
+    { prov: "groq", prefs: ["llama-3.3-70b", "qwen3-32b", "llama-3.1-8b"] },
+    { prov: "cerebras", prefs: ["llama-3.3-70b", "qwen-3-32b"] },
+  ];
+  draft.agentRouting.cartographer = assignFirstAvailableFreeSlot(fastFreeCandidates);
+  draft.agentRouting.tester = assignFirstAvailableFreeSlot(fastFreeCandidates);
+  draft.agentRouting.synthesizer = assignFirstAvailableFreeSlot(fastFreeCandidates);
+
+  const usedFreeProviders = new Set(
+    Object.values(draft.agentRouting)
+      .map((s) => s.provider)
+      .filter((p) => freeTierProviderIds.has(p))
+  );
+  if (usedFreeProviders.size > 0) {
+    noCostPresetFeedback.value = `Préréglage appliqué (${usedFreeProviders.size} fournisseur(s) gratuit(s) actif(s) + repli Ollama local). Cliquez sur Enregistrer.`;
+  } else {
+    noCostPresetFeedback.value =
+      "Aucun fournisseur gratuit validé détecté : tous les rôles restent sur Ollama local. Validez Gemini, OpenRouter (:free), Groq ou Cerebras dans Fournisseurs.";
+  }
+}
+
 function formatLimitLabel(limit: number): string {
   if (limit >= 1_000_000) return `${(limit / 1_000_000).toFixed(limit % 1_000_000 === 0 ? 0 : 1)}M`;
   if (limit >= 1000) return `${Math.round(limit / 1000)}K`;
@@ -307,7 +390,7 @@ const agentRoles: {
   >
     <div class="modal-card halo-hud">
       <div class="modal-header">
-        <h2>Paramètres AiderStudio</h2>
+        <h2>Paramètres vAIx STUDIO</h2>
         <button class="close-x" @click="store.settingsOpen = false">✕</button>
       </div>
 
@@ -493,6 +576,13 @@ const agentRoles: {
               <div class="provider-title-wrap">
                 <span class="provider-name">{{ p.name }}</span>
                 <span class="provider-id-tag">{{ p.id }}</span>
+                <span
+                  v-if="freeTierProviderIds.has(p.id)"
+                  class="free-tier-badge"
+                  title="Fournisseur proposant un tier gratuit ou des modèles :free"
+                >
+                  Tier gratuit
+                </span>
               </div>
               <span
                 class="probe-status-tag"
@@ -608,6 +698,22 @@ const agentRoles: {
         <p class="tab-intro">
           Assignez un fournisseur et un modèle précis à chaque sous-agent pour le mode <strong>Agent</strong>. Cliquez sur un sous-agent pour personnaliser son moteur.
         </p>
+
+        <div class="agents-toolbar">
+          <span class="agents-fallback-hint">
+            En cas d'erreur quota/HTTP 429, le moteur bascule automatiquement entre vos fournisseurs validés vers Ollama local.
+          </span>
+          <button
+            type="button"
+            class="no-cost-preset-btn"
+            @click="applyNoCostPreset"
+          >
+            ⚡ Préréglage No-Cost
+          </button>
+        </div>
+        <div v-if="noCostPresetFeedback" class="no-cost-feedback">
+          {{ noCostPresetFeedback }}
+        </div>
 
         <div class="agents-list">
           <div
@@ -1568,5 +1674,56 @@ const agentRoles: {
 
 .agent-custom-input:focus {
   border-color: var(--accent);
+}
+
+.free-tier-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(16, 185, 129, 0.14);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.28);
+}
+
+.agents-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--border-subtle);
+  background: var(--hover-bg);
+}
+
+.agents-fallback-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.no-cost-preset-btn {
+  flex-shrink: 0;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  background: rgba(16, 185, 129, 0.14);
+  color: #10b981;
+  border-radius: 8px;
+  padding: 6px 11px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.no-cost-preset-btn:hover {
+  background: rgba(16, 185, 129, 0.22);
+  border-color: #10b981;
+}
+
+.no-cost-feedback {
+  font-size: 11px;
+  color: #10b981;
+  padding: 0 2px;
 }
 </style>

@@ -2,6 +2,8 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { useStudioStore } from "../stores/studio";
 import type { DiffLine } from "../types/studio";
+import MarkdownInline from "./MarkdownInline.vue";
+import { tokenizeInline, type ResolvedFileTarget } from "../utils/markdownInline";
 
 const props = defineProps<{
   isResizing: boolean;
@@ -13,7 +15,20 @@ const diffViewerRef = ref<HTMLElement | null>(null);
 
 const conv = computed(() => store.activeConversation);
 const modifiedFiles = computed(() => conv.value?.modifiedFiles ?? []);
-const artifacts = computed(() => conv.value?.artifacts ?? []);
+
+function isRealArtifact(art: { filePath?: string | null; title?: string; language?: string }): boolean {
+  const p = (art.filePath || art.title || "").toLowerCase();
+  if (/\.(vue|ts|tsx|js|jsx|rs|css|scss|html|json|py|toml|yaml|yml|sh|bash|sql)$/.test(p)) {
+    return false;
+  }
+  const lang = (art.language || "").toLowerCase();
+  if (["rust", "rs", "typescript", "ts", "javascript", "js", "vue", "python", "py", "css", "scss", "html", "json", "sh", "bash"].includes(lang)) {
+    return false;
+  }
+  return true;
+}
+
+const artifacts = computed(() => (conv.value?.artifacts ?? []).filter(isRealArtifact));
 
 const selectedFile = computed(() => {
   if (!modifiedFiles.value.length) return null;
@@ -37,8 +52,26 @@ const selectedArtifact = computed(() => {
   );
 });
 
+const diffAvailablePaths = computed(() => modifiedFiles.value.map((f) => f.path));
+
+const isMarkdownArtifact = computed(() => {
+  if (!selectedArtifact.value) return false;
+  const t = selectedArtifact.value.title.toLowerCase();
+  const l = selectedArtifact.value.language.toLowerCase();
+  const f = (selectedArtifact.value.filePath || "").toLowerCase();
+  return (
+    t.endsWith(".md") ||
+    t.endsWith(".markdown") ||
+    f.endsWith(".md") ||
+    f.endsWith(".markdown") ||
+    l === "markdown" ||
+    l === "md"
+  );
+});
+
 const isPreviewRenderable = computed(() => {
   if (!selectedArtifact.value) return false;
+  if (isMarkdownArtifact.value) return true;
   const t = selectedArtifact.value.title.toLowerCase();
   const l = selectedArtifact.value.language.toLowerCase();
   const c = selectedArtifact.value.content.trim().toLowerCase();
@@ -53,6 +86,128 @@ const isPreviewRenderable = computed(() => {
     c.startsWith("<svg")
   );
 });
+
+interface MarkdownBlock {
+  type: "h1" | "h2" | "h3" | "h4" | "p" | "ul" | "code" | "hr";
+  content?: string;
+  items?: string[];
+  lang?: string;
+}
+
+const parsedMarkdownBlocks = computed<MarkdownBlock[]>(() => {
+  if (!selectedArtifact.value) return [];
+  const lines = selectedArtifact.value.content.split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let inCodeBlock = false;
+  let codeBuffer: string[] = [];
+  let codeLang = "";
+  let listBuffer: string[] = [];
+  let pBuffer: string[] = [];
+
+  function flushList() {
+    if (listBuffer.length > 0) {
+      blocks.push({ type: "ul", items: [...listBuffer] });
+      listBuffer = [];
+    }
+  }
+
+  function flushParagraph() {
+    if (pBuffer.length > 0) {
+      blocks.push({ type: "p", content: pBuffer.join(" ") });
+      pBuffer = [];
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const line = rawLine.trim();
+
+    if (line.startsWith("```")) {
+      flushParagraph();
+      flushList();
+      if (!inCodeBlock) {
+        inCodeBlock = true;
+        codeLang = line.slice(3).trim();
+        codeBuffer = [];
+      } else {
+        inCodeBlock = false;
+        blocks.push({ type: "code", content: codeBuffer.join("\n"), lang: codeLang });
+        codeBuffer = [];
+        codeLang = "";
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeBuffer.push(rawLine);
+      continue;
+    }
+
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    if (line === "---" || line === "***") {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "hr" });
+      continue;
+    }
+
+    if (line.startsWith("# ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h1", content: line.slice(2).trim() });
+      continue;
+    }
+
+    if (line.startsWith("## ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h2", content: line.slice(3).trim() });
+      continue;
+    }
+
+    if (line.startsWith("### ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h3", content: line.slice(4).trim() });
+      continue;
+    }
+
+    if (line.startsWith("#### ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h4", content: line.slice(5).trim() });
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      flushParagraph();
+      listBuffer.push(line.replace(/^[-*]\s+/, ""));
+      continue;
+    }
+
+    flushList();
+    pBuffer.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+  if (inCodeBlock && codeBuffer.length > 0) {
+    blocks.push({ type: "code", content: codeBuffer.join("\n"), lang: codeLang });
+  }
+
+  return blocks;
+});
+
+function handleOpenFileFromArtifact(target: ResolvedFileTarget) {
+  store.codeMode = "review";
+  store.activeDiffFilePath = target.path;
+  store.codeOpen = true;
+}
 
 const isSvg = computed(() => {
   if (!selectedArtifact.value) return false;
@@ -374,12 +529,71 @@ watch(
             </div>
           </div>
 
-          <!-- Rendu interprété (ex: HTML, SVG) -->
+          <!-- Rendu interprété (ex: HTML, SVG, Markdown) -->
           <div
             v-if="isPreviewRenderable && artifactRenderMode === 'preview'"
             class="artifact-preview-container"
           >
             <div v-if="isSvg" class="rendered-svg-wrap" v-html="selectedArtifact.content" />
+            <div
+              v-else-if="isMarkdownArtifact"
+              class="artifact-markdown-view custom-scroll"
+            >
+              <template v-for="(block, bIdx) in parsedMarkdownBlocks" :key="bIdx">
+                <h1 v-if="block.type === 'h1'" class="art-h1">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h1>
+                <h2 v-else-if="block.type === 'h2'" class="art-h2">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h2>
+                <h3 v-else-if="block.type === 'h3'" class="art-h3">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h3>
+                <h4 v-else-if="block.type === 'h4'" class="art-h4">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h4>
+                <ul v-else-if="block.type === 'ul'" class="art-ul">
+                  <li v-for="(item, iIdx) in block.items" :key="iIdx" class="art-li">
+                    <MarkdownInline
+                      :tokens="tokenizeInline(item)"
+                      :available-paths="diffAvailablePaths"
+                      :project-root="store.activeProject?.rootPath"
+                      @open-file="handleOpenFileFromArtifact"
+                    />
+                  </li>
+                </ul>
+                <pre v-else-if="block.type === 'code'" class="art-code-block"><code>{{ block.content }}</code></pre>
+                <hr v-else-if="block.type === 'hr'" class="art-hr" />
+                <p v-else-if="block.type === 'p'" class="art-p">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </p>
+              </template>
+            </div>
             <iframe
               v-else
               class="rendered-html-iframe"
@@ -832,7 +1046,7 @@ watch(
   min-height: 0;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: #ffffff;
+  background: var(--surface-base, #0f172a);
   overflow: hidden;
   display: flex;
 }
@@ -885,5 +1099,91 @@ watch(
   font-family: var(--font-code), ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12.5px;
   line-height: 1.5;
+}
+
+/* Vue interprétée Markdown pour les artefacts (Journal d'évolution, etc.) */
+.artifact-markdown-view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  background: var(--surface-base, #0f172a);
+  color: #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.art-h1 {
+  font-size: 18px;
+  font-weight: 700;
+  color: #ffffff;
+  margin: 0 0 4px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.art-h2 {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: #f1f5f9;
+  margin: 12px 0 2px 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.art-h3 {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #cbd5e1;
+  margin: 6px 0 2px 0;
+}
+
+.art-h4 {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #94a3b8;
+  margin: 4px 0 2px 0;
+}
+
+.art-p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #cbd5e1;
+}
+
+.art-ul {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.art-li {
+  font-size: 13px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+
+.art-code-block {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: var(--font-code);
+  font-size: 12px;
+  color: #e2e8f0;
+  overflow-x: auto;
+  margin: 4px 0;
+}
+
+.art-hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  margin: 10px 0;
 }
 </style>

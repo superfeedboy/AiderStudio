@@ -34,6 +34,34 @@ watch(
   }
 );
 
+watch(
+  () => store.targetScrollMsgId,
+  (msgId) => {
+    if (msgId) {
+      scrollToMessage(msgId);
+      store.targetScrollMsgId = "";
+    }
+  }
+);
+
+function ensureElementVisibleInStream(el: HTMLElement | null) {
+  const container = scrollRef.value;
+  if (!container || !el) return;
+
+  const containerRect = container.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  const bottomMargin = 20;
+  const topMargin = 16;
+
+  if (elRect.bottom > containerRect.bottom - bottomMargin) {
+    const needed = elRect.bottom - (containerRect.bottom - bottomMargin);
+    const maxShift = Math.max(0, elRect.top - (containerRect.top + topMargin));
+    container.scrollTop += Math.min(needed, maxShift);
+  } else if (elRect.top < containerRect.top + topMargin) {
+    container.scrollTop -= containerRect.top + topMargin - elRect.top;
+  }
+}
+
 async function toggleFilesDropdown(msgId: string) {
   const willOpen = !openFilesDropdown.value[msgId];
   openFilesDropdown.value[msgId] = willOpen;
@@ -41,34 +69,23 @@ async function toggleFilesDropdown(msgId: string) {
   if (!willOpen) return;
 
   await nextTick();
-
-  const container = scrollRef.value;
-  const wrapEl = document.getElementById(`diff-dropdown-${msgId}`);
-  if (!container || !wrapEl) return;
-
-  const containerRect = container.getBoundingClientRect();
-  const wrapRect = wrapEl.getBoundingClientRect();
-  const bottomMargin = 20;
-  const topMargin = 16;
-
-  if (wrapRect.bottom > containerRect.bottom - bottomMargin) {
-    const needed = wrapRect.bottom - (containerRect.bottom - bottomMargin);
-    const maxShift = Math.max(0, wrapRect.top - (containerRect.top + topMargin));
-    container.scrollTop += Math.min(needed, maxShift);
-  } else if (wrapRect.top < containerRect.top + topMargin) {
-    container.scrollTop -= containerRect.top + topMargin - wrapRect.top;
-  }
+  ensureElementVisibleInStream(document.getElementById(`diff-dropdown-${msgId}`));
 }
 
 // Thinking state per message
 const openThinkingIds = ref<Set<string>>(new Set());
 
-function toggleThinking(msgId: string) {
-  if (openThinkingIds.value.has(msgId)) {
-    openThinkingIds.value.delete(msgId);
-  } else {
+async function toggleThinking(msgId: string) {
+  const willOpen = !openThinkingIds.value.has(msgId);
+  if (willOpen) {
     openThinkingIds.value.add(msgId);
+  } else {
+    openThinkingIds.value.delete(msgId);
+    return;
   }
+
+  await nextTick();
+  ensureElementVisibleInStream(document.getElementById(`thinking-block-${msgId}`));
 }
 
 // File and image attachments
@@ -185,6 +202,8 @@ const providerColors: Record<string, string> = {
   anthropic: "#f59e0b",
   deepseek: "#06b6d4",
   openrouter: "#a855f7",
+  groq: "#f43f5e",
+  cerebras: "#ec4899",
   mistral: "#f97316",
 };
 
@@ -209,11 +228,14 @@ const providerShortLabels: Record<string, string> = {
   anthropic: "Claude",
   deepseek: "DeepSeek",
   openrouter: "OpenRouter",
+  groq: "Groq",
+  cerebras: "Cerebras",
   mistral: "Mistral",
 };
 
 function roleTraceDotColor(role: string): string {
-  return roleTraceColors[role] || "#3b82f6";
+  const base = role.split("_step_")[0];
+  return roleTraceColors[base] || "#3b82f6";
 }
 
 function providerShortName(id: string): string {
@@ -306,17 +328,74 @@ const filteredMentions = computed<MentionItem[]>(() => {
 
 let tickTimer: number | null = null;
 let streamObserver: MutationObserver | null = null;
+const isAutoScrollPinned = ref(true);
+let lastScrollTop = 0;
+let scrollBottomRafId: number | null = null;
+let clearProgrammaticRafId: number | null = null;
+let isProgrammaticScroll = false;
+
+function cancelPendingAutoScroll() {
+  if (scrollBottomRafId !== null) {
+    cancelAnimationFrame(scrollBottomRafId);
+    scrollBottomRafId = null;
+  }
+  if (clearProgrammaticRafId !== null) {
+    cancelAnimationFrame(clearProgrammaticRafId);
+    clearProgrammaticRafId = null;
+  }
+}
+
+function unpinAutoScroll() {
+  isAutoScrollPinned.value = false;
+  isProgrammaticScroll = false;
+  cancelPendingAutoScroll();
+}
+
+function onStreamWheel(ev: WheelEvent) {
+  if (ev.deltaY < 0) {
+    unpinAutoScroll();
+  } else if (ev.deltaY > 0 && scrollRef.value) {
+    const el = scrollRef.value;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom <= 24) {
+      isAutoScrollPinned.value = true;
+    }
+  }
+}
 
 function scrollToBottom(force = false) {
+  if (force) {
+    isAutoScrollPinned.value = true;
+  } else if (!isAutoScrollPinned.value) {
+    return;
+  }
+
   nextTick(() => {
-    if (scrollRef.value) {
-      scrollRef.value.scrollTop = scrollRef.value.scrollHeight;
-      requestAnimationFrame(() => {
-        if (scrollRef.value) {
-          scrollRef.value.scrollTop = scrollRef.value.scrollHeight;
-        }
+    if (!force && !isAutoScrollPinned.value) return;
+    const container = scrollRef.value;
+    if (!container) return;
+
+    cancelPendingAutoScroll();
+    isProgrammaticScroll = true;
+    container.scrollTop = container.scrollHeight;
+    lastScrollTop = container.scrollTop;
+
+    scrollBottomRafId = requestAnimationFrame(() => {
+      scrollBottomRafId = null;
+      if (!force && !isAutoScrollPinned.value) {
+        isProgrammaticScroll = false;
+        return;
+      }
+      const el = scrollRef.value;
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+        lastScrollTop = el.scrollTop;
+      }
+      clearProgrammaticRafId = requestAnimationFrame(() => {
+        clearProgrammaticRafId = null;
+        isProgrammaticScroll = false;
       });
-    }
+    });
   });
 }
 
@@ -329,8 +408,10 @@ onMounted(() => {
 
   // Smooth autoscroll during live LLM streaming
   if (scrollRef.value) {
+    scrollRef.value.addEventListener("scroll", onStreamScroll, { passive: true });
+    scrollRef.value.addEventListener("wheel", onStreamWheel, { passive: true });
     streamObserver = new MutationObserver(() => {
-      if (store.isProcessing) {
+      if (store.isProcessing && isAutoScrollPinned.value) {
         scrollToBottom();
       }
     });
@@ -343,7 +424,14 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  scrollRef.value?.removeEventListener("scroll", onStreamScroll);
+  scrollRef.value?.removeEventListener("wheel", onStreamWheel);
   document.removeEventListener("click", handleTargetOutsideClick);
+  cancelPendingAutoScroll();
+  if (scrollDebounceTimer !== null) {
+    cancelAnimationFrame(scrollDebounceTimer);
+    scrollDebounceTimer = null;
+  }
   if (tickTimer !== null) {
     clearInterval(tickTimer);
     tickTimer = null;
@@ -364,6 +452,102 @@ watch(
 const conv = computed(() => store.activeConversation);
 const messages = computed(() => conv.value?.messages ?? []);
 const hasStarted = computed(() => messages.value.length > 0);
+const activeToolApprovals = computed(() =>
+  store.pendingToolApprovals.filter(
+    (req) =>
+      req.conversationId === store.activeConversationId ||
+      req.conversationId === store.processingConversationId
+  )
+);
+
+interface ConversationTurn {
+  id: string;
+  assistantMsgIds: string[];
+  items: { msg: ChatMessage; globalIndex: number }[];
+}
+
+const conversationTurns = computed<ConversationTurn[]>(() => {
+  const msgs = messages.value;
+  const turns: ConversationTurn[] = [];
+  let currentTurn: ConversationTurn | null = null;
+
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i];
+    if (msg.role === "user") {
+      if (!currentTurn || currentTurn.assistantMsgIds.length > 0) {
+        currentTurn = {
+          id: `turn-${msg.id}`,
+          assistantMsgIds: [],
+          items: [{ msg, globalIndex: i }],
+        };
+        turns.push(currentTurn);
+      } else {
+        currentTurn.items.push({ msg, globalIndex: i });
+      }
+    } else {
+      if (!currentTurn) {
+        currentTurn = {
+          id: `turn-${msg.id}`,
+          assistantMsgIds: [msg.id],
+          items: [{ msg, globalIndex: i }],
+        };
+        turns.push(currentTurn);
+      } else {
+        currentTurn.assistantMsgIds.push(msg.id);
+        currentTurn.items.push({ msg, globalIndex: i });
+      }
+    }
+  }
+
+  return turns;
+});
+
+// Gestion des bulles de question longues (collapsible 5-6 lignes max)
+const longQuestionIds = ref<Set<string>>(new Set());
+const expandedQuestionIds = ref<Set<string>>(new Set());
+
+function checkQuestionOverflow(el: HTMLElement | null, msgId: string) {
+  if (!el) return;
+  // 5 à 6 lignes à 13.5px line-height 1.55 correspond à ~126-130px
+  if (el.scrollHeight > 128) {
+    if (!longQuestionIds.value.has(msgId)) {
+      longQuestionIds.value.add(msgId);
+    }
+  }
+}
+
+function isQuestionCollapsible(msgId: string, content: string): boolean {
+  if (longQuestionIds.value.has(msgId)) return true;
+  return content.split("\n").length >= 6 || content.length > 250;
+}
+
+function toggleQuestionExpand(msgId: string) {
+  if (expandedQuestionIds.value.has(msgId)) {
+    expandedQuestionIds.value.delete(msgId);
+  } else {
+    expandedQuestionIds.value.add(msgId);
+  }
+}
+
+function handleBubbleClick(msgId: string, isCollapsible: boolean, _ev: MouseEvent) {
+  if (!isCollapsible) return;
+  const selection = window.getSelection();
+  if (selection && selection.toString().trim().length > 0) {
+    return;
+  }
+  toggleQuestionExpand(msgId);
+}
+
+function clearPromptInput() {
+  promptDraft.value = "";
+  mentionOpen.value = false;
+  nextTick(() => {
+    if (textareaRef.value) {
+      textareaRef.value.style.height = "";
+      textareaRef.value.focus();
+    }
+  });
+}
 
 const isRenamingTitle = ref(false);
 const titleDraft = ref("");
@@ -373,6 +557,8 @@ watch(
   () => store.activeConversationId,
   () => {
     isRenamingTitle.value = false;
+    lastScrollTop = 0;
+    scrollToBottom(true);
   }
 );
 
@@ -801,7 +987,7 @@ function formatFileSize(bytes: number): string {
 
 function messageDiffStats(
   msg: ChatMessage,
-  idx: number
+  _idx: number
 ): { filesChanged: number; linesAdded: number; linesRemoved: number } | null {
   if (
     (msg.filesChanged && msg.filesChanged > 0) ||
@@ -814,23 +1000,10 @@ function messageDiffStats(
       linesRemoved: msg.linesRemoved ?? 0,
     };
   }
-  if (
-    idx === lastAssistantIndex.value &&
-    (conv.value?.modifiedFiles.length ?? 0) > 0
-  ) {
-    return {
-      filesChanged: conv.value?.modifiedFiles.length ?? 0,
-      linesAdded: conv.value?.linesAdded ?? 0,
-      linesRemoved: conv.value?.linesRemoved ?? 0,
-    };
-  }
   return null;
 }
 
-function getFileListForMessage(msg: ChatMessage, idx: number): FileChangeSummary[] {
-  if (idx === lastAssistantIndex.value && (conv.value?.modifiedFiles.length ?? 0) > 0) {
-    return conv.value!.modifiedFiles;
-  }
+function getFileListForMessage(msg: ChatMessage, _idx: number): FileChangeSummary[] {
   if (msg.filesSummary && msg.filesSummary.length > 0) {
     return msg.filesSummary;
   }
@@ -839,6 +1012,170 @@ function getFileListForMessage(msg: ChatMessage, idx: number): FileChangeSummary
 
 function canUndoMessageFiles(idx: number): boolean {
   return idx === lastAssistantIndex.value && (conv.value?.modifiedFiles.length ?? 0) > 0;
+}
+
+const activeVisibleMsgId = ref<string>("");
+
+function formatTimelineTime(isoString?: string): string {
+  if (!isoString) return "";
+  try {
+    const d = new Date(isoString);
+    const now = new Date();
+    const timeStr = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const isToday =
+      d.getDate() === now.getDate() &&
+      d.getMonth() === now.getMonth() &&
+      d.getFullYear() === now.getFullYear();
+    if (isToday) {
+      return timeStr;
+    }
+    const dateStr = d.toLocaleDateString([], { day: "numeric", month: "short" });
+    return `${timeStr} · ${dateStr}`;
+  } catch {
+    return isoString;
+  }
+}
+
+function cleanResponseSnippet(text: string): string {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^[#*-]+\s*/gm, "")
+    .replace(/\n+/g, " ")
+    .trim();
+  if (cleaned.length > 220) {
+    return cleaned.slice(0, 217) + "...";
+  }
+  return cleaned || "Réponse générée.";
+}
+
+const assistantTimelineSteps = computed(() => {
+  const msgs = messages.value;
+  const steps: {
+    msgId: string;
+    isCurrent: boolean;
+    isCompaction: boolean;
+    question: string;
+    answerSnippet: string;
+    timestamp: string;
+    commitId?: string;
+  }[] = [];
+
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i];
+    if (msg.role !== "assistant") continue;
+
+    let userQuestion = "";
+    let userTime = msg.createdAt;
+    for (let j = i - 1; j >= 0; j--) {
+      if (msgs[j].role === "user") {
+        userQuestion = msgs[j].content;
+        userTime = msgs[j].createdAt;
+        break;
+      }
+    }
+
+    const isCompaction =
+      Boolean(msg.stageSummary?.toLowerCase().includes("compact")) ||
+      Boolean(msg.content.toLowerCase().includes("contexte compacté")) ||
+      msg.id.startsWith("compact-") ||
+      Boolean(i > 0 && msgs[i - 1].content.trim() === "/compact");
+
+    const isCurrent = activeVisibleMsgId.value
+      ? activeVisibleMsgId.value === msg.id
+      : i === lastAssistantIndex.value;
+
+    steps.push({
+      msgId: msg.id,
+      isCurrent,
+      isCompaction,
+      question: userQuestion,
+      answerSnippet: cleanResponseSnippet(msg.content),
+      timestamp: userTime || msg.createdAt,
+      commitId: msg.commitId,
+    });
+  }
+
+  return steps;
+});
+
+let scrollDebounceTimer: number | null = null;
+function onStreamScroll() {
+  const container = scrollRef.value;
+  if (container) {
+    const currentTop = container.scrollTop;
+    const distanceFromBottom =
+      container.scrollHeight - currentTop - container.clientHeight;
+
+    if (currentTop < lastScrollTop - 2 && distanceFromBottom > 12) {
+      unpinAutoScroll();
+    } else if (!isProgrammaticScroll && distanceFromBottom <= 24) {
+      isAutoScrollPinned.value = true;
+    }
+    lastScrollTop = currentTop;
+  }
+
+  if (scrollDebounceTimer) cancelAnimationFrame(scrollDebounceTimer);
+  scrollDebounceTimer = requestAnimationFrame(() => {
+    const container = scrollRef.value;
+    if (!container) return;
+    const containerRect = container.getBoundingClientRect();
+    const targetY = containerRect.top + containerRect.height * 0.35;
+
+    // Refermer automatiquement les bulles de question ouvertes sorties de l'écran
+    if (expandedQuestionIds.value.size > 0) {
+      expandedQuestionIds.value.forEach((msgId) => {
+        const bubbleEl = container.querySelector<HTMLElement>(`[data-user-bubble-id="${msgId}"]`);
+        if (!bubbleEl) return;
+        const rect = bubbleEl.getBoundingClientRect();
+        if (rect.bottom < containerRect.top || rect.top > containerRect.bottom) {
+          expandedQuestionIds.value.delete(msgId);
+        }
+      });
+    }
+
+    const assistantArticles = container.querySelectorAll<HTMLElement>(".assistant-article");
+    let closestId = "";
+    let minDistance = Infinity;
+
+    assistantArticles.forEach((el) => {
+      const rect = el.getBoundingClientRect();
+      const mid = rect.top + rect.height * 0.3;
+      const dist = Math.abs(mid - targetY);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestId = el.getAttribute("data-msg-id") || "";
+      }
+    });
+
+    if (closestId) {
+      activeVisibleMsgId.value = closestId;
+    }
+  });
+}
+
+function scrollToMessage(msgId: string) {
+  const container = scrollRef.value;
+  if (!container) return;
+  const turn = container.querySelector<HTMLElement>(`[data-turn-assistant-id~="${msgId}"]`);
+  const assistantEl = container.querySelector<HTMLElement>(`[data-msg-id="${msgId}"]`);
+  const target = turn || assistantEl;
+  if (target) {
+    unpinAutoScroll();
+    const containerH = container.clientHeight;
+    const targetH = target.offsetHeight;
+    if (targetH <= containerH * 0.85) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    target.classList.remove("pulse-highlight");
+    void target.offsetWidth;
+    target.classList.add("pulse-highlight");
+    setTimeout(() => {
+      target.classList.remove("pulse-highlight");
+    }, 1800);
+  }
 }
 
 function getAvailableDiffPaths(msg?: ChatMessage): string[] {
@@ -1087,7 +1424,7 @@ async function handleSubmit() {
   }
   scrollToBottom(true);
   await store.sendPrompt(text, files);
-  scrollToBottom(true);
+  scrollToBottom(false);
 }
 
 function handleKeydown(ev: KeyboardEvent) {
@@ -1323,6 +1660,38 @@ async function copyCodeBlock(key: string, code: string) {
     <!-- Floating HUD -->
     <LeHud />
 
+    <!-- Rail de navigation temporel (ronds centré verticalement à droite du menu) -->
+    <nav
+      v-if="assistantTimelineSteps.length > 0"
+      class="disc-timeline-rail"
+      aria-label="Timeline des réponses IA"
+    >
+      <div
+        v-for="step in assistantTimelineSteps"
+        :key="step.msgId"
+        class="timeline-dot-wrapper"
+        :class="{ 'is-current': step.isCurrent, 'is-compact': step.isCompaction }"
+        @click="scrollToMessage(step.msgId)"
+      >
+        <span
+          class="timeline-dot"
+          :class="{ 'is-current': step.isCurrent, 'is-compact': step.isCompaction }"
+        />
+        <!-- Bulle d'aperçu au survol -->
+        <div class="timeline-tooltip halo-hud">
+          <div v-if="step.commitId || step.isCompaction" class="timeline-tooltip-header">
+            <span v-if="step.commitId" class="tt-commit-tag">📦 {{ step.commitId }}</span>
+            <span v-if="step.isCompaction" class="tt-compact-tag">🧹 Compacté</span>
+          </div>
+          <p class="timeline-tooltip-question">{{ step.question || "Étape d'initialisation" }}</p>
+          <p v-if="step.answerSnippet" class="timeline-tooltip-answer">{{ step.answerSnippet }}</p>
+          <div class="timeline-tooltip-footer">
+            <span class="tt-time">{{ formatTimelineTime(step.timestamp) }}</span>
+          </div>
+        </div>
+      </div>
+    </nav>
+
     <!-- Scrollable stream or Empty welcome state -->
     <div ref="scrollRef" class="disc-stream custom-scroll">
       <!-- Empty state before first prompt -->
@@ -1349,19 +1718,36 @@ async function copyCodeBlock(key: string, code: string) {
       <!-- Conversation messages -->
       <div v-else class="messages-list">
         <div
-          v-for="(msg, msgIdx) in messages"
-          :key="msg.id"
-          class="msg-wrapper"
-          :class="msg.role === 'user' ? 'is-user' : 'is-assistant'"
+          v-for="turn in conversationTurns"
+          :key="turn.id"
+          class="turn-group"
+          :data-turn-assistant-id="turn.assistantMsgIds.join(' ')"
         >
+          <div
+            v-for="{ msg, globalIndex: msgIdx } in turn.items"
+            :key="msg.id"
+            class="msg-wrapper"
+            :class="msg.role === 'user' ? 'is-user' : 'is-assistant'"
+          >
           <!-- USER MESSAGE -->
           <div v-if="msg.role === 'user'" class="user-msg-col">
             <div class="user-bubble-box">
-              <div class="user-bubble">
+              <div
+                class="user-bubble"
+                :class="{
+                  'is-collapsible': isQuestionCollapsible(msg.id, msg.content),
+                  'is-expanded': expandedQuestionIds.has(msg.id),
+                  'is-clamped': isQuestionCollapsible(msg.id, msg.content) && !expandedQuestionIds.has(msg.id),
+                }"
+                :data-user-bubble-id="msg.id"
+                :title="isQuestionCollapsible(msg.id, msg.content) ? (expandedQuestionIds.has(msg.id) ? 'Cliquer pour replier' : 'Cliquer pour afficher la question complète') : undefined"
+                @click="handleBubbleClick(msg.id, isQuestionCollapsible(msg.id, msg.content), $event)"
+              >
                 <!-- Attached images in user message -->
                 <div
                   v-if="msg.attachments && msg.attachments.some((a) => a.isImage)"
                   class="msg-gallery"
+                  @click.stop
                 >
                   <img
                     v-for="att in msg.attachments.filter((a) => a.isImage)"
@@ -1378,6 +1764,7 @@ async function copyCodeBlock(key: string, code: string) {
                 <div
                   v-if="msg.attachments && msg.attachments.some((a) => !a.isImage)"
                   class="msg-files"
+                  @click.stop
                 >
                   <span
                     v-for="att in msg.attachments.filter((a) => !a.isImage)"
@@ -1393,7 +1780,21 @@ async function copyCodeBlock(key: string, code: string) {
                   </span>
                 </div>
 
-                <p class="msg-text">{{ msg.content }}</p>
+                <div
+                  class="msg-text-wrapper"
+                  :class="{
+                    'is-clamped': isQuestionCollapsible(msg.id, msg.content) && !expandedQuestionIds.has(msg.id),
+                  }"
+                >
+                  <p
+                    :ref="(el) => checkQuestionOverflow(el as HTMLElement, msg.id)"
+                    class="msg-text"
+                  >{{ msg.content }}</p>
+                  <div
+                    v-if="isQuestionCollapsible(msg.id, msg.content) && !expandedQuestionIds.has(msg.id)"
+                    class="bubble-fade-gradient"
+                  />
+                </div>
               </div>
 
               <!-- User prompt hover action buttons (copier, relancer) -->
@@ -1401,7 +1802,7 @@ async function copyCodeBlock(key: string, code: string) {
                 <button
                   class="user-action-pill"
                   :title="copiedPromptId === msg.id ? 'Prompt copié !' : 'Copier le prompt'"
-                  @click="copyPrompt(msg.content, msg.id)"
+                  @click.stop="copyPrompt(msg.content, msg.id)"
                 >
                   <svg
                     v-if="copiedPromptId !== msg.id"
@@ -1429,7 +1830,7 @@ async function copyCodeBlock(key: string, code: string) {
                 <button
                   class="user-action-pill"
                   title="Relancer ce prompt"
-                  @click="rerunPrompt(msg.content)"
+                  @click.stop="rerunPrompt(msg.content)"
                 >
                   <svg class="u-act-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M21 2v6h-6" />
@@ -1447,10 +1848,15 @@ async function copyCodeBlock(key: string, code: string) {
           </div>
 
           <!-- ASSISTANT MESSAGE -->
-          <article v-else class="assistant-article">
+          <article v-else :id="'msg-' + msg.id" :data-msg-id="msg.id" class="assistant-article">
             <!-- AI Thinking Section (presented right under user prompt) -->
-            <div v-if="msg.thinking || (msg.agentTrace && msg.agentTrace.length > 0)" class="thinking-block">
+            <div
+              v-if="msg.thinking || (msg.agentTrace && msg.agentTrace.length > 0)"
+              :id="'thinking-block-' + msg.id"
+              class="thinking-block"
+            >
               <button
+                type="button"
                 class="thinking-header"
                 :title="openThinkingIds.has(msg.id) ? 'Replier la réflexion' : 'Déplier la réflexion'"
                 @click="toggleThinking(msg.id)"
@@ -1769,12 +2175,12 @@ async function copyCodeBlock(key: string, code: string) {
             </div>
 
             <!-- Dropdown Sélecteur des fichiers modifiés avec diff -->
-            <div
-              v-if="messageDiffStats(msg, msgIdx)"
-              :id="'diff-dropdown-' + msg.id"
-              class="diff-dropdown-wrap"
-              :class="{ 'is-open': openFilesDropdown[msg.id] }"
-            >
+            <div v-if="messageDiffStats(msg, msgIdx)" class="msg-footer-actions-bar">
+              <div
+                :id="'diff-dropdown-' + msg.id"
+                class="diff-dropdown-wrap"
+                :class="{ 'is-open': openFilesDropdown[msg.id] }"
+              >
               <button
                 type="button"
                 class="diff-dropdown-trigger"
@@ -1888,6 +2294,7 @@ async function copyCodeBlock(key: string, code: string) {
                 </div>
               </div>
             </div>
+          </div>
 
             <!-- Relative Timestamp -->
             <div class="msg-timestamp">
@@ -1895,6 +2302,7 @@ async function copyCodeBlock(key: string, code: string) {
             </div>
           </article>
         </div>
+      </div>
 
         <!-- LIVE STREAMING CARD (Displayed while IA is processing) -->
         <div v-if="store.isProcessing" class="msg-wrapper is-assistant is-live">
@@ -2219,6 +2627,40 @@ async function copyCodeBlock(key: string, code: string) {
     <!-- Bottom: Prompt Input -->
     <footer class="disc-footer">
       <div class="footer-inner">
+        <!-- Tool Approval Guardrail Banner -->
+        <div v-if="activeToolApprovals.length > 0" class="tool-approval-stack">
+          <div
+            v-for="req in activeToolApprovals"
+            :key="req.requestId"
+            class="tool-approval-card"
+          >
+            <div class="tool-approval-info">
+              <div class="tool-approval-head">
+                <span class="tool-approval-badge">{{ req.tool }}</span>
+                <strong class="tool-approval-title">{{ req.title }}</strong>
+              </div>
+              <code class="tool-approval-target">{{ req.target }}</code>
+              <p v-if="req.reason" class="tool-approval-reason">{{ req.reason }}</p>
+            </div>
+            <div class="tool-approval-actions">
+              <button
+                type="button"
+                class="tool-approval-btn is-deny"
+                @click="store.resolveToolApproval(req.requestId, false)"
+              >
+                Refuser
+              </button>
+              <button
+                type="button"
+                class="tool-approval-btn is-approve"
+                @click="store.resolveToolApproval(req.requestId, true)"
+              >
+                {{ req.tool === "delete_file" ? "Confirmer la suppression" : "Autoriser" }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <!-- Prompt composer with rotating rainbow border during thinking -->
         <div class="composer-wrapper">
           <!-- Mention (@) Autocompletion Popover -->
@@ -2342,6 +2784,19 @@ async function copyCodeBlock(key: string, code: string) {
                 @keydown="handleKeydown"
                 @paste="handlePaste"
               />
+              <button
+                v-if="promptDraft.length > 0 && !store.isProcessing"
+                type="button"
+                class="prompt-clear-btn"
+                title="Vider le texte"
+                aria-label="Vider le champ"
+                @click="clearPromptInput"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
             </div>
 
             <!-- Ligne 2: Bouton PJ + choix modèle à gauche, permissions tools et bouton envoi (flèche droite) à droite -->
@@ -2612,6 +3067,245 @@ async function copyCodeBlock(key: string, code: string) {
   }
 }
 
+/* Timeline rail (ronds verticaux à droite du menu) */
+.disc-timeline-rail {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  z-index: 60;
+  padding: 4px 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  overflow: visible;
+}
+
+.timeline-dot-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 1px 3px;
+}
+
+.timeline-dot {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.35);
+  opacity: 0.6;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.timeline-dot.is-current {
+  width: 6px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.95);
+  opacity: 1;
+  box-shadow: 0 0 4px rgba(255, 255, 255, 0.4);
+}
+
+.timeline-dot.is-compact {
+  width: 5px;
+  height: 12px;
+  border-radius: 9999px;
+}
+
+.timeline-dot-wrapper:hover .timeline-dot {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.9);
+  transform: scale(1.15);
+}
+
+.timeline-tooltip {
+  position: absolute;
+  left: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: clamp(235px, calc((100% - 840px) / 2 - 20px), 340px);
+  min-width: 220px;
+  max-width: calc(100vw - 36px);
+  padding: 9px 12px;
+  background: rgba(15, 23, 42, 0.96);
+  backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65), 0 0 1px rgba(255, 255, 255, 0.2);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.16s ease, visibility 0.16s ease, transform 0.16s ease;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  word-break: break-word;
+}
+
+.timeline-dot-wrapper:hover .timeline-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(-50%) translateX(2px);
+}
+
+.timeline-tooltip-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tt-commit-tag {
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(99, 102, 241, 0.2);
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.tt-compact-tag {
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.2);
+  color: #fcd34d;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.timeline-tooltip-question {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffffff;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.timeline-tooltip-answer {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: #94a3b8;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.timeline-tooltip-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 9.5px;
+  color: #94a3b8;
+  margin-top: 1px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  padding-top: 3px;
+}
+
+/* Commit badge pill & Pulse highlight */
+.msg-footer-actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.commit-pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #f3f4f6;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.commit-pill-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(99, 102, 241, 0.5);
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.commit-pill-tag {
+  font-weight: 700;
+  color: #818cf8;
+}
+
+.commit-pill-summary {
+  color: #94a3b8;
+  max-width: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pulse-highlight {
+  position: relative;
+  isolation: isolate;
+}
+
+.pulse-highlight::before {
+  content: "";
+  position: absolute;
+  inset: -14px -18px;
+  border-radius: 14px;
+  pointer-events: none;
+  z-index: -1;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(rgba(18, 16, 26, 0.4), rgba(18, 16, 26, 0.4)) padding-box,
+    linear-gradient(135deg, rgba(236, 64, 84, 0.7), rgba(251, 140, 26, 0.65)) border-box;
+  box-shadow:
+    0 0 16px rgba(236, 64, 84, 0.22),
+    0 0 30px rgba(251, 140, 26, 0.14),
+    inset 0 0 14px rgba(236, 64, 84, 0.06);
+  animation: highlightPulseGlow 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes highlightPulseGlow {
+  0% {
+    opacity: 0;
+    transform: scale(0.995);
+  }
+  20% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  75% {
+    opacity: 0.9;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
 .la-discussion {
   position: relative;
   flex: 1;
@@ -2747,7 +3441,7 @@ async function copyCodeBlock(key: string, code: string) {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  padding: 16px 32px 42px;
+  padding: 16px 36px 42px;
 }
 
 .welcome-state {
@@ -2798,8 +3492,17 @@ async function copyCodeBlock(key: string, code: string) {
   margin-inline: auto;
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 28px;
   padding-bottom: 18px;
+}
+
+.turn-group {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  position: relative;
+  border-radius: 16px;
 }
 
 .msg-wrapper {
@@ -2834,6 +3537,16 @@ async function copyCodeBlock(key: string, code: string) {
   flex-direction: column;
   gap: 8px;
   font-family: var(--font-response);
+  position: relative;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.user-bubble.is-collapsible {
+  cursor: pointer;
+}
+
+.user-bubble.is-collapsible:hover {
+  border-color: rgba(255, 255, 255, 0.24);
 }
 
 .user-hover-actions {
@@ -2933,6 +3646,28 @@ async function copyCodeBlock(key: string, code: string) {
 
 .file-size {
   opacity: 0.75;
+}
+
+.msg-text-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+.msg-text-wrapper.is-clamped {
+  max-height: 126px; /* 5-6 lignes max */
+  overflow: hidden;
+}
+
+.bubble-fade-gradient {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 48px;
+  background: linear-gradient(to bottom, transparent, var(--surface-elevated));
+  pointer-events: none;
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 4px;
 }
 
 .msg-text {
@@ -3907,7 +4642,7 @@ async function copyCodeBlock(key: string, code: string) {
 }
 
 .disc-footer {
-  padding: 8px 32px 16px;
+  padding: 8px 36px 16px;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
@@ -4217,10 +4952,13 @@ async function copyCodeBlock(key: string, code: string) {
 .composer-line-1 {
   width: 100%;
   display: flex;
+  align-items: flex-start;
+  position: relative;
 }
 
 .composer-line-1 textarea {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   min-height: 48px;
   max-height: 220px;
   border: none;
@@ -4231,6 +4969,33 @@ async function copyCodeBlock(key: string, code: string) {
   font-size: 13.5px;
   line-height: 1.5;
   padding: 4px 6px;
+}
+
+.prompt-clear-btn {
+  margin-top: 6px;
+  margin-right: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.prompt-clear-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f1f5f9;
+}
+
+.prompt-clear-btn svg {
+  width: 13px;
+  height: 13px;
 }
 
 /* Ligne 2: Bouton PJ + choix modèle à gauche, permissions tools et bouton envoi à droite */
@@ -4632,12 +5397,12 @@ async function copyCodeBlock(key: string, code: string) {
 
 .stop-btn {
   height: 32px;
-  width: 34px;
+  width: 32px;
   box-sizing: border-box;
-  border: none;
-  background: #ef4444;
-  color: #fff;
-  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(148, 163, 184, 0.22);
+  color: #ef4444;
+  border-radius: 50%;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -4648,8 +5413,9 @@ async function copyCodeBlock(key: string, code: string) {
 }
 
 .stop-btn:hover:not(:disabled) {
-  background: #dc2626;
-  transform: scale(1.03);
+  background: rgba(148, 163, 184, 0.34);
+  border-color: rgba(239, 68, 68, 0.55);
+  transform: scale(1.04);
 }
 
 .stop-btn:disabled {
@@ -4771,5 +5537,110 @@ async function copyCodeBlock(key: string, code: string) {
   max-height: 80vh;
   border-radius: 10px;
   object-fit: contain;
+}
+
+/* Tool approval guardrails */
+.tool-approval-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-approval-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: var(--surface-elevated);
+  box-shadow: 0 8px 24px -10px rgba(0, 0, 0, 0.35);
+}
+
+.tool-approval-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.tool-approval-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-approval-badge {
+  font-family: var(--font-code);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--diff-del-bg);
+  color: var(--diff-del-bar);
+  flex-shrink: 0;
+}
+
+.tool-approval-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.tool-approval-target {
+  font-family: var(--font-code);
+  font-size: 12px;
+  color: var(--text-main);
+  background: var(--table-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 4px 8px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.tool-approval-reason {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.tool-approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.tool-approval-btn {
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.12s ease, background 0.15s ease;
+}
+
+.tool-approval-btn.is-deny {
+  border: 1px solid var(--border-subtle);
+  background: var(--table-bg);
+  color: var(--text-main);
+}
+
+.tool-approval-btn.is-deny:hover {
+  background: var(--hover-bg);
+}
+
+.tool-approval-btn.is-approve {
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  background: var(--diff-del-bar);
+  color: #ffffff;
+}
+
+.tool-approval-btn.is-approve:hover {
+  opacity: 0.92;
+  transform: translateY(-1px);
 }
 </style>

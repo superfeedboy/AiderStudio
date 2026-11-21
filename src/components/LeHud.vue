@@ -10,7 +10,20 @@ const hoveredAgentStep = ref<TokenUsageEvent | null>(null);
 const apiHovered = ref(false);
 
 const conv = computed(() => store.activeConversation);
-const artifacts = computed(() => conv.value?.artifacts ?? []);
+
+function isRealArtifact(art: { filePath?: string | null; title?: string; language?: string }): boolean {
+  const p = (art.filePath || art.title || "").toLowerCase();
+  if (/\.(vue|ts|tsx|js|jsx|rs|css|scss|html|json|py|toml|yaml|yml|sh|bash|sql)$/.test(p)) {
+    return false;
+  }
+  const lang = (art.language || "").toLowerCase();
+  if (["rust", "rs", "typescript", "ts", "javascript", "js", "vue", "python", "py", "css", "scss", "html", "json", "sh", "bash"].includes(lang)) {
+    return false;
+  }
+  return true;
+}
+
+const artifacts = computed(() => (conv.value?.artifacts ?? []).filter(isRealArtifact));
 const linesAdded = computed(() => conv.value?.linesAdded ?? 0);
 const linesRemoved = computed(() => conv.value?.linesRemoved ?? 0);
 
@@ -98,6 +111,8 @@ const providerUsageRows = computed(() => {
     anthropic: "Anthropic",
     deepseek: "DeepSeek",
     openrouter: "OpenRouter",
+    groq: "Groq",
+    cerebras: "Cerebras",
     mistral: "Mistral",
   };
   return Object.entries(map).map(([id, entry]) => ({
@@ -513,7 +528,7 @@ function selectArtifact(id: string) {
 
       <div v-if="dropdownOpen" class="art-menu halo-hud">
         <div v-if="artifacts.length === 0" class="art-empty">
-          Aucun artefact créé
+          Aucun document d'audit ou de projection
         </div>
         <button
           v-for="art in artifacts"

@@ -270,177 +270,7 @@ pub async fn execute_local_tool_internal(
     name: &str,
     args: &serde_json::Value,
 ) -> Result<ToolExecutionResult, String> {
-    match name {
-        "write_file" | "create_file" => {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or("Paramètre 'path' manquant")?;
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let clean_path = patcher::sanitize_rel_path(path_str)
-                .ok_or_else(|| "Chemin de fichier invalide ou non autorisé".to_string())?;
-            let target_path = project_root.join(&clean_path);
-            if let Some(parent) = target_path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-
-            let final_content =
-                if content.contains("<<<<<<< SEARCH") && content.contains(">>>>>>> REPLACE") {
-                    if target_path.exists() {
-                        let orig = tokio::fs::read_to_string(&target_path)
-                            .await
-                            .unwrap_or_default();
-                        let patched_res = patcher::parse_edit_blocks(content, &[clean_path.clone()], "")
-                            .into_iter()
-                            .fold(Ok(orig.clone()), |acc, blk| match (acc, blk) {
-                                (Ok(cur), patcher::EditBlock::SearchReplace { search, replace, .. }) => {
-                                    patcher::apply_search_replace_fuzzy(&cur, &search, &replace)
-                                }
-                                (res, _) => res,
-                            });
-                        patched_res.unwrap_or_else(|_| patcher::extract_clean_replace_code(content))
-                    } else {
-                        patcher::extract_clean_replace_code(content)
-                    }
-                } else {
-                    content.to_string()
-                };
-
-            tokio::fs::write(&target_path, &final_content)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(ToolExecutionResult {
-                tool: name.to_string(),
-                success: true,
-                message: format!(
-                    "Fichier '{}' écrit avec succès ({} octets)",
-                    clean_path,
-                    final_content.len()
-                ),
-                path: Some(clean_path),
-            })
-        }
-        "read_file" => {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or("Paramètre 'path' manquant")?;
-            let clean_path = path_str
-                .trim()
-                .trim_matches('`')
-                .trim_start_matches("./")
-                .trim()
-                .replace('\\', "/");
-            if clean_path.is_empty() || clean_path.contains("..") || clean_path.starts_with('/') {
-                return Err("Chemin relatif non autorisé".to_string());
-            }
-            let target_path = project_root.join(&clean_path);
-            let content = tokio::fs::read_to_string(&target_path)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(ToolExecutionResult {
-                tool: name.to_string(),
-                success: true,
-                message: content,
-                path: Some(clean_path),
-            })
-        }
-        "search_code" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or("Paramètre 'query' manquant")?;
-            let path_filter = args.get("path_filter").and_then(|v| v.as_str());
-            let out = repo_map::search_in_project(project_root, query, path_filter, 40)?;
-            Ok(ToolExecutionResult {
-                tool: name.to_string(),
-                success: true,
-                message: out,
-                path: None,
-            })
-        }
-        "run_command" => {
-            let cmd_str = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or("Paramètre 'command' manquant")?;
-
-            #[cfg(target_os = "windows")]
-            let mut cmd = {
-                let mut c = tokio::process::Command::new("cmd");
-                c.args(["/C", cmd_str]);
-                c.creation_flags(0x08000000);
-                c
-            };
-
-            #[cfg(not(target_os = "windows"))]
-            let mut cmd = {
-                let mut c = tokio::process::Command::new("sh");
-                c.args(["-c", cmd_str]);
-                c
-            };
-
-            cmd.current_dir(project_root);
-            let output = tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output())
-                .await
-                .map_err(|_| "Timeout lors de l'exécution de la commande (45s)".to_string())?
-                .map_err(|e| e.to_string())?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = if stderr.is_empty() {
-                stdout.to_string()
-            } else if stdout.is_empty() {
-                stderr.to_string()
-            } else {
-                format!("{}\n{}", stdout, stderr)
-            };
-            Ok(ToolExecutionResult {
-                tool: name.to_string(),
-                success: output.status.success(),
-                message: combined,
-                path: None,
-            })
-        }
-        "list_files" => {
-            let files = list_project_files_internal(project_root);
-            Ok(ToolExecutionResult {
-                tool: name.to_string(),
-                success: true,
-                message: serde_json::to_string(&files).unwrap_or_default(),
-                path: None,
-            })
-        }
-        "delete_file" => {
-            let path_str = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or("Paramètre 'path' manquant")?;
-            let clean_path = path_str
-                .trim()
-                .trim_matches('`')
-                .trim_start_matches("./")
-                .trim()
-                .replace('\\', "/");
-            if clean_path.is_empty() || clean_path.contains("..") || clean_path.starts_with('/') {
-                return Err("Chemin relatif non autorisé".to_string());
-            }
-            let target = project_root.join(&clean_path);
-            if target.exists() {
-                tokio::fs::remove_file(&target)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(ToolExecutionResult {
-                tool: name.to_string(),
-                success: true,
-                message: format!("Fichier '{}' supprimé", clean_path),
-                path: Some(clean_path),
-            })
-        }
-        other => Err(format!("Outil inconnu : {}", other)),
-    }
+    crate::tools::execute_local_tool(project_root, name, args).await
 }
 
 pub fn resolve_binary(default_name: &str, custom: &str) -> Option<String> {
@@ -596,12 +426,46 @@ fn emit_stage(
     );
 }
 
+pub fn normalize_diff_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+pub fn paths_match(p1: &str, p2: &str) -> bool {
+    let n1 = normalize_diff_path(p1);
+    let n2 = normalize_diff_path(p2);
+    if n1 == n2 {
+        return true;
+    }
+    n1.ends_with(&format!("/{n2}")) || n2.ends_with(&format!("/{n1}"))
+}
+
 fn extract_artifacts_from_markdown(text: &str) -> Vec<ArtifactItem> {
     let re = Regex::new(r"```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```").expect("valid fence regex");
     let file_hint_re = Regex::new(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8}").expect("valid path regex");
     let now = Utc::now().to_rfc3339();
     let mut items = Vec::new();
-    for (idx, cap) in re.captures_iter(text).enumerate() {
+    let doc_kw = [
+        "audit",
+        "rapport",
+        "projection",
+        "synthese",
+        "synthèse",
+        "bilan",
+        "specification",
+        "spécification",
+        "roadmap",
+        "plan stratégique",
+        "architecture globale",
+        "analyse d'impact",
+        "artefact",
+        "artifact",
+    ];
+
+    for cap in re.captures_iter(text) {
         let full_match = cap.get(0).unwrap();
         let before = &text[..full_match.start()];
         let prev_line = before
@@ -630,23 +494,52 @@ fn extract_artifacts_from_markdown(text: &str) -> Vec<ArtifactItem> {
         if code.starts_with("{\"name\":") && code.contains("\"arguments\":") {
             continue;
         }
-        let ext = match lang.as_str() {
-            "rust" | "rs" => "rs",
-            "typescript" | "ts" => "ts",
-            "javascript" | "js" => "js",
-            "vue" => "vue",
-            "python" | "py" => "py",
-            "json" => "json",
-            "css" => "css",
-            _ => "txt",
-        };
+
+        let lang_low = lang.to_lowercase();
+        let prev_low = prev_line.to_lowercase();
+
+        // Les fichiers de code source d'application ne sont JAMAIS des artefacts
+        let is_code_lang = matches!(
+            lang_low.as_str(),
+            "rust" | "rs" | "typescript" | "ts" | "javascript" | "js" | "vue" | "python" | "py" | "css" | "scss" | "html" | "json" | "toml" | "yaml" | "yml" | "sh" | "bash" | "sql"
+        );
+        let is_explicit_artifact = matches!(
+            lang_low.as_str(),
+            "artifact" | "artefact" | "report" | "projection" | "audit"
+        );
+
         let inferred_path = file_hint_re
             .find(prev_line)
             .map(|m| m.as_str().trim_matches('`').to_string());
-        let title = inferred_path
-            .as_deref()
-            .and_then(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_else(|| format!("snippet_{}.{}", idx + 1, ext));
+
+        let has_code_extension = inferred_path.as_deref().map(|p| {
+            matches!(
+                Path::new(p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+                Some("vue" | "ts" | "tsx" | "js" | "jsx" | "rs" | "css" | "scss" | "html" | "json" | "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "sql")
+            )
+        }).unwrap_or(false);
+
+        // Rejeter catégoriquement tout bloc de code de langage ou fichier de code source
+        if is_code_lang || has_code_extension {
+            continue;
+        }
+
+        let is_doc_context = doc_kw.iter().any(|kw| prev_low.contains(kw));
+        if !is_explicit_artifact && !is_doc_context {
+            continue;
+        }
+        if !matches!(lang_low.as_str(), "markdown" | "md" | "text" | "txt" | "artifact" | "artefact" | "report" | "projection" | "audit") {
+            continue;
+        }
+
+        let title = if !prev_line.is_empty() && !prev_line.starts_with("```") {
+            prev_line.to_string()
+        } else {
+            inferred_path
+                .as_deref()
+                .and_then(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| format!("Rapport_{}", items.len() + 1))
+        };
 
         items.push(ArtifactItem {
             id: Uuid::new_v4().to_string(),
@@ -809,6 +702,68 @@ pub fn is_global_or_doc_task(user_prompt: &str, target_files: &[String]) -> bool
     global_or_doc_kw.iter().any(|k| lower.contains(k))
 }
 
+pub fn is_install_or_setup_prompt(prompt: &str) -> bool {
+    let low = prompt.to_lowercase();
+    let install_markers = [
+        "installe",
+        "installer",
+        "install ",
+        "npm i ",
+        "npm install",
+        "pnpm add",
+        "pnpm install",
+        "yarn add",
+        "bun add",
+        "cargo add",
+        "pip install",
+        "ajoute le package",
+        "ajouter le package",
+        "ajoute la dépendance",
+        "ajoute la dependance",
+        "ajouter la dépendance",
+        "ajouter la dependance",
+        "ajoute la lib",
+        "ajouter la lib",
+        "configure tailwind",
+        "configurer tailwind",
+        "active tailwind",
+        "activer tailwind",
+        "mettre en place tailwind",
+    ];
+    if !install_markers.iter().any(|k| low.contains(k)) {
+        return false;
+    }
+
+    let ui_redesign_markers = [
+        "layout",
+        "sidebar",
+        "menu à gauche",
+        "menu a gauche",
+        "couleur",
+        "dégradé",
+        "degrade",
+        "bulle",
+        "bouton",
+        "fond ",
+        "refais le design",
+        "refonte",
+        "stylise",
+        "mise en page",
+        "responsive",
+        "thème sombre",
+        "theme sombre",
+        "hauteur",
+        "largeur",
+        "centré",
+        "centrer",
+        "aligner",
+        "convertis les composants",
+        "migre les composants",
+        "migrer les composants",
+    ];
+    !ui_redesign_markers.iter().any(|k| low.contains(k))
+}
+
 pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
     let lower = user_prompt.to_lowercase();
 
@@ -847,6 +802,43 @@ pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
         "visuel",
         "look",
         "page web",
+        "fond",
+        "arrière-plan",
+        "arriere-plan",
+        "background",
+        "gris",
+        "anthracite",
+        "noir",
+        "blanc",
+        "bleu",
+        "rouge",
+        "vert",
+        "jaune",
+        "violet",
+        "sombre",
+        "clair",
+        "page",
+        "écran",
+        "ecran",
+        "titre",
+        "texte",
+        "police",
+        "font",
+        "bordure",
+        "ombre",
+        "centrer",
+        "aligner",
+        "marge",
+        "margin",
+        "padding",
+        "header",
+        "footer",
+        "navbar",
+        "icône",
+        "icone",
+        "emote",
+        "emoji",
+        "logo",
     ];
     let refac_kw = [
         "refactor",
@@ -873,6 +865,9 @@ pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
     ];
 
     let wants_tests = test_kw.iter().any(|k| lower.contains(k));
+    if is_install_or_setup_prompt(&lower) {
+        return ("coder", wants_tests);
+    }
     if !is_doc_focused_prompt(&lower) && design_kw.iter().any(|k| lower.contains(k)) {
         return ("designer", wants_tests);
     }
@@ -892,22 +887,54 @@ pub fn augment_design_target_files(all_files: &[String], matched: &mut Vec<Strin
     if !has_css && matched.len() < 3 {
         let css_candidates = [
             "src/style.css",
+            "src/styles.css",
+            "src/styles/main.css",
             "src/assets/main.css",
+            "src/assets/base.css",
             "src/index.css",
+            "src/main.css",
             "src/app.css",
+            "src/App.css",
+            "app/globals.css",
+            "style.css",
+            "styles.css",
         ];
+        let mut added_css = false;
         for cand in css_candidates {
             if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
                 if !matched.contains(found) {
                     matched.push(found.clone());
-                    break;
+                }
+                added_css = true;
+                break;
+            }
+        }
+        if !added_css {
+            if let Some(fallback_css) = all_files
+                .iter()
+                .filter(|f| {
+                    let low = f.to_lowercase();
+                    low.ends_with(".css") || low.ends_with(".scss")
+                })
+                .min_by_key(|f| (f.matches('/').count(), f.len()))
+            {
+                if !matched.contains(fallback_css) {
+                    matched.push(fallback_css.clone());
                 }
             }
         }
     }
 
     if matched.len() < 3 {
-        for app_cand in ["src/App.vue", "src/App.tsx", "src/App.jsx"] {
+        for app_cand in [
+            "src/App.vue",
+            "src/App.tsx",
+            "src/App.jsx",
+            "src/App.svelte",
+            "app/page.tsx",
+            "src/pages/index.vue",
+            "index.html",
+        ] {
             if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(app_cand)) {
                 if !matched.contains(found) {
                     matched.push(found.clone());
@@ -916,6 +943,870 @@ pub fn augment_design_target_files(all_files: &[String], matched: &mut Vec<Strin
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FrontendStackInfo {
+    pub framework: Option<String>,
+    pub bundler: Option<String>,
+    pub tailwind_in_pkg: bool,
+    pub tailwind_active: bool,
+    pub tailwind_broken_reason: Option<String>,
+    pub entry_file: Option<String>,
+    pub global_css_files: Vec<String>,
+    pub imported_css_in_entry: Vec<String>,
+    pub css_entry_missing_import: bool,
+    pub installed_packages: Vec<String>,
+}
+
+impl FrontendStackInfo {
+    pub fn format_summary(&self) -> String {
+        let mut lines = Vec::new();
+        let stack_label = match (&self.framework, &self.bundler) {
+            (Some(fw), Some(bd)) => format!("{fw} + {bd}"),
+            (Some(fw), None) => fw.clone(),
+            (None, Some(bd)) => bd.clone(),
+            (None, None) => "Frontend Web".to_string(),
+        };
+        lines.push(format!("[Stack Frontend détectée : {stack_label}]"));
+
+        if self.tailwind_active {
+            lines.push(
+                "- CSS : Tailwind CSS actif (classes utilitaires Tailwind + CSS natif utilisables)."
+                    .to_string(),
+            );
+        } else {
+            let reason = self
+                .tailwind_broken_reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "- CSS : CSS NATIF UNIQUEMENT — Tailwind NON actif{reason}. INTERDICTION d'utiliser des classes utilitaires Tailwind (flex, h-screen, w-[...], bg-[#...], bg-gradient-to-*) ; écris du vrai CSS explicite (<style scoped> et/ou CSS global)."
+            ));
+        }
+
+        let entry_desc = self.entry_file.as_deref().unwrap_or("aucun détecté");
+        let css_desc = if self.imported_css_in_entry.is_empty() {
+            if self.global_css_files.is_empty() {
+                "aucun".to_string()
+            } else {
+                format!(
+                    "aucun import détecté (disponible : {})",
+                    self.global_css_files.join(", ")
+                )
+            }
+        } else {
+            self.imported_css_in_entry.join(", ")
+        };
+        lines.push(format!(
+            "- Point d'entrée : {entry_desc} | CSS importés : {css_desc}"
+        ));
+        if !self.installed_packages.is_empty() {
+            lines.push(format!(
+                "- Paquets installés (package.json) : {}",
+                self.installed_packages.join(", ")
+            ));
+        }
+
+        if self.css_entry_missing_import && !self.global_css_files.is_empty() {
+            lines.push(format!(
+                "- ⚠️ ALERTE CSS : {} n'est pas importé dans {entry_desc} — ajoute l'import ou écris les styles dans <style>.",
+                self.global_css_files[0]
+            ));
+        }
+
+        lines.join("\n")
+    }
+}
+
+pub fn prompt_mentions_uninstalled_library(
+    user_prompt: &str,
+    stack: Option<&FrontendStackInfo>,
+) -> Vec<String> {
+    let Some(st) = stack else {
+        return Vec::new();
+    };
+    let low = user_prompt.to_lowercase();
+    let table: &[(&[&str], &[&str], &str)] = &[
+        (
+            &["remix-icon", "remixicon", "remix icon"],
+            &["remixicon", "@iconify/vue", "@iconify-json/ri"],
+            "remixicon (ou @iconify/vue) — installer via `npm install remixicon` et importer `import 'remixicon/fonts/remixicon.css'` dans le point d'entrée",
+        ),
+        (
+            &["iconify"],
+            &["@iconify/vue", "@iconify/react", "@iconify/svelte", "iconify-icon"],
+            "@iconify/vue (ou @iconify/react selon le framework) — installer via `npm install`",
+        ),
+        (
+            &["lucide"],
+            &["lucide-vue-next", "lucide-react", "lucide-svelte", "lucide"],
+            "lucide-vue-next (ou lucide-react selon le framework) — installer via `npm install`",
+        ),
+        (
+            &["heroicons", "heroicon"],
+            &["@heroicons/vue", "@heroicons/react"],
+            "@heroicons/vue (ou @heroicons/react) — installer via `npm install`",
+        ),
+        (
+            &["fontawesome", "font-awesome", "font awesome"],
+            &[
+                "@fortawesome/fontawesome-free",
+                "@fortawesome/vue-fontawesome",
+                "@fortawesome/react-fontawesome",
+            ],
+            "@fortawesome/fontawesome-free — installer via `npm install`",
+        ),
+        (
+            &["bootstrap-icons", "bootstrap icons"],
+            &["bootstrap-icons"],
+            "bootstrap-icons — installer via `npm install`",
+        ),
+        (
+            &["tabler icon", "tabler-icons"],
+            &["@tabler/icons-vue", "@tabler/icons-react", "@tabler/icons-webfont"],
+            "@tabler/icons-vue (ou @tabler/icons-react) — installer via `npm install`",
+        ),
+        (
+            &["phosphor"],
+            &["@phosphor-icons/vue", "@phosphor-icons/react", "phosphor-icons"],
+            "@phosphor-icons/vue (ou @phosphor-icons/react) — installer via `npm install`",
+        ),
+        (&["pinia"], &["pinia"], "pinia — installer via `npm install pinia`"),
+        (
+            &["vue-router", "vue router"],
+            &["vue-router"],
+            "vue-router — installer via `npm install vue-router`",
+        ),
+        (&["axios"], &["axios"], "axios — installer via `npm install axios`"),
+        (&["marked"], &["marked"], "marked — installer via `npm install marked`"),
+        (
+            &["highlight.js", "highlightjs"],
+            &["highlight.js"],
+            "highlight.js — installer via `npm install highlight.js`",
+        ),
+        (
+            &["chart.js", "chartjs"],
+            &["chart.js"],
+            "chart.js — installer via `npm install chart.js`",
+        ),
+        (
+            &["echarts"],
+            &["echarts"],
+            "echarts — installer via `npm install echarts`",
+        ),
+        (&["gsap"], &["gsap"], "gsap — installer via `npm install gsap`"),
+        (&["dayjs"], &["dayjs"], "dayjs — installer via `npm install dayjs`"),
+        (&["zod"], &["zod"], "zod — installer via `npm install zod`"),
+    ];
+
+    let mut missing = Vec::new();
+    for &(prompt_markers, aliases, advice) in table {
+        if !prompt_markers.iter().any(|m| low.contains(m)) {
+            continue;
+        }
+        let already_installed = aliases.iter().any(|alias| {
+            st.installed_packages
+                .iter()
+                .any(|pkg| pkg.eq_ignore_ascii_case(alias))
+        });
+        if !already_installed {
+            missing.push(advice.to_string());
+        }
+    }
+    missing
+}
+
+fn resolve_import_spec_to_project_file(
+    from_rel_path: &str,
+    raw_spec: &str,
+    all_files: &[String],
+) -> Option<String> {
+    let spec = raw_spec
+        .trim()
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .replace('\\', "/");
+
+    if spec.is_empty() || spec.starts_with("http://") || spec.starts_with("https://") {
+        return None;
+    }
+
+    let candidate_base = if let Some(rest) = spec.strip_prefix("@/") {
+        format!("src/{rest}")
+    } else if spec.starts_with('/') {
+        spec.trim_start_matches('/').to_string()
+    } else if spec.starts_with("./") || spec.starts_with("../") {
+        let mut stack: Vec<&str> = match from_rel_path.rsplit_once('/') {
+            Some((dir, _)) if !dir.is_empty() => dir.split('/').filter(|s| !s.is_empty()).collect(),
+            _ => Vec::new(),
+        };
+        for seg in spec.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    stack.pop();
+                }
+                other => stack.push(other),
+            }
+        }
+        if stack.is_empty() {
+            return None;
+        }
+        stack.join("/")
+    } else {
+        return None;
+    };
+
+    if let Some(exact) = all_files
+        .iter()
+        .find(|f| f.eq_ignore_ascii_case(&candidate_base))
+    {
+        return Some(exact.clone());
+    }
+
+    for ext in [
+        ".vue", ".tsx", ".ts", ".jsx", ".js", ".svelte", ".css", ".scss",
+    ] {
+        let with_ext = format!("{candidate_base}{ext}");
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(&with_ext)) {
+            return Some(found.clone());
+        }
+    }
+
+    for idx in ["/index.ts", "/index.js", "/index.tsx", "/index.jsx"] {
+        let with_idx = format!("{candidate_base}{idx}");
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(&with_idx)) {
+            return Some(found.clone());
+        }
+    }
+
+    None
+}
+
+pub fn extract_relative_imports(
+    rel_path: &str,
+    content: &str,
+    all_files: &[String],
+) -> Vec<String> {
+    let mut resolved = Vec::new();
+    let import_from_re = Regex::new(
+        r#"(?m)import\s+(?:[^;{}'"]+|\{[^;]*\})\s+from\s+['"]([^'"]+)['"]"#,
+    )
+    .expect("valid import_from regex");
+    let import_side_re =
+        Regex::new(r#"(?m)import\s+['"]([^'"]+)['"]"#).expect("valid import_side regex");
+    let style_src_re =
+        Regex::new(r#"(?i)<style[^>]*\bsrc\s*=\s*['"]([^'"]+)['"]"#).expect("valid style_src regex");
+
+    let mut specs = Vec::new();
+    for cap in import_from_re.captures_iter(content) {
+        if let Some(m) = cap.get(1) {
+            specs.push(m.as_str());
+        }
+    }
+    for cap in import_side_re.captures_iter(content) {
+        if let Some(m) = cap.get(1) {
+            specs.push(m.as_str());
+        }
+    }
+    for cap in style_src_re.captures_iter(content) {
+        if let Some(m) = cap.get(1) {
+            specs.push(m.as_str());
+        }
+    }
+
+    for spec in specs {
+        if let Some(found) = resolve_import_spec_to_project_file(rel_path, spec, all_files) {
+            if !resolved.iter().any(|existing| existing == &found) {
+                resolved.push(found);
+            }
+        }
+    }
+
+    resolved
+}
+
+fn is_stylesheet_path(path: &str) -> bool {
+    let low = path.to_lowercase();
+    low.ends_with(".css") || low.ends_with(".scss")
+}
+
+fn is_ui_component_or_page(path: &str) -> bool {
+    let low = path.to_lowercase();
+    low.ends_with(".vue")
+        || low.ends_with(".tsx")
+        || low.ends_with(".jsx")
+        || low.ends_with(".svelte")
+        || low.ends_with(".html")
+}
+
+pub fn detect_frontend_stack(
+    project_root: &Path,
+    all_files: &[String],
+) -> Option<FrontendStackInfo> {
+    let is_frontend_repo = all_files.iter().any(|f| {
+        let low = f.to_lowercase();
+        let base = low.rsplit('/').next().unwrap_or(&low);
+        base == "package.json"
+            || base == "index.html"
+            || low.ends_with(".vue")
+            || low.ends_with(".tsx")
+            || low.ends_with(".jsx")
+            || low.ends_with(".svelte")
+            || low.ends_with(".css")
+            || low.ends_with(".scss")
+    });
+    if !is_frontend_repo {
+        return None;
+    }
+
+    let mut info = FrontendStackInfo::default();
+
+    if let Some(pkg_rel) = all_files.iter().find(|f| f.eq_ignore_ascii_case("package.json")) {
+        let full = project_root.join(pkg_rel);
+        if let Ok(meta) = std::fs::metadata(&full) {
+            if meta.is_file() && meta.len() <= 65_536 {
+                if let Ok(raw) = std::fs::read_to_string(&full) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let has_dep = |name: &str| -> bool {
+                            json.get("dependencies")
+                                .and_then(|d| d.get(name))
+                                .is_some()
+                                || json
+                                    .get("devDependencies")
+                                    .and_then(|d| d.get(name))
+                                    .is_some()
+                        };
+
+                        info.framework = if has_dep("next") {
+                            Some("Next.js".to_string())
+                        } else if has_dep("nuxt") {
+                            Some("Nuxt".to_string())
+                        } else if has_dep("vue") {
+                            Some("Vue".to_string())
+                        } else if has_dep("react") {
+                            Some("React".to_string())
+                        } else if has_dep("svelte") {
+                            Some("Svelte".to_string())
+                        } else {
+                            None
+                        };
+
+                        if has_dep("vite") {
+                            info.bundler = Some("Vite".to_string());
+                        }
+
+                        info.tailwind_in_pkg = has_dep("tailwindcss")
+                            || has_dep("@tailwindcss/vite")
+                            || has_dep("@tailwindcss/postcss");
+
+                        let mut pkgs = Vec::new();
+                        for section in ["dependencies", "devDependencies"] {
+                            if let Some(obj) = json.get(section).and_then(|v| v.as_object()) {
+                                for k in obj.keys() {
+                                    if !pkgs.iter().any(|p: &String| p.eq_ignore_ascii_case(k)) {
+                                        pkgs.push(k.clone());
+                                    }
+                                }
+                            }
+                        }
+                        pkgs.sort_by_key(|p| p.to_lowercase());
+                        pkgs.truncate(40);
+                        info.installed_packages = pkgs;
+                    }
+                }
+            }
+        }
+    }
+
+    for entry_cand in [
+        "src/main.ts",
+        "src/main.js",
+        "src/main.tsx",
+        "src/main.jsx",
+        "src/index.ts",
+        "src/index.js",
+        "src/index.tsx",
+        "src/index.jsx",
+    ] {
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(entry_cand)) {
+            info.entry_file = Some(found.clone());
+            break;
+        }
+    }
+
+    let css_candidates = [
+        "src/style.css",
+        "src/styles.css",
+        "src/styles/main.css",
+        "src/assets/main.css",
+        "src/assets/base.css",
+        "src/index.css",
+        "src/main.css",
+        "src/app.css",
+        "src/App.css",
+        "app/globals.css",
+        "style.css",
+        "styles.css",
+    ];
+    for cand in css_candidates {
+        if info.global_css_files.len() >= 3 {
+            break;
+        }
+        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
+            if !info.global_css_files.contains(found) {
+                info.global_css_files.push(found.clone());
+            }
+        }
+    }
+    if info.global_css_files.is_empty() {
+        if let Some(fallback_css) = all_files
+            .iter()
+            .filter(|f| is_stylesheet_path(f))
+            .min_by_key(|f| (f.matches('/').count(), f.len()))
+        {
+            info.global_css_files.push(fallback_css.clone());
+        }
+    }
+
+    let mut push_imported_css = |p: String| {
+        if is_stylesheet_path(&p)
+            && !info
+                .imported_css_in_entry
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&p))
+        {
+            info.imported_css_in_entry.push(p);
+        }
+    };
+
+    if let Some(ref entry) = info.entry_file.clone() {
+        if let Ok(content) = std::fs::read_to_string(project_root.join(entry)) {
+            for imp in extract_relative_imports(entry, &content, all_files) {
+                push_imported_css(imp);
+            }
+        }
+    }
+
+    for root_app in [
+        "src/App.vue",
+        "src/App.tsx",
+        "src/App.jsx",
+        "src/App.svelte",
+    ] {
+        if let Some(found_app) = all_files.iter().find(|f| f.eq_ignore_ascii_case(root_app)) {
+            if let Ok(content) = std::fs::read_to_string(project_root.join(found_app)) {
+                for imp in extract_relative_imports(found_app, &content, all_files) {
+                    push_imported_css(imp);
+                }
+            }
+        }
+    }
+
+    let mut has_tailwind_cdn = false;
+    if let Some(index_html) = all_files.iter().find(|f| f.eq_ignore_ascii_case("index.html")) {
+        if let Ok(html_content) = std::fs::read_to_string(project_root.join(index_html)) {
+            if html_content.contains("cdn.tailwindcss.com") {
+                has_tailwind_cdn = true;
+            }
+            let link_re =
+                Regex::new(r#"(?i)<link\b[^>]*rel\s*=\s*['"]stylesheet['"][^>]*>"#)
+                    .expect("valid link regex");
+            let href_re =
+                Regex::new(r#"(?i)\bhref\s*=\s*['"]([^'"]+)['"]"#).expect("valid href regex");
+            for m in link_re.find_iter(&html_content) {
+                if let Some(cap) = href_re.captures(m.as_str()) {
+                    if let Some(href) = cap.get(1) {
+                        if let Some(resolved_css) =
+                            resolve_import_spec_to_project_file(index_html, href.as_str(), all_files)
+                        {
+                            push_imported_css(resolved_css);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let any_global_in_entry = info.global_css_files.iter().any(|g| {
+        info.imported_css_in_entry
+            .iter()
+            .any(|imp| imp.eq_ignore_ascii_case(g))
+    });
+    info.css_entry_missing_import = !info.global_css_files.is_empty()
+        && info.entry_file.is_some()
+        && !any_global_in_entry
+        && info.imported_css_in_entry.is_empty();
+
+    if has_tailwind_cdn {
+        info.tailwind_active = true;
+    } else if info.tailwind_in_pkg {
+        let mut css_to_check = info.imported_css_in_entry.clone();
+        for g in &info.global_css_files {
+            if !css_to_check.iter().any(|c| c.eq_ignore_ascii_case(g)) {
+                css_to_check.push(g.clone());
+            }
+        }
+        let has_css_directive = css_to_check.iter().any(|css_rel| {
+            std::fs::read_to_string(project_root.join(css_rel))
+                .map(|body| {
+                    body.contains("@tailwind")
+                        || body.contains("@import \"tailwindcss\"")
+                        || body.contains("@import 'tailwindcss'")
+                        || body.contains("@import \"tailwindcss/")
+                        || body.contains("@import 'tailwindcss/")
+                })
+                .unwrap_or(false)
+        });
+
+        let has_vite_tw = [
+            "vite.config.ts",
+            "vite.config.js",
+            "vite.config.mjs",
+            "vite.config.cjs",
+        ]
+        .iter()
+        .any(|cfg| {
+            all_files
+                .iter()
+                .find(|f| f.eq_ignore_ascii_case(cfg))
+                .and_then(|rel| std::fs::read_to_string(project_root.join(rel)).ok())
+                .map(|c| c.contains("tailwindcss"))
+                .unwrap_or(false)
+        });
+
+        let has_postcss_tw = [
+            "postcss.config.js",
+            "postcss.config.cjs",
+            "postcss.config.mjs",
+            "postcss.config.ts",
+        ]
+        .iter()
+        .any(|cfg| {
+            all_files
+                .iter()
+                .find(|f| f.eq_ignore_ascii_case(cfg))
+                .and_then(|rel| std::fs::read_to_string(project_root.join(rel)).ok())
+                .map(|c| c.contains("tailwind"))
+                .unwrap_or(false)
+        });
+
+        let has_build_wiring = has_vite_tw
+            || has_postcss_tw
+            || matches!(info.framework.as_deref(), Some("Next.js" | "Nuxt"));
+
+        info.tailwind_active =
+            has_css_directive && has_build_wiring && !info.css_entry_missing_import;
+
+        if !info.tailwind_active {
+            let mut reasons = Vec::new();
+            if !has_build_wiring {
+                reasons.push("plugin Vite/PostCSS manquant");
+            }
+            if !has_css_directive {
+                reasons.push("directive @tailwind / @import \"tailwindcss\" absente");
+            }
+            if info.css_entry_missing_import {
+                reasons.push("feuille CSS non importée dans le point d'entrée");
+            }
+            if !reasons.is_empty() {
+                info.tailwind_broken_reason = Some(reasons.join(", "));
+            }
+        }
+    }
+
+    Some(info)
+}
+
+pub fn expand_design_targets_with_imports(
+    project_root: &Path,
+    all_files: &[String],
+    matched: &mut Vec<String>,
+    stack: Option<&FrontendStackInfo>,
+    max_files: usize,
+) {
+    augment_design_target_files(all_files, matched);
+    let cap = max_files.max(1);
+
+    let snapshot = matched.clone();
+    for rel in snapshot {
+        if matched.len() >= cap {
+            break;
+        }
+        if !is_ui_component_or_page(&rel) {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(project_root.join(&rel)) {
+            for imp in extract_relative_imports(&rel, &content, all_files) {
+                if matched.len() >= cap {
+                    break;
+                }
+                if (is_ui_component_or_page(&imp) || is_stylesheet_path(&imp))
+                    && !matched.iter().any(|existing| existing.eq_ignore_ascii_case(&imp))
+                {
+                    matched.push(imp);
+                }
+            }
+        }
+    }
+
+    if let Some(st) = stack {
+        if st.css_entry_missing_import && matched.len() < cap {
+            if let Some(ref entry) = st.entry_file {
+                if !matched.iter().any(|existing| existing.eq_ignore_ascii_case(entry)) {
+                    matched.push(entry.clone());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CssAuditReport {
+    pub issues: Vec<String>,
+    pub flagged_files: Vec<String>,
+    pub needs_entry_import: Option<String>,
+}
+
+fn collect_css_class_selectors(css_text: &str, out: &mut HashSet<String>) {
+    let re = Regex::new(r"\.([A-Za-z_][A-Za-z0-9_-]*)").expect("valid css selector regex");
+    for cap in re.captures_iter(css_text) {
+        if let Some(m) = cap.get(1) {
+            out.insert(m.as_str().to_string());
+        }
+    }
+}
+
+fn is_tailwind_utility_token(tok: &str) -> bool {
+    if tok.is_empty() || tok.contains("://") {
+        return false;
+    }
+    let core = tok.rsplit(':').next().unwrap_or(tok).trim_start_matches('!');
+    if matches!(
+        core,
+        "h-screen"
+            | "w-screen"
+            | "min-h-screen"
+            | "flex-1"
+            | "flex-col"
+            | "items-center"
+            | "justify-between"
+            | "justify-end"
+            | "justify-start"
+            | "mx-auto"
+            | "rounded-lg"
+            | "rounded-xl"
+            | "rounded-full"
+            | "text-white"
+            | "overflow-y-auto"
+            | "shrink-0"
+    ) {
+        return true;
+    }
+
+    let prefixes = [
+        "w-[",
+        "h-[",
+        "bg-[",
+        "text-[",
+        "bg-gradient-to-",
+        "from-",
+        "to-",
+        "via-",
+        "space-y-",
+        "gap-",
+        "px-",
+        "py-",
+        "bg-gray-",
+        "bg-slate-",
+        "bg-zinc-",
+        "bg-neutral-",
+        "bg-blue-",
+        "bg-orange-",
+        "bg-red-",
+        "text-gray-",
+        "border-gray-",
+    ];
+    prefixes
+        .iter()
+        .any(|p| core.starts_with(p) && core.len() > p.len())
+}
+
+fn has_non_empty_css_rule(css_text: &str) -> bool {
+    let stripped_block = Regex::new(r"/\*[\s\S]*?\*/")
+        .map(|re| re.replace_all(css_text, "").into_owned())
+        .unwrap_or_else(|_| css_text.to_string());
+    if let (Some(open), Some(close)) = (stripped_block.find('{'), stripped_block.rfind('}')) {
+        open < close && !stripped_block[open + 1..close].trim().is_empty()
+    } else {
+        false
+    }
+}
+
+pub fn audit_frontend_css_issues(
+    project_root: &Path,
+    all_files: &[String],
+    touched_files: &[String],
+    is_designer_task: bool,
+) -> CssAuditReport {
+    let mut report = CssAuditReport::default();
+    let Some(stack) = detect_frontend_stack(project_root, all_files) else {
+        return report;
+    };
+
+    let mut global_css_classes = HashSet::new();
+    for rel in all_files.iter().filter(|f| is_stylesheet_path(f)).take(12) {
+        let full = project_root.join(rel);
+        if let Ok(meta) = std::fs::metadata(&full) {
+            if meta.is_file() && meta.len() <= 131_072 {
+                if let Ok(css_body) = std::fs::read_to_string(&full) {
+                    collect_css_class_selectors(&css_body, &mut global_css_classes);
+                }
+            }
+        }
+    }
+
+    let style_block_re =
+        Regex::new(r"(?is)<style\b[^>]*>([\s\S]*?)(?:</style>|$)").expect("valid style regex");
+    let class_attr_re = Regex::new(
+        r#"(?i)\b(?:class|className)\s*=\s*(?:"([^"]*)"|'([^']*)'|\{[`'"]([^}`'"]*)[`'"]\})"#,
+    )
+    .expect("valid class attr regex");
+    let template_block_re =
+        Regex::new(r"(?is)<template\b[^>]*>([\s\S]*?)</template>").expect("valid template regex");
+
+    let mut push_flagged = |rel: &str| {
+        if !report
+            .flagged_files
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(rel))
+        {
+            report.flagged_files.push(rel.to_string());
+        }
+    };
+
+    // Anomalie 1 : classes utilitaires Tailwind orphelines lorsque Tailwind n'est pas actif
+    if !stack.tailwind_active {
+        for rel in touched_files {
+            if !is_ui_component_or_page(rel) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(project_root.join(rel)) else {
+                continue;
+            };
+
+            let mut local_css_classes = HashSet::new();
+            for cap in style_block_re.captures_iter(&content) {
+                if let Some(m) = cap.get(1) {
+                    collect_css_class_selectors(m.as_str(), &mut local_css_classes);
+                }
+            }
+
+            let mut orphan_tokens = Vec::new();
+            let mut seen_tokens = HashSet::new();
+            for cap in class_attr_re.captures_iter(&content) {
+                let raw_val = cap
+                    .get(1)
+                    .or_else(|| cap.get(2))
+                    .or_else(|| cap.get(3))
+                    .map(|m| m.as_str())
+                    .unwrap_or("");
+                for raw_tok in raw_val.split_whitespace() {
+                    let tok = raw_tok.trim_matches(|c: char| matches!(c, ',' | ';' | '"' | '\''));
+                    if tok.is_empty() || tok.contains("${") || tok.contains("{{") {
+                        continue;
+                    }
+                    if global_css_classes.contains(tok) || local_css_classes.contains(tok) {
+                        continue;
+                    }
+                    if is_tailwind_utility_token(tok) && seen_tokens.insert(tok.to_string()) {
+                        orphan_tokens.push(tok.to_string());
+                    }
+                }
+            }
+
+            if orphan_tokens.len() >= 4 {
+                let sample: Vec<String> = orphan_tokens.into_iter().take(6).collect();
+                let reason = stack
+                    .tailwind_broken_reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                report.issues.push(format!(
+                    "Le fichier `{rel}` utilise des classes utilitaires Tailwind sans effet ({}) car Tailwind CSS n'est pas actif{reason} : convertis-les en vrai CSS explicite dans `<style>` ou dans la feuille CSS globale.",
+                    sample.join(", ")
+                ));
+                push_flagged(rel);
+            }
+        }
+    }
+
+    // Anomalie 2 : feuille CSS globale existante non importée dans le point d'entrée
+    if stack.css_entry_missing_import && !stack.global_css_files.is_empty() {
+        let entry = stack.entry_file.clone().unwrap_or_default();
+        report.issues.push(format!(
+            "La feuille CSS globale `{}` n'est importée ni dans `{entry}` ni dans `App` / `index.html` : aucun style global ne sera chargé.",
+            stack.global_css_files[0]
+        ));
+        if !entry.is_empty() {
+            report.needs_entry_import = Some(entry);
+        }
+    }
+
+    // Anomalie 3 : tâche Designer sans Tailwind actif, aucune règle CSS écrite
+    if is_designer_task && !stack.tailwind_active {
+        let has_touched_css_rules = touched_files
+            .iter()
+            .filter(|f| is_stylesheet_path(f))
+            .any(|css_rel| {
+                std::fs::read_to_string(project_root.join(css_rel))
+                    .map(|body| has_non_empty_css_rule(&body))
+                    .unwrap_or(false)
+            });
+
+        if !has_touched_css_rules {
+            for rel in touched_files {
+                if !rel.to_lowercase().ends_with(".vue") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(project_root.join(rel)) else {
+                    continue;
+                };
+                let has_structural_template = template_block_re
+                    .captures(&content)
+                    .and_then(|c| c.get(1))
+                    .map(|m| {
+                        let low_tpl = m.as_str().to_lowercase();
+                        ["<div", "<aside", "<main", "<nav", "<section", "<header"]
+                            .iter()
+                            .any(|tag| low_tpl.contains(tag))
+                    })
+                    .unwrap_or(false);
+                if !has_structural_template {
+                    continue;
+                }
+
+                let has_style_rules = style_block_re
+                    .captures_iter(&content)
+                    .any(|cap| cap.get(1).map(|m| m.as_str().contains('{')).unwrap_or(false));
+                if !has_style_rules {
+                    report.issues.push(format!(
+                        "Le composant `{rel}` contient une structure `<template>` sans aucun bloc `<style>` avec des règles CSS (et aucun fichier CSS global n'a été mis à jour)."
+                    ));
+                    push_flagged(rel);
+                }
+            }
+        }
+    }
+
+    report
 }
 
 fn role_display_name(role: &str) -> &'static str {
@@ -1111,8 +2002,12 @@ pub fn match_files_deterministically(
         return (matched, true);
     }
 
+    let is_install = is_install_or_setup_prompt(&prompt_lower);
+    let wants_tailwind_setup = is_install && prompt_lower.contains("tailwind");
+    let max_kw_matches = if wants_tailwind_setup { 3 } else { 2 };
+
     let mut add_if_exists = |cand: &str| {
-        if matched.len() >= 2 {
+        if matched.len() >= max_kw_matches {
             return;
         }
         if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
@@ -1150,6 +2045,58 @@ pub fn match_files_deterministically(
         || prompt_lower.contains("dependencies")
     {
         add_if_exists("package.json");
+    }
+    if is_install
+        || prompt_lower.contains("npm ")
+        || prompt_lower.contains("pnpm ")
+        || prompt_lower.contains("yarn ")
+    {
+        if !prompt_lower.contains("cargo ") && !prompt_lower.contains("pip ") {
+            add_if_exists("package.json");
+        }
+        if prompt_lower.contains("tailwind")
+            || prompt_lower.contains("vite")
+            || prompt_lower.contains("plugin")
+        {
+            let has_vite_cfg = all_files.iter().any(|f| {
+                f.eq_ignore_ascii_case("vite.config.ts")
+                    || f.eq_ignore_ascii_case("vite.config.js")
+            });
+            if has_vite_cfg {
+                if all_files
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case("vite.config.ts"))
+                {
+                    add_if_exists("vite.config.ts");
+                } else {
+                    add_if_exists("vite.config.js");
+                }
+            } else {
+                for cand in [
+                    "postcss.config.js",
+                    "postcss.config.cjs",
+                    "tailwind.config.ts",
+                    "tailwind.config.js",
+                ] {
+                    add_if_exists(cand);
+                }
+            }
+        }
+        if wants_tailwind_setup {
+            for css_cand in [
+                "src/index.css",
+                "src/style.css",
+                "src/styles/main.css",
+                "src/assets/main.css",
+                "src/main.css",
+                "app/globals.css",
+            ] {
+                if all_files.iter().any(|f| f.eq_ignore_ascii_case(css_cand)) {
+                    add_if_exists(css_cand);
+                    break;
+                }
+            }
+        }
     }
 
     (matched, false)
@@ -1196,10 +2143,50 @@ pub fn collect_structural_context_files(
     target_files: &[String],
     is_cloud_exec: bool,
     is_global_task: bool,
+    is_design_task: bool,
     exec_num_ctx: usize,
 ) -> Vec<String> {
-    if !is_global_task && !(is_cloud_exec && target_files.is_empty()) {
+    if !is_global_task && !(is_cloud_exec && target_files.is_empty()) && !is_design_task {
         return Vec::new();
+    }
+
+    let push_if_new = |cand: &str, out: &mut Vec<String>| {
+        if target_files.iter().any(|t| t.eq_ignore_ascii_case(cand)) {
+            return;
+        }
+        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(cand)) {
+            out.push(cand.to_string());
+        }
+    };
+
+    if is_design_task && !is_global_task {
+        let (max_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
+            (3usize, 6_144u64, 20_480u64)
+        } else {
+            (2usize, 6_144u64, 6_144u64)
+        };
+        let mut candidates = Vec::new();
+        for name in [
+            "index.html",
+            "src/main.js",
+            "src/main.ts",
+            "src/main.tsx",
+            "src/main.jsx",
+            "vite.config.js",
+            "vite.config.ts",
+            "package.json",
+        ] {
+            if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(name)) {
+                push_if_new(found, &mut candidates);
+            }
+        }
+        return filter_files_by_size_budget(
+            project_root,
+            candidates,
+            max_files,
+            max_single_bytes,
+            max_total_bytes,
+        );
     }
 
     let (max_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
@@ -1211,15 +2198,6 @@ pub fn collect_structural_context_files(
     };
 
     let mut candidates: Vec<String> = Vec::new();
-    let push_if_new = |cand: &str, out: &mut Vec<String>| {
-        if target_files.iter().any(|t| t.eq_ignore_ascii_case(cand)) {
-            return;
-        }
-        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(cand)) {
-            out.push(cand.to_string());
-        }
-    };
-
     let manifests = [
         "package.json",
         "Cargo.toml",
@@ -1229,11 +2207,16 @@ pub fn collect_structural_context_files(
         "requirements.txt",
         "go.mod",
         "vite.config.ts",
+        "vite.config.js",
         "tsconfig.json",
+        "index.html",
         "README.md",
         "src/App.vue",
         "src/App.tsx",
         "src/main.ts",
+        "src/main.js",
+        "src/main.tsx",
+        "src/main.jsx",
         "src-tauri/src/lib.rs",
         "src-tauri/src/models.rs",
     ];
@@ -1262,6 +2245,7 @@ struct CartographerPlan {
     cartographer_tokens: Option<(usize, usize)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_cartographer(
     project_root: &Path,
     all_files: &[String],
@@ -1273,6 +2257,7 @@ async fn run_cartographer(
     exec_provider: &str,
     ollama_running: bool,
     is_design_task: bool,
+    frontend_stack: Option<&FrontendStackInfo>,
 ) -> CartographerPlan {
     if all_files.is_empty() {
         let is_global_task = is_global_or_doc_task(user_prompt, &[]);
@@ -1289,17 +2274,24 @@ async fn run_cartographer(
     let is_cloud_exec = exec_provider != "ollama";
     let exec_num_ctx = effective_num_ctx(settings);
     let (max_target_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
-        (6usize, 65_536u64, 163_840u64)
+        (8usize, 65_536u64, 180_000u64)
     } else if exec_num_ctx >= 16_384 {
-        (4usize, 32_768u64, 57_344u64)
+        (5usize, 32_768u64, 65_536u64)
     } else {
-        (3usize, 20_480u64, 28_672u64)
+        (4usize, 20_480u64, 32_768u64)
     };
     let doc_focused_prompt = is_doc_focused_prompt(&user_prompt.to_lowercase());
+    let install_setup_prompt = is_install_or_setup_prompt(user_prompt);
 
     let (mut tier1, explicit) = match_files_deterministically(user_prompt, attachments, all_files);
-    if is_design_task && !tier1.is_empty() && !doc_focused_prompt {
-        augment_design_target_files(all_files, &mut tier1);
+    if is_design_task && !tier1.is_empty() && !doc_focused_prompt && !install_setup_prompt {
+        expand_design_targets_with_imports(
+            project_root,
+            all_files,
+            &mut tier1,
+            frontend_stack,
+            max_target_files,
+        );
     }
     let budgeted_tier1 = filter_files_by_size_budget(
         project_root,
@@ -1318,140 +2310,213 @@ async fn run_cartographer(
             };
             (budgeted_tier1, explicit, note, None)
         } else {
-            let can_call_llm = if carto_provider == "ollama" {
-                ollama_running
-            } else {
-                providers::find_provider_key(settings, carto_provider).is_some()
-            };
-
-            if !can_call_llm || all_files.len() < 2 {
-                let mut fallback = Vec::new();
-                if is_design_task && !doc_focused_prompt {
-                    augment_design_target_files(all_files, &mut fallback);
-                }
-                let budgeted = filter_files_by_size_budget(
+            // Voie rapide 0 token pour petits dépôts UI : graphe UI + imports sans LLM routeur
+            let mut fast_ui_budgeted = Vec::new();
+            if is_design_task && !doc_focused_prompt && !install_setup_prompt && all_files.len() <= 24 {
+                let mut fast_ui = Vec::new();
+                expand_design_targets_with_imports(
                     project_root,
-                    fallback,
+                    all_files,
+                    &mut fast_ui,
+                    frontend_stack,
+                    max_target_files,
+                );
+                fast_ui_budgeted = filter_files_by_size_budget(
+                    project_root,
+                    fast_ui,
                     max_target_files,
                     max_single_bytes,
                     max_total_bytes,
                 );
+            }
+
+            if !fast_ui_budgeted.is_empty() {
                 (
-                    budgeted,
+                    fast_ui_budgeted,
                     false,
-                    "Ciblage auto · repo-map native".to_string(),
-                    None,
-                )
-            } else if all_files.len() > 400 {
-                let mut fallback = Vec::new();
-                if is_design_task && !doc_focused_prompt {
-                    augment_design_target_files(all_files, &mut fallback);
-                }
-                let budgeted = filter_files_by_size_budget(
-                    project_root,
-                    fallback,
-                    max_target_files,
-                    max_single_bytes,
-                    max_total_bytes,
-                );
-                (
-                    budgeted,
-                    false,
-                    "Dépôt volumineux (>400 fichiers) · repo-map native".to_string(),
+                    "0 tok déterministe (graphe UI + imports)".to_string(),
                     None,
                 )
             } else {
-                let mut prioritized = Vec::new();
-                let mut others = Vec::new();
-                for f in all_files {
-                    if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
-                        prioritized.push(f.clone());
-                    } else {
-                        others.push(f.clone());
-                    }
-                }
-                prioritized.extend(others);
-                let compact_limit = if is_cloud_exec { 200 } else { 100 };
-                let compact_files: Vec<String> =
-                    prioritized.into_iter().take(compact_limit).collect();
-
-                let sys = if is_cloud_exec {
-                    "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum 6 chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication."
+                let can_call_llm = if carto_provider == "ollama" {
+                    ollama_running
+                        || providers::build_fallback_candidates(
+                            carto_provider,
+                            carto_model,
+                            "cartographer",
+                            settings,
+                            ollama_running,
+                        )
+                        .iter()
+                        .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
                 } else {
-                    "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum 3 chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication."
+                    providers::find_provider_key(settings, carto_provider).is_some()
+                        || ollama_running
+                        || providers::build_fallback_candidates(
+                            carto_provider,
+                            carto_model,
+                            "cartographer",
+                            settings,
+                            ollama_running,
+                        )
+                        .iter()
+                        .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
                 };
-                let user = format!(
-                    "Fichiers:\n{}\n\nDemande:\n{}",
-                    compact_files.join("\n"),
-                    truncate_chars(user_prompt.trim(), 400)
-                );
 
-                match providers::call_provider_oneshot(
-                    carto_provider,
-                    carto_model,
-                    settings,
-                    sys,
-                    &user,
-                    120,
-                    0.0,
-                )
-                .await
-                {
-                    Ok((reply, p_tok, c_tok)) => {
-                        let mut routed = Vec::new();
-                        if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
-                            if start < end {
-                                if let Ok(arr) =
-                                    serde_json::from_str::<Vec<String>>(&reply[start..=end])
-                                {
-                                    for cand in arr {
-                                        let clean = cand.trim().trim_start_matches("./");
-                                        if let Some(canon) =
-                                            all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
-                                        {
-                                            if !routed.contains(canon) {
-                                                routed.push(canon.clone());
+                if !can_call_llm || all_files.len() < 2 {
+                    let mut fallback = Vec::new();
+                    if is_design_task && !doc_focused_prompt && !install_setup_prompt {
+                        expand_design_targets_with_imports(
+                            project_root,
+                            all_files,
+                            &mut fallback,
+                            frontend_stack,
+                            max_target_files,
+                        );
+                    }
+                    let budgeted = filter_files_by_size_budget(
+                        project_root,
+                        fallback,
+                        max_target_files,
+                        max_single_bytes,
+                        max_total_bytes,
+                    );
+                    (
+                        budgeted,
+                        false,
+                        "Ciblage auto · repo-map native".to_string(),
+                        None,
+                    )
+                } else if all_files.len() > 400 {
+                    let mut fallback = Vec::new();
+                    if is_design_task && !doc_focused_prompt {
+                        expand_design_targets_with_imports(
+                            project_root,
+                            all_files,
+                            &mut fallback,
+                            frontend_stack,
+                            max_target_files,
+                        );
+                    }
+                    let budgeted = filter_files_by_size_budget(
+                        project_root,
+                        fallback,
+                        max_target_files,
+                        max_single_bytes,
+                        max_total_bytes,
+                    );
+                    (
+                        budgeted,
+                        false,
+                        "Dépôt volumineux (>400 fichiers) · repo-map native".to_string(),
+                        None,
+                    )
+                } else {
+                    let mut prioritized = Vec::new();
+                    let mut others = Vec::new();
+                    for f in all_files {
+                        if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
+                            prioritized.push(f.clone());
+                        } else {
+                            others.push(f.clone());
+                        }
+                    }
+                    prioritized.extend(others);
+                    let compact_limit = if is_cloud_exec { 200 } else { 100 };
+                    let compact_files: Vec<String> =
+                        prioritized.into_iter().take(compact_limit).collect();
+
+                    let sys = format!(
+                        "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum {max_target_files} chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication."
+                    );
+                    let user = format!(
+                        "Fichiers:\n{}\n\nDemande:\n{}",
+                        compact_files.join("\n"),
+                        truncate_chars(user_prompt.trim(), 1600)
+                    );
+
+                    match providers::call_provider_oneshot_with_fallback(
+                        carto_provider,
+                        carto_model,
+                        "cartographer",
+                        ollama_running,
+                        settings,
+                        &sys,
+                        &user,
+                        160,
+                        0.0,
+                    )
+                    .await
+                    {
+                        Ok((reply, p_tok, c_tok, used_prov, _used_mdl, fb_reason)) => {
+                            let mut routed = Vec::new();
+                            if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
+                                if start < end {
+                                    if let Ok(arr) =
+                                        serde_json::from_str::<Vec<String>>(&reply[start..=end])
+                                    {
+                                        for cand in arr {
+                                            let clean = cand.trim().trim_start_matches("./");
+                                            if let Some(canon) =
+                                                all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
+                                            {
+                                                if !routed.contains(canon) {
+                                                    routed.push(canon.clone());
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+                            if is_design_task && !doc_focused_prompt {
+                                expand_design_targets_with_imports(
+                                    project_root,
+                                    all_files,
+                                    &mut routed,
+                                    frontend_stack,
+                                    max_target_files,
+                                );
+                            }
+                            let budgeted = filter_files_by_size_budget(
+                                project_root,
+                                routed,
+                                max_target_files,
+                                max_single_bytes,
+                                max_total_bytes,
+                            );
+                            let fb_tag = if fb_reason.is_some() { " (repli)" } else { "" };
+                            let note = if budgeted.is_empty() {
+                                format!("Routeur IA ({used_prov}{fb_tag} · aucun fichier ciblé)")
+                            } else {
+                                format!("Routeur IA ({used_prov}{fb_tag})")
+                            };
+                            (budgeted, false, note, Some((p_tok, c_tok)))
                         }
-                        if is_design_task && !doc_focused_prompt {
-                            augment_design_target_files(all_files, &mut routed);
+                        Err(_) => {
+                            let mut fallback = Vec::new();
+                            if is_design_task && !doc_focused_prompt {
+                                expand_design_targets_with_imports(
+                                    project_root,
+                                    all_files,
+                                    &mut fallback,
+                                    frontend_stack,
+                                    max_target_files,
+                                );
+                            }
+                            let budgeted = filter_files_by_size_budget(
+                                project_root,
+                                fallback,
+                                max_target_files,
+                                max_single_bytes,
+                                max_total_bytes,
+                            );
+                            (
+                                budgeted,
+                                false,
+                                "Repli repo-map native".to_string(),
+                                None,
+                            )
                         }
-                        let budgeted = filter_files_by_size_budget(
-                            project_root,
-                            routed,
-                            max_target_files,
-                            max_single_bytes,
-                            max_total_bytes,
-                        );
-                        let note = if budgeted.is_empty() {
-                            "Routeur IA (aucun fichier ciblé)".to_string()
-                        } else {
-                            format!("Routeur IA ({carto_provider})")
-                        };
-                        (budgeted, false, note, Some((p_tok, c_tok)))
-                    }
-                    Err(_) => {
-                        let mut fallback = Vec::new();
-                        if is_design_task && !doc_focused_prompt {
-                            augment_design_target_files(all_files, &mut fallback);
-                        }
-                        let budgeted = filter_files_by_size_budget(
-                            project_root,
-                            fallback,
-                            max_target_files,
-                            max_single_bytes,
-                            max_total_bytes,
-                        );
-                        (
-                            budgeted,
-                            false,
-                            "Repli repo-map native".to_string(),
-                            None,
-                        )
                     }
                 }
             }
@@ -1464,6 +2529,7 @@ async fn run_cartographer(
         &target_files,
         is_cloud_exec,
         is_global_task,
+        is_design_task && !doc_focused_prompt,
         exec_num_ctx,
     );
     let strategy_note = if read_only_files.is_empty() {
@@ -1552,12 +2618,17 @@ pub fn choose_execution_strategy(
         384
     };
 
-    let max_turns = if provider != "ollama" {
-        5
+    let base_turns = if provider != "ollama" {
+        7usize
     } else if num_ctx >= 16_384 {
-        3
+        5usize
     } else {
-        2
+        3usize
+    };
+    let max_turns = if target_files.len() > 1 || !explicit_match {
+        base_turns + 1
+    } else {
+        base_turns
     };
 
     ExecutionStrategy {
@@ -1630,19 +2701,160 @@ fn has_unclosed_fence_or_patch(text: &str) -> bool {
     if fence_count % 2 == 1 {
         return true;
     }
-    let search_count = text.matches("<<<<<<< SEARCH").count();
-    let replace_count = text.matches(">>>>>>> REPLACE").count();
+    let search_count = text.lines().filter(|l| patcher::is_search_marker(l)).count();
+    let replace_count = text.lines().filter(|l| patcher::is_replace_marker(l)).count();
     search_count > replace_count
 }
 
+fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
+    crate::tools::build_native_tool_definitions(has_mcp)
+}
+
+pub fn load_project_architecture_memory(
+    project_root: &Path,
+    max_chars: usize,
+) -> Option<(String, String)> {
+    const CANDIDATES: [&str; 3] = [
+        ".vaix/architecture.md",
+        "AGENTS.md",
+        ".aider/conventions.md",
+    ];
+    for rel in CANDIDATES {
+        let p = project_root.join(rel);
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some((rel.to_string(), truncate_chars(trimmed, max_chars)));
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectStep {
+    pub title: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedArchitectPlan {
+    pub role: Option<String>,
+    pub run_tests: bool,
+    pub spec: Option<String>,
+    pub steps: Vec<ArchitectStep>,
+}
+
+fn normalize_exec_role(raw: &str) -> Option<String> {
+    match raw.trim().to_lowercase().as_str() {
+        "designer" => Some("designer".to_string()),
+        "coder" => Some("coder".to_string()),
+        "refactoring" => Some("refactoring".to_string()),
+        "tester" => Some("tester".to_string()),
+        _ => None,
+    }
+}
+
+pub fn parse_architect_plan(raw: &str, default_role: &str) -> ParsedArchitectPlan {
+    let mut plan = ParsedArchitectPlan::default();
+    let Some(start) = raw.find('{') else {
+        return plan;
+    };
+    let Some(end) = raw.rfind('}') else {
+        return plan;
+    };
+    if start >= end {
+        return plan;
+    }
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
+        return plan;
+    };
+
+    if let Some(r) = val.get("role").and_then(|v| v.as_str()) {
+        plan.role = normalize_exec_role(r);
+    }
+    plan.run_tests = val
+        .get("runTests")
+        .or_else(|| val.get("run_tests"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if let Some(spec) = val.get("spec").and_then(|v| v.as_str()) {
+        let clean_spec = spec.trim();
+        if !clean_spec.is_empty() {
+            plan.spec = Some(truncate_chars(clean_spec, 1400));
+        }
+    }
+
+    let step_fallback_role = plan
+        .role
+        .clone()
+        .or_else(|| normalize_exec_role(default_role))
+        .unwrap_or_else(|| "coder".to_string());
+
+    if let Some(arr) = val.get("steps").and_then(|v| v.as_array()) {
+        for item in arr {
+            if plan.steps.len() >= 5 {
+                break;
+            }
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let instructions = item
+                .get("instructions")
+                .or_else(|| item.get("spec"))
+                .or_else(|| item.get("description"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if title.is_empty() || instructions.is_empty() {
+                continue;
+            }
+            let role = item
+                .get("role")
+                .and_then(|v| v.as_str())
+                .and_then(normalize_exec_role)
+                .unwrap_or_else(|| step_fallback_role.clone());
+            let files: Vec<String> = item
+                .get("files")
+                .and_then(|v| v.as_array())
+                .map(|fs| {
+                    fs.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|s| s.trim().trim_start_matches("./").to_string())
+                        .filter(|s| !s.is_empty())
+                        .take(5)
+                        .collect()
+                })
+                .unwrap_or_default();
+            plan.steps.push(ArchitectStep {
+                title: truncate_chars(title, 120),
+                role,
+                files,
+                instructions: truncate_chars(instructions, 1200),
+            });
+        }
+    }
+
+    plan
+}
+
 fn build_native_system_prompt(
+    role: &str,
     edit_format: &str,
     active_mcp: &[&McpServerConfig],
     mcp_schemas_note: &str,
+    frontend_stack: Option<&FrontendStackInfo>,
 ) -> String {
     let edit_rules = if edit_format == "diff" {
         "FORMAT D'ÉDITION (`diff`) :\n\
-        Pour modifier un fichier existant, écris son chemin relatif exact (sans backtick) suivi d'un bloc SEARCH/REPLACE :\n\
+        Pour modifier un fichier existant, écris son chemin relatif EXACT brut (sans backtick et JAMAIS en lien Markdown `[...](...)`, réservé uniquement au résumé final) suivi d'un bloc SEARCH/REPLACE :\n\
         ### chemin/du/fichier.ext\n\
         ```langage\n\
         <<<<<<< SEARCH\n\
@@ -1654,12 +2866,38 @@ fn build_native_system_prompt(
         Pour créer un nouveau fichier inexistant, écris le contenu complet dans le bloc précédé de `### chemin/du/fichier.ext`."
     } else {
         "FORMAT D'ÉDITION (`whole`) :\n\
-        Pour créer ou modifier un fichier, écris son chemin relatif exact (sans backtick) suivi du contenu COMPLET et opérationnel du fichier (sans TODO ni ellipsis) :\n\
+        Pour créer ou modifier un fichier, écris son chemin relatif EXACT brut (sans backtick et JAMAIS en lien Markdown `[...](...)`, réservé uniquement au résumé final) suivi du contenu COMPLET et opérationnel du fichier (sans TODO ni ellipsis) :\n\
         ### chemin/du/fichier.ext\n\
         ```langage\n\
         // Contenu complet...\n\
         ```\n\
         Si un fichier est marqué [TRONQUÉ], utilise exclusivement des blocs `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE`."
+    };
+
+    let role_rules = match role {
+        "designer" => {
+            let tailwind_active = frontend_stack.map(|s| s.tailwind_active).unwrap_or(false);
+            let css_policy = if tailwind_active {
+                "- Stack CSS : Tailwind CSS est ACTIF sur ce projet. Tu peux utiliser les classes utilitaires Tailwind ainsi que du CSS natif complémentaire."
+            } else {
+                "- RÈGLE CSS ABSOLUE : Tailwind CSS N'EST PAS actif sur ce projet. INTERDICTION STRICTE d'écrire des classes utilitaires Tailwind (ex. `flex`, `h-screen`, `w-[170px]`, `bg-[#...]`, `bg-gradient-to-*`, `rounded-lg`, `text-white`). Écris exclusivement du vrai CSS natif complet et explicite dans `<style scoped>`/`<style>` et/ou dans la feuille CSS globale vérifiée importée."
+            };
+            format!(
+                "CONSIGNES DU RÔLE (`Designer UI/UX`) :\n\
+                {css_policy}\n\
+                - Reset de base obligatoire dans le CSS global ou le composant racine : `*, *::before, *::after {{ box-sizing: border-box; }}` et `html, body, #app {{ margin: 0; padding: 0; height: 100%; width: 100%; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}`.\n\
+                - Respecte scrupuleusement CHAQUE spécification chiffrée, visuelle et comportementale demandée (largeurs/hauteurs exactes, couleurs, dégradés `linear-gradient(...)`, alignements droite/gauche, états initiaux et interactions).\n\
+                - Mets à jour de manière cohérente le layout parent ET les composants enfants importés concernés afin qu'aucune vue ne reste non stylée."
+            )
+        }
+        "refactoring" => "CONSIGNES DU RÔLE (`Refactoring`) :\n\
+        - Préserve strictement le comportement externe existant tout en améliorant la lisibilité, le découpage et le typage sans régression.".to_string(),
+        "tester" => "CONSIGNES DU RÔLE (`Testeur`) :\n\
+        - Écris des tests déterministes, isolés et directement exécutables couvrant le comportement demandé sans modifier la logique métier.".to_string(),
+        _ => "CONSIGNES DU RÔLE (`Codeur`) :\n\
+        - Produis du code complet, robuste et opérationnel, sans TODO ni placeholder, cohérent avec l'architecture et les imports du projet.\n\
+        - PÉRIMÈTRE STRICT : modifie uniquement ce qui est explicitement demandé par l'utilisateur dans le dernier message. Ne réécris jamais des composants UI ou fichiers existants non demandés.\n\
+        - INSTALLATION DE PAQUETS : si l'utilisateur demande d'installer/ajouter une librairie (ex. `tailwindcss`, `@iconify/vue`, etc.), exécute d'abord la commande d'installation via l'outil `run_command` (ex. `npm install ...`), puis mets à jour uniquement les fichiers de configuration concernés (`vite.config.*`, feuille CSS globale) sans réécrire les composants applicatifs sauf demande explicite.".to_string(),
     };
 
     let mcp_section = if active_mcp.is_empty() {
@@ -1683,20 +2921,25 @@ fn build_native_system_prompt(
     };
 
     format!(
-        "Tu es le moteur de code d'AiderStudio. Réponds TOUJOURS ET EXCLUSIVEMENT EN FRANÇAIS de façon concise et technique.\n\n\
+        "Tu es le moteur de code de vAIx STUDIO. Réponds TOUJOURS ET EXCLUSIVEMENT EN FRANÇAIS de façon concise et technique.\n\n\
+        {role_rules}\n\n\
         {edit_rules}\n\n\
         STYLE DE RÉPONSE :\n\
         - Les blocs d'édition de fichiers sont appliqués automatiquement sur le disque puis masqués de la conversation (le diff détaillé apparaît dans un menu dédié).\n\
+        - MODULARITÉ (ANTI-MONOLITHE) : privilégie des fichiers et composants modulaires courts (150–300 lignes max par fichier) plutôt qu'un fichier monolithique.\n\
+        - DÉPENDANCES & PACKS EXTERNES : vérifie toujours la liste `Paquets installés (package.json)` fournie. N'utilise JAMAIS une classe CSS de pack d'icônes (ex. `ri-*` de Remix Icon, `fa-*`), un composant de lib externe ou un import de paquet absent des paquets installés sans l'avoir d'abord installé via `run_command` (`npm install ...`) ET importé dans le point d'entrée ou le composant (ex. `import 'remixicon/fonts/remixicon.css'` dans `src/main.js`/`src/main.ts`).\n\
         - N'écris JAMAIS de phrase d'introduction annonçant un bloc de code (« Voici les modifications nécessaires : », « Voici le code mis à jour : », « Modifiez le fichier comme suit : »).\n\
         - Émets directement les blocs d'édition, puis conclus par un bref résumé autonome au passé composé expliquant concrètement ce qui a été généré ou modifié dans chaque fichier en le citant par un lien Markdown cliquable `[NomFichier](chemin/relatif/NomFichier)` (ex. `[App.vue](src/App.vue)`).\n\
         - Si la demande utilisateur comporte plusieurs tâches ou points distincts, présente ce résumé en liste à puces (`- ...`), une puce par demande traitée avec les fichiers cliquables concernés.\n\
         - N'ajoute JAMAIS de section `### Fichiers modifiés` en fin de message.\n\n\
-        OUTILS DISPONIBLES (uniquement si une information manque) :\n\
-        <tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"src/...\"}}}}</tool_call>\n\
+        OUTILS DISPONIBLES (appel d'outil natif JSON ou balise `<tool_call>`) :\n\
+        <tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"src/...\",\"start_line\":1,\"end_line\":120}}}}</tool_call> (start_line/end_line optionnels et recommandés pour les fichiers > 200 lignes)\n\
         <tool_call>{{\"name\":\"search_code\",\"arguments\":{{\"query\":\"motif\",\"path_filter\":\"src/\"}}}}</tool_call>\n\
         <tool_call>{{\"name\":\"list_files\",\"arguments\":{{}}}}</tool_call>\n\
-        <tool_call>{{\"name\":\"delete_file\",\"arguments\":{{\"path\":\"...\"}}}}</tool_call>\n\
-        <tool_call>{{\"name\":\"run_command\",\"arguments\":{{\"command\":\"...\"}}}}</tool_call>\n\
+        <tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"src/...\",\"content\":\"...\"}}}}</tool_call> (créer un nouveau fichier ou réécrire un fichier complet)\n\
+        <tool_call>{{\"name\":\"edit_file\",\"arguments\":{{\"path\":\"src/...\",\"search\":\"extrait exact\",\"replace\":\"nouveau texte\"}}}}</tool_call> (modification chirurgicale SEARCH/REPLACE atomique, accepte aussi `edits: [...]`)\n\
+        <tool_call>{{\"name\":\"delete_file\",\"arguments\":{{\"path\":\"...\",\"reason\":\"motif\"}}}}</tool_call> (requiert une confirmation utilisateur dans l'interface)\n\
+        <tool_call>{{\"name\":\"run_command\",\"arguments\":{{\"command\":\"...\",\"timeout_secs\":90}}}}</tool_call> (`timeout_secs` optionnel 5..300s ; confirmation demandée si commande destructrice)\n\
         Les commandes shell à afficher simplement à l'utilisateur vont dans un bloc ```bash ... ``` standard (hors <tool_call>).{mcp_section}"
     )
 }
@@ -1714,6 +2957,7 @@ async fn build_native_initial_user_message(
     target_files: &[String],
     read_only_files: &[String],
     repo_map_text: Option<&str>,
+    frontend_stack: Option<&FrontendStackInfo>,
     is_cloud: bool,
 ) -> (LlmMessage, HashSet<String>, HashSet<String>) {
     let mut parts = Vec::new();
@@ -1727,6 +2971,17 @@ async fn build_native_initial_user_message(
             "[Contexte global du projet]\n{}",
             truncate_chars(project.global_context.trim(), limit)
         ));
+    }
+
+    let arch_mem_limit = if is_cloud { 2800 } else { 1200 };
+    if let Some((mem_path, mem_content)) = load_project_architecture_memory(project_root, arch_mem_limit) {
+        parts.push(format!(
+            "[Architecture & Conventions ({mem_path})]\n{mem_content}"
+        ));
+    }
+
+    if let Some(fs_info) = frontend_stack {
+        parts.push(fs_info.format_summary());
     }
 
     if !project.shared_directories.is_empty() {
@@ -1789,17 +3044,18 @@ async fn build_native_initial_user_message(
     }
 
     if !target_files.is_empty() {
-        let max_targets = if is_cloud { 6 } else { 3 };
+        let max_targets = if is_cloud { 8 } else { 5 };
         let clip_chars = if is_cloud { 24_000 } else { 12_000 };
         let mut file_sections = Vec::new();
         for rel in target_files.iter().take(max_targets) {
             if let Ok(content) = tokio::fs::read_to_string(project_root.join(rel)).await {
                 let char_len = content.chars().count();
                 if char_len > clip_chars {
+                    let total_lines = content.lines().count();
                     truncated_files.insert(rel.clone());
                     let clipped = truncate_chars(&content, clip_chars);
                     file_sections.push(format!(
-                        "### {rel} [TRONQUÉ : utilisez SEARCH/REPLACE]\n```\n{clipped}\n```"
+                        "### {rel} [TRONQUÉ · {total_lines} lignes — utilise SEARCH/REPLACE et `read_file` avec start_line/end_line ou `search_code` pour voir la suite]\n```\n{clipped}\n```"
                     ));
                 } else {
                     file_sections.push(format!("### {rel}\n```\n{content}\n```"));
@@ -1822,7 +3078,9 @@ async fn build_native_initial_user_message(
         compact_conv_ctx_for_prompt(conv_ctx, 400, 2)
     };
     if !compact_conv.is_empty() {
-        parts.push(format!("[Objectif discussion]\n{compact_conv}"));
+        parts.push(format!(
+            "[Historique des tours précédents (déjà terminés — contexte uniquement, ne pas ré-exécuter)]\n{compact_conv}"
+        ));
     }
     if let Some(spec) = architect_spec {
         if !spec.trim().is_empty() {
@@ -1849,6 +3107,95 @@ async fn build_native_initial_user_message(
     (msg, truncated_files, preloaded_files)
 }
 
+fn prompt_expects_code_changes(user_prompt: &str) -> bool {
+    let trimmed = user_prompt.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let low = trimmed.to_lowercase();
+    let padded = format!(" {low} ");
+
+    let edit_markers = [
+        "mets ",
+        "mets-",
+        "met ",
+        "mettre ",
+        "ajoute",
+        "modifie",
+        "change",
+        "corrige",
+        "crée",
+        "créé",
+        "cree",
+        "supprime",
+        "remplace",
+        "applique",
+        "implémente",
+        "implemente",
+        "refactor",
+        "fix",
+        " add ",
+        " update ",
+        " create ",
+        " set ",
+        " replace ",
+        " remove ",
+        " delete ",
+        "passe ",
+        "rends ",
+        "centre",
+        "colori",
+        "affiche ",
+        "enlève",
+        "enleve",
+        "retire ",
+        "positionne",
+        "insère",
+        "insere",
+        "intègre",
+        "integre",
+        "déplace",
+        "deplace",
+        "stylise",
+        "refais",
+        "construis",
+    ];
+    if edit_markers.iter().any(|k| padded.contains(k)) {
+        return true;
+    }
+
+    let question_starts = [
+        "comment ",
+        "pourquoi ",
+        "qu'est-ce",
+        "est-ce que",
+        "explique",
+        "décris",
+        "decris",
+        "analyse",
+        "audit",
+        "résume",
+        "resume",
+        "liste ",
+        "quel ",
+        "quelle ",
+        "quels ",
+        "quelles ",
+        "combien ",
+        "où ",
+        "ou ",
+        "what ",
+        "how ",
+        "why ",
+        "explain ",
+    ];
+    if question_starts.iter().any(|q| low.starts_with(q)) || trimmed.ends_with('?') {
+        return false;
+    }
+
+    false
+}
+
 struct NativeLoopResult {
     narrative: String,
     raw_last_response: String,
@@ -1860,6 +3207,9 @@ struct NativeLoopResult {
     turns_run: usize,
     had_repairs: bool,
     effective_edit_format: String,
+    actual_provider: String,
+    actual_model: String,
+    fallback_reason: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1876,11 +3226,13 @@ async fn execute_native_agent_loop(
     provider: &str,
     model: &str,
     role: &str,
+    ollama_running: bool,
     settings: &AppSettings,
     all_project_files: &[String],
     target_files: &[String],
     read_only_files: &[String],
     strategy: &ExecutionStrategy,
+    frontend_stack: Option<&FrontendStackInfo>,
     mcp_servers: &[McpServerConfig],
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<NativeLoopResult> {
@@ -1959,6 +3311,7 @@ async fn execute_native_agent_loop(
         target_files,
         read_only_files,
         repo_map_text.as_deref(),
+        frontend_stack,
         is_cloud,
     )
     .await;
@@ -1969,8 +3322,13 @@ async fn execute_native_agent_loop(
         strategy.edit_format.clone()
     };
 
-    let system_prompt =
-        build_native_system_prompt(&effective_edit_format, &active_mcp, &mcp_schemas_note);
+    let system_prompt = build_native_system_prompt(
+        role,
+        &effective_edit_format,
+        &active_mcp,
+        &mcp_schemas_note,
+        frontend_stack,
+    );
     let mut messages = vec![LlmMessage::system(system_prompt), initial_user_msg];
 
     let tool_output_budget = if is_cloud {
@@ -1989,8 +3347,8 @@ async fn execute_native_agent_loop(
         4096usize
     };
 
-    let ctx_limit = providers::resolve_model_context_limit(provider, model, settings);
     let subagent_label = format!("{} ({})", role_display_name(role), effective_edit_format);
+    let native_tool_defs = build_native_tool_definitions(!active_mcp.is_empty());
 
     let mut total_prompt_tokens = 0usize;
     let mut total_completion_tokens = 0usize;
@@ -2003,6 +3361,10 @@ async fn execute_native_agent_loop(
     let mut pending_continuation: Option<String> = None;
     let mut turns_run = 0usize;
     let mut had_repairs = false;
+    let mut did_no_edit_nudge = false;
+    let mut active_provider = provider.to_string();
+    let mut active_model = model.to_string();
+    let mut last_fallback_reason: Option<String> = None;
 
     for turn in 0..strategy.max_turns {
         if is_cancelled(cancel_rx) {
@@ -2014,8 +3376,8 @@ async fn execute_native_agent_loop(
             "[Tour {}/{}] Appel {}:{} (format {})...",
             turn + 1,
             strategy.max_turns,
-            provider,
-            model,
+            active_provider,
+            active_model,
             effective_edit_format
         );
         let _ = app.emit("aider:stream", (conversation_id, &stream_start));
@@ -2030,27 +3392,44 @@ async fn execute_native_agent_loop(
             max_tokens: max_output_tokens,
             temperature: 0.2,
             enable_cache: true,
+            tools: Some(native_tool_defs.clone()),
         };
 
-        let res = providers::call_provider_streaming(
-            provider,
-            model,
-            settings,
-            &messages,
-            &opts,
-            cancel_rx,
-            |delta| match delta {
-                StreamDelta::Thinking(t) => {
-                    turn_live_thinking.push_str(&t);
-                    let _ = app.emit("aider:thinking", (conversation_id, turn_live_thinking.trim()));
-                }
-                StreamDelta::Content(c) => {
-                    turn_live_content.push_str(&c);
-                    let _ = app.emit("aider:live_chunk", (conversation_id, &turn_live_content));
-                }
-            },
-        )
-        .await?;
+        let (res, used_provider, used_model, fb_reason) =
+            providers::stream_chat_completion_with_fallback(
+                &active_provider,
+                &active_model,
+                role,
+                ollama_running,
+                settings,
+                &messages,
+                &opts,
+                cancel_rx,
+                |delta| match delta {
+                    StreamDelta::Thinking(t) => {
+                        turn_live_thinking.push_str(&t);
+                        let _ = app.emit("aider:thinking", (conversation_id, turn_live_thinking.trim()));
+                    }
+                    StreamDelta::Content(c) => {
+                        turn_live_content.push_str(&c);
+                        let _ = app.emit("aider:live_chunk", (conversation_id, &turn_live_content));
+                    }
+                },
+                |from_p, from_m, to_p, to_m, reason| {
+                    let msg = format!(
+                        "[Fallback] {from_p}:{from_m} -> {to_p}:{to_m} ({})",
+                        truncate_chars(reason, 90)
+                    );
+                    let _ = app.emit("aider:stream", (conversation_id, &msg));
+                },
+            )
+            .await?;
+
+        active_provider = used_provider.clone();
+        active_model = used_model.clone();
+        if fb_reason.is_some() {
+            last_fallback_reason = fb_reason.clone();
+        }
 
         if let Some(th) = &res.thinking {
             if !th.trim().is_empty() {
@@ -2069,7 +3448,7 @@ async fn execute_native_agent_loop(
             record_external_api_usage(
                 app,
                 state_lock,
-                provider,
+                &used_provider,
                 res.prompt_tokens,
                 res.completion_tokens,
             )
@@ -2083,9 +3462,13 @@ async fn execute_native_agent_loop(
                     completion_tokens: res.completion_tokens,
                     total_tokens: turn_tot,
                     role: role.to_string(),
-                    provider: provider.to_string(),
-                    model: model.to_string(),
-                    context_limit: ctx_limit,
+                    provider: used_provider.clone(),
+                    model: used_model.clone(),
+                    context_limit: providers::resolve_model_context_limit(
+                        &used_provider,
+                        &used_model,
+                        settings,
+                    ),
                 },
             );
         }
@@ -2096,9 +3479,11 @@ async fn execute_native_agent_loop(
             String::new()
         };
         let stream_done = format!(
-            "[Tour {}/{}] Réponse reçue ({} in / {} out{}).",
+            "[Tour {}/{}] Réponse reçue de {}:{} ({} in / {} out{}).",
             turn + 1,
             strategy.max_turns,
+            used_provider,
+            used_model,
             res.prompt_tokens,
             res.completion_tokens,
             cache_note
@@ -2112,12 +3497,44 @@ async fn execute_native_agent_loop(
         };
 
         last_raw_response = effective_response.clone();
-        messages.push(LlmMessage::assistant(res.content.clone()));
 
-        // 1. Exécuter les <tool_call> (locaux + mcp_call)
-        let tool_calls = extract_tool_calls(&res.content);
+        // 1. Fusionner appels d'outils natifs + balises <tool_call> dédupliqués
+        let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut seen_tc_keys = HashSet::new();
+        for ntc in &res.tool_calls {
+            let key = format!(
+                "{}:{}",
+                ntc.name,
+                serde_json::to_string(&ntc.arguments).unwrap_or_default()
+            );
+            if seen_tc_keys.insert(key) {
+                tool_calls.push(ParsedToolCall {
+                    name: ntc.name.clone(),
+                    arguments: ntc.arguments.clone(),
+                });
+            }
+        }
+        for xtc in extract_tool_calls(&res.content) {
+            let key = format!(
+                "{}:{}",
+                xtc.name,
+                serde_json::to_string(&xtc.arguments).unwrap_or_default()
+            );
+            if seen_tc_keys.insert(key) {
+                tool_calls.push(xtc);
+            }
+        }
+
+        let assistant_msg_text = if res.content.trim().is_empty() && !tool_calls.is_empty() {
+            let names: Vec<&str> = tool_calls.iter().map(|t| t.name.as_str()).collect();
+            format!("[Appel d'outils natifs : {}]", names.join(", "))
+        } else {
+            res.content.clone()
+        };
+        messages.push(LlmMessage::assistant(assistant_msg_text));
         let mut tool_outputs = Vec::new();
         let mut wrote_via_tool = false;
+        let mut tool_had_failure = false;
 
         for tc in tool_calls {
             if is_cancelled(cancel_rx) {
@@ -2171,6 +3588,7 @@ async fn execute_native_agent_loop(
                             ));
                         }
                         Err(e) => {
+                            tool_had_failure = true;
                             all_tool_results.push(ToolExecutionResult {
                                 tool: format!("mcp:{}:{}", srv.name, tool_name),
                                 success: false,
@@ -2184,6 +3602,7 @@ async fn execute_native_agent_loop(
                         }
                     }
                 } else {
+                    tool_had_failure = true;
                     tool_outputs.push(format!(
                         "[Erreur MCP] Serveur '{server_ref}' introuvable ou inactif."
                     ));
@@ -2191,38 +3610,348 @@ async fn execute_native_agent_loop(
                 continue;
             }
 
-            if tc.name == "read_file" {
+            if tc.name == "delete_file" {
+                let raw_path = match tc.arguments.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => {
+                        tool_had_failure = true;
+                        let err_msg = "Paramètre 'path' manquant".to_string();
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "delete_file".to_string(),
+                            success: false,
+                            message: err_msg.clone(),
+                            path: None,
+                        });
+                        tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
+                        continue;
+                    }
+                };
+                let clean_path = match crate::tools::fs::sanitize_tool_path(raw_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tool_had_failure = true;
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "delete_file".to_string(),
+                            success: false,
+                            message: format!("Erreur delete_file : {e}"),
+                            path: None,
+                        });
+                        tool_outputs.push(format!("[Erreur delete_file] {e}"));
+                        continue;
+                    }
+                };
+                let target_path = project_root.join(&clean_path);
+                if !target_path.exists() {
+                    tool_had_failure = true;
+                    let err_msg = format!("Fichier '{}' introuvable", clean_path);
+                    all_tool_results.push(ToolExecutionResult {
+                        tool: "delete_file".to_string(),
+                        success: false,
+                        message: err_msg.clone(),
+                        path: Some(clean_path),
+                    });
+                    tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
+                    continue;
+                }
+                if !target_path.is_file() {
+                    tool_had_failure = true;
+                    let err_msg = format!("'{}' n'est pas un fichier supprimable", clean_path);
+                    all_tool_results.push(ToolExecutionResult {
+                        tool: "delete_file".to_string(),
+                        success: false,
+                        message: err_msg.clone(),
+                        path: Some(clean_path),
+                    });
+                    tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
+                    continue;
+                }
+
+                let reason = tc
+                    .arguments
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                let ask_line = format!(
+                    "[Validation] Confirmation demandée pour supprimer `{clean_path}`..."
+                );
+                let _ = app.emit("aider:stream", (conversation_id, &ask_line));
+
+                let approved = match crate::tools::approval::request_tool_approval(
+                    app,
+                    conversation_id,
+                    "delete_file",
+                    "Confirmation de suppression",
+                    &clean_path,
+                    reason,
+                    cancel_rx,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) if e.contains("CANCELLED_BY_USER") => {
+                        anyhow::bail!("CANCELLED_BY_USER");
+                    }
+                    Err(e) => {
+                        tool_had_failure = true;
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "delete_file".to_string(),
+                            success: false,
+                            message: format!("Erreur validation delete_file : {e}"),
+                            path: Some(clean_path),
+                        });
+                        tool_outputs.push(format!("[Erreur delete_file] {e}"));
+                        continue;
+                    }
+                };
+
+                if !approved {
+                    tool_had_failure = true;
+                    let deny_msg =
+                        format!("Suppression de `{clean_path}` refusée par l'utilisateur.");
+                    let _ = app.emit(
+                        "aider:stream",
+                        (conversation_id, &format!("[Validation] {deny_msg}")),
+                    );
+                    all_tool_results.push(ToolExecutionResult {
+                        tool: "delete_file".to_string(),
+                        success: false,
+                        message: deny_msg,
+                        path: Some(clean_path.clone()),
+                    });
+                    tool_outputs.push(format!(
+                        "[delete_file: {clean_path}] Refusé par l'utilisateur. Ne supprime pas ce fichier."
+                    ));
+                    continue;
+                }
+
+                match crate::tools::fs::delete_file(project_root, &tc.arguments).await {
+                    Ok(tr) => {
+                        wrote_via_tool = true;
+                        let pfx = format!("{clean_path}:");
+                        already_read.retain(|k| k != &clean_path && !k.starts_with(&pfx));
+                        if seen_applied.insert(clean_path.clone()) {
+                            all_applied_files.push(clean_path.clone());
+                        }
+                        let ok_line = format!("[Outil] Fichier supprimé : `{clean_path}`.");
+                        let _ = app.emit("aider:stream", (conversation_id, &ok_line));
+                        all_tool_results.push(tr.clone());
+                        tool_outputs.push(format!("[delete_file] {}", tr.message));
+                    }
+                    Err(e) => {
+                        tool_had_failure = true;
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "delete_file".to_string(),
+                            success: false,
+                            message: format!("Erreur delete_file : {e}"),
+                            path: Some(clean_path),
+                        });
+                        tool_outputs.push(format!("[Erreur delete_file] {e}"));
+                    }
+                }
+                continue;
+            }
+
+            if tc.name == "run_command" {
+                let cmd_str = match tc
+                    .arguments
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(c) => c,
+                    None => {
+                        tool_had_failure = true;
+                        let err_msg = "Paramètre 'command' manquant".to_string();
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "run_command".to_string(),
+                            success: false,
+                            message: err_msg.clone(),
+                            path: None,
+                        });
+                        tool_outputs.push(format!("[Erreur run_command] {err_msg}"));
+                        continue;
+                    }
+                };
+                let timeout_secs = crate::tools::shell::parse_timeout_secs(&tc.arguments);
+
+                if let Some(reason) = crate::tools::shell::is_destructive_command(cmd_str) {
+                    let ask_line = format!(
+                        "[Validation] Confirmation demandée pour commande sensible : `{}`...",
+                        truncate_chars(cmd_str, 80)
+                    );
+                    let _ = app.emit("aider:stream", (conversation_id, &ask_line));
+
+                    let approved = match crate::tools::approval::request_tool_approval(
+                        app,
+                        conversation_id,
+                        "run_command",
+                        "Confirmation de commande sensible",
+                        cmd_str,
+                        Some(reason.to_string()),
+                        cancel_rx,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) if e.contains("CANCELLED_BY_USER") => {
+                            anyhow::bail!("CANCELLED_BY_USER");
+                        }
+                        Err(e) => {
+                            tool_had_failure = true;
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: "run_command".to_string(),
+                                success: false,
+                                message: format!("Erreur validation run_command : {e}"),
+                                path: None,
+                            });
+                            tool_outputs.push(format!("[Erreur run_command] {e}"));
+                            continue;
+                        }
+                    };
+
+                    if !approved {
+                        tool_had_failure = true;
+                        let deny_msg = format!(
+                            "Exécution de la commande `{}` refusée par l'utilisateur.",
+                            truncate_chars(cmd_str, 80)
+                        );
+                        let _ = app.emit(
+                            "aider:stream",
+                            (conversation_id, &format!("[Validation] {deny_msg}")),
+                        );
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "run_command".to_string(),
+                            success: false,
+                            message: deny_msg,
+                            path: None,
+                        });
+                        tool_outputs.push(format!(
+                            "[run_command] Exécution refusée par l'utilisateur pour `{cmd_str}`."
+                        ));
+                        continue;
+                    }
+                }
+
+                let cmd_line = format!("[Cmd] {}", truncate_chars(cmd_str, 120));
+                let _ = app.emit("aider:stream", (conversation_id, &cmd_line));
+
+                match crate::tools::shell::run_command_streaming(
+                    project_root,
+                    cmd_str,
+                    timeout_secs,
+                    Some(cancel_rx),
+                    |line| {
+                        let stream_msg = format!("[cmd] {line}");
+                        let _ = app.emit("aider:stream", (conversation_id, &stream_msg));
+                    },
+                )
+                .await
+                {
+                    Ok(tr) => {
+                        if !tr.success {
+                            tool_had_failure = true;
+                        }
+                        let clipped = truncate_chars(&tr.message, tool_output_budget);
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: tr.tool.clone(),
+                            success: tr.success,
+                            message: format!("Commande exécutée (succès={})", tr.success),
+                            path: None,
+                        });
+                        tool_outputs.push(format!(
+                            "[run_command (succès={})]\n{}",
+                            tr.success, clipped
+                        ));
+                    }
+                    Err(e) if e.contains("CANCELLED_BY_USER") => {
+                        anyhow::bail!("CANCELLED_BY_USER");
+                    }
+                    Err(e) => {
+                        tool_had_failure = true;
+                        all_tool_results.push(ToolExecutionResult {
+                            tool: "run_command".to_string(),
+                            success: false,
+                            message: format!("Erreur run_command : {e}"),
+                            path: None,
+                        });
+                        tool_outputs.push(format!("[Erreur run_command] {e}"));
+                    }
+                }
+                continue;
+            }
+
+            let read_key_for_call = if tc.name == "read_file" {
+                let s_opt = tc
+                    .arguments
+                    .get("start_line")
+                    .or_else(|| tc.arguments.get("startLine"))
+                    .and_then(|v| v.as_u64());
+                let e_opt = tc
+                    .arguments
+                    .get("end_line")
+                    .or_else(|| tc.arguments.get("endLine"))
+                    .and_then(|v| v.as_u64());
+                let has_range = s_opt.is_some() || e_opt.is_some();
                 if let Some(raw_p) = tc.arguments.get("path").and_then(|v| v.as_str()) {
                     let norm_p = raw_p
                         .trim()
                         .trim_matches('`')
                         .trim_start_matches("./")
                         .replace('\\', "/");
-                    if already_read.contains(&norm_p) {
+                    let rkey = format!("{norm_p}:{s_opt:?}:{e_opt:?}");
+                    let already_cached = if has_range {
+                        already_read.contains(&rkey)
+                    } else {
+                        (!truncated_files.contains(&norm_p) && already_read.contains(&norm_p))
+                            || already_read.contains(&rkey)
+                    };
+                    if already_cached {
                         tool_outputs.push(format!(
                             "[read_file: {norm_p}] Déjà présent dans le contexte ci-dessus."
                         ));
                         continue;
                     }
+                    Some((norm_p, rkey, has_range))
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
 
             let log_line = format!("[Outil] {}...", tc.name);
             let _ = app.emit("aider:stream", (conversation_id, &log_line));
             match execute_local_tool_internal(project_root, &tc.name, &tc.arguments).await {
                 Ok(tr) => {
-                    if tc.name == "write_file" || tc.name == "create_file" {
-                        wrote_via_tool = true;
-                        if let Some(p) = &tr.path {
-                            already_read.remove(p);
-                            if seen_applied.insert(p.clone()) {
-                                all_applied_files.push(p.clone());
+                    if tc.name == "write_file" || tc.name == "create_file" || tc.name == "edit_file"
+                    {
+                        if tr.success {
+                            wrote_via_tool = true;
+                            if let Some(p) = &tr.path {
+                                let pfx = format!("{p}:");
+                                already_read.retain(|k| k != p && !k.starts_with(&pfx));
+                                if seen_applied.insert(p.clone()) {
+                                    all_applied_files.push(p.clone());
+                                }
+                                let ok_line =
+                                    format!("[Outil] Modification appliquée sur `{p}`.");
+                                let _ = app.emit("aider:stream", (conversation_id, &ok_line));
                             }
+                        } else {
+                            tool_had_failure = true;
                         }
                         all_tool_results.push(tr.clone());
                         tool_outputs.push(format!("[{}] {}", tc.name, tr.message));
                     } else if tc.name == "read_file" {
-                        if let Some(p) = &tr.path {
+                        if let Some((norm_p, rkey, has_range)) = read_key_for_call {
+                            already_read.insert(rkey);
+                            if !has_range && tr.message.lines().count() <= 220 {
+                                already_read.insert(norm_p);
+                            }
+                        } else if let Some(p) = &tr.path {
                             already_read.insert(p.clone());
                         }
                         let clipped = truncate_chars(&tr.message, tool_output_budget);
@@ -2242,24 +3971,21 @@ async fn execute_native_agent_loop(
                             clipped
                         ));
                     } else {
+                        if !tr.success {
+                            tool_had_failure = true;
+                        }
                         let clipped = truncate_chars(&tr.message, tool_output_budget);
                         all_tool_results.push(ToolExecutionResult {
                             tool: tr.tool.clone(),
                             success: tr.success,
-                            message: if tc.name == "run_command" {
-                                format!(
-                                    "Commande exécutée (succès={})",
-                                    tr.success
-                                )
-                            } else {
-                                format!("Outil '{}' exécuté", tc.name)
-                            },
+                            message: format!("Outil '{}' exécuté", tc.name),
                             path: tr.path.clone(),
                         });
                         tool_outputs.push(format!("[{}]\n{}", tc.name, clipped));
                     }
                 }
                 Err(e) => {
+                    tool_had_failure = true;
                     all_tool_results.push(ToolExecutionResult {
                         tool: tc.name.clone(),
                         success: false,
@@ -2276,13 +4002,15 @@ async fn execute_native_agent_loop(
             project_root,
             &effective_response,
             target_files,
+            all_project_files,
             &truncated_files,
             user_prompt,
         )
         .await;
 
         for f in &edit_outcome.applied_files {
-            already_read.remove(f);
+            let pfx = format!("{f}:");
+            already_read.retain(|k| k != f && !k.starts_with(&pfx));
             if seen_applied.insert(f.clone()) {
                 all_applied_files.push(f.clone());
             }
@@ -2293,7 +4021,8 @@ async fn execute_native_agent_loop(
 
         let turn_cleaned =
             patcher::strip_edit_blocks_for_display(&effective_response, &all_applied_files);
-        if !turn_cleaned.trim().is_empty() {
+        let turn_cleaned_is_empty = turn_cleaned.trim().is_empty();
+        if !turn_cleaned_is_empty {
             last_non_empty_narrative = turn_cleaned;
         }
 
@@ -2343,10 +4072,54 @@ async fn execute_native_agent_loop(
             continue;
         }
 
-        if !tool_outputs.is_empty() && edit_outcome.applied_files.is_empty() && !wrote_via_tool {
+        if !tool_outputs.is_empty()
+            && edit_outcome.applied_files.is_empty()
+            && (!wrote_via_tool || tool_had_failure || turn_cleaned_is_empty)
+        {
             messages.push(LlmMessage::user(format!(
                 "[Résultats des outils]\n{}\n\nPoursuis maintenant avec ces informations pour répondre précisément ou appliquer les modifications de fichiers attendues.",
                 tool_outputs.join("\n\n")
+            )));
+            continue;
+        }
+
+        if all_applied_files.is_empty()
+            && !wrote_via_tool
+            && tool_outputs.is_empty()
+            && !all_tool_results.iter().any(|t| t.tool == "run_command" && t.success)
+            && edit_outcome.failures.is_empty()
+            && prompt_expects_code_changes(user_prompt)
+            && !did_no_edit_nudge
+        {
+            did_no_edit_nudge = true;
+            had_repairs = true;
+            let _ = app.emit(
+                "aider:stream",
+                (
+                    conversation_id,
+                    "[Auto-réparation] Aucune modification détectée sur disque — relance au format d'édition...",
+                ),
+            );
+            let candidate_paths: Vec<String> = if !target_files.is_empty() {
+                target_files.to_vec()
+            } else {
+                all_project_files.iter().take(12).cloned().collect()
+            };
+            let files_hint = if candidate_paths.is_empty() {
+                "aucun chemin pré-listé (crée le fichier nécessaire)".to_string()
+            } else {
+                candidate_paths.join(", ")
+            };
+            let format_example = if effective_edit_format == "diff" {
+                "### chemin/exact.ext\n```lang\n<<<<<<< SEARCH\nlignes exactes\n=======\nnouvelles lignes\n>>>>>>> REPLACE\n```"
+            } else {
+                "### chemin/exact.ext\n```lang\n// Contenu complet du fichier\n```"
+            };
+            messages.push(LlmMessage::user(format!(
+                "ATTENTION : ta réponse précédente n'a modifié AUCUN fichier sur le disque.\n\
+                Tu DOIS appliquer concrètement la demande sur les fichiers réels du projet ({files_hint}).\n\
+                Si le fichier exact te manque, appelle `<tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"...\"}}}}</tool_call>` ; sinon émets IMMEDIATEMENT un bloc précédé du chemin relatif brut :\n\
+                {format_example}"
             )));
             continue;
         }
@@ -2375,6 +4148,9 @@ async fn execute_native_agent_loop(
         turns_run,
         had_repairs,
         effective_edit_format,
+        actual_provider: active_provider,
+        actual_model: active_model,
+        fallback_reason: last_fallback_reason,
     })
 }
 
@@ -2482,6 +4258,15 @@ fn has_multiple_requests(user_prompt: &str) -> bool {
     }
 
     false
+}
+
+fn is_complex_multi_requirement_prompt(user_prompt: &str) -> bool {
+    if has_multiple_requests(user_prompt) {
+        return true;
+    }
+    let trimmed = user_prompt.trim();
+    trimmed.chars().count() >= 280
+        && (trimmed.contains('\n') || trimmed.contains('•') || trimmed.contains(':'))
 }
 
 fn file_basename(path: &str) -> &str {
@@ -2788,6 +4573,30 @@ fn append_modified_files_summary(
     bullets.join("\n")
 }
 
+fn has_callable_candidate(
+    primary_provider: &str,
+    primary_model: &str,
+    role: &str,
+    settings: &AppSettings,
+    ollama_running: bool,
+) -> bool {
+    providers::build_fallback_candidates(
+        primary_provider,
+        primary_model,
+        role,
+        settings,
+        ollama_running,
+    )
+    .into_iter()
+    .any(|(p, _)| {
+        if p == "ollama" {
+            ollama_running
+        } else {
+            providers::find_provider_key(settings, &p).is_some()
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn synthesize_final_response(
     app: &AppHandle,
@@ -2805,11 +4614,8 @@ async fn synthesize_final_response(
     extra_stage_edits: bool,
     verifier_note: &str,
 ) -> (String, usize) {
-    let can_call_synth = if synth_provider == "ollama" {
-        ollama_running
-    } else {
-        providers::find_provider_key(settings, synth_provider).is_some()
-    };
+    let can_call_synth =
+        has_callable_candidate(synth_provider, synth_model, "synthesizer", settings, ollama_running);
 
     let needs_llm_synthesis = engine_ran
         && can_call_synth
@@ -2825,18 +4631,13 @@ async fn synthesize_final_response(
     let mut synth_tokens = 0usize;
     let core_narrative = if needs_llm_synthesis {
         let scoped_diffs: Vec<ModifiedFileDiff> = if !turn_applied_files.is_empty() {
-            let scoped: Vec<ModifiedFileDiff> = modified_files
+            modified_files
                 .iter()
-                .filter(|f| turn_applied_files.iter().any(|p| p == &f.path))
+                .filter(|f| turn_applied_files.iter().any(|p| paths_match(&f.path, p)))
                 .cloned()
-                .collect();
-            if scoped.is_empty() {
-                modified_files.to_vec()
-            } else {
-                scoped
-            }
+                .collect()
         } else {
-            modified_files.to_vec()
+            Vec::new()
         };
 
         let diff_summary = if scoped_diffs.is_empty() {
@@ -2846,7 +4647,7 @@ async fn synthesize_final_response(
         };
         let files_names: Vec<String> = scoped_diffs.iter().map(|f| f.path.clone()).collect();
         let multi_req = has_multiple_requests(user_prompt);
-        let synth_sys = "Tu es l'Architecte Synthétiseur d'AiderStudio. Rédige en français un retour clair et concis sur ce qui a réellement été généré ou modifié dans chaque fichier.\n\
+        let synth_sys = "Tu es l'Architecte Synthétiseur de vAIx STUDIO. Rédige en français un retour clair et concis sur ce qui a réellement été généré ou modifié dans chaque fichier.\n\
         RÈGLES STRICTES :\n\
         1. Cite chaque fichier concerné avec un lien Markdown cliquable exact `[NomFichier](chemin/relatif/NomFichier)` (ex. `[App.vue](src/App.vue)`).\n\
         2. Si la demande contient plusieurs points/tâches distincts (ou plusieurs fichiers modifiés pour des raisons distinctes), structure obligatoirement la réponse en bullet points (`- ...`), avec une puce par demande traitée expliquant ce qui a changé et dans quel(s) fichier(s).\n\
@@ -2866,9 +4667,11 @@ async fn synthesize_final_response(
             truncate_chars(cleaned_narrative, 800)
         );
 
-        match providers::call_provider_oneshot(
+        match providers::call_provider_oneshot_with_fallback(
             synth_provider,
             synth_model,
+            "synthesizer",
+            ollama_running,
             settings,
             synth_sys,
             &synth_user,
@@ -2877,10 +4680,10 @@ async fn synthesize_final_response(
         )
         .await
         {
-            Ok((summary, p_tok, c_tok)) => {
+            Ok((summary, p_tok, c_tok, used_prov, used_mdl, _fb_reason)) => {
                 synth_tokens = p_tok + c_tok;
                 if synth_tokens > 0 {
-                    record_external_api_usage(app, state_lock, synth_provider, p_tok, c_tok).await;
+                    record_external_api_usage(app, state_lock, &used_prov, p_tok, c_tok).await;
                     let _ = app.emit(
                         "aider:tokens",
                         TokenUsageEvent {
@@ -2890,11 +4693,11 @@ async fn synthesize_final_response(
                             completion_tokens: c_tok,
                             total_tokens: synth_tokens,
                             role: "synthesizer".to_string(),
-                            provider: synth_provider.to_string(),
-                            model: synth_model.to_string(),
+                            provider: used_prov.clone(),
+                            model: used_mdl.clone(),
                             context_limit: providers::resolve_model_context_limit(
-                                synth_provider,
-                                synth_model,
+                                &used_prov,
+                                &used_mdl,
                                 settings,
                             ),
                         },
@@ -3064,6 +4867,8 @@ async fn finish_cancelled_pipeline(
             lines_removed,
             files_summary: build_files_summary(&modified_files),
             agent_trace: agent_trace.clone(),
+            commit_id: None,
+            commit_summary: None,
         });
         guard.conversations[conv_idx].modified_files = modified_files;
         guard.conversations[conv_idx].lines_added = lines_added;
@@ -3137,6 +4942,8 @@ pub async fn run_prompt_pipeline(
             lines_removed: 0,
             files_summary: Vec::new(),
             agent_trace: Vec::new(),
+            commit_id: None,
+            commit_summary: None,
         });
         guard.conversations[conv_idx].updated_at = now.clone();
 
@@ -3243,6 +5050,9 @@ pub async fn run_prompt_pipeline(
     };
 
     // SUB-AGENT 1/5: Architecte & Orchestrateur
+    let all_project_files = list_source_files_for_cartographer(&project_root_path);
+    let frontend_stack = detect_frontend_stack(&project_root_path, &all_project_files);
+
     let (arch_prov, arch_model) = resolve_agent_slot("architect", &settings);
     let (mut exec_role, mut run_tests_after) = classify_prompt_role(&user_prompt);
     let (base_exec_prov, base_exec_model) = resolve_agent_slot(exec_role, &settings);
@@ -3276,20 +5086,82 @@ pub async fn run_prompt_pipeline(
     );
 
     let mut architect_spec: Option<String> = None;
+    let mut architect_steps: Vec<ArchitectStep> = Vec::new();
     let mut architect_llm_ran = false;
     let mut architect_err: Option<String> = None;
     let mut arch_tokens_used = 0usize;
+    let mut used_arch_prov = arch_prov.clone();
+    let mut used_arch_model = arch_model.clone();
+    let mut arch_fb_reason: Option<String> = None;
+
+    let arch_can_run = has_callable_candidate(
+        &arch_prov,
+        &arch_model,
+        "architect",
+        &settings,
+        stack.ollama_running,
+    );
+
+    let missing_deps =
+        prompt_mentions_uninstalled_library(&user_prompt, frontend_stack.as_ref());
 
     if is_agent_mode
-        && (arch_prov != base_exec_prov || arch_model != base_exec_model)
-        && (arch_prov != "ollama" || stack.ollama_running)
+        && arch_can_run
+        && (arch_prov != base_exec_prov
+            || arch_model != base_exec_model
+            || !missing_deps.is_empty()
+            || ((arch_prov != "ollama" || effective_num_ctx(&settings) >= 16_384)
+                && is_complex_multi_requirement_prompt(&user_prompt)))
     {
-        let arch_sys = "Tu es l'Architecte logiciel d'AiderStudio. Analyse la demande utilisateur et décide du sous-agent d'exécution le plus adapté.\nSi la demande contient plusieurs tâches ou points distincts, décompose `spec` en les énumérant point par point pour qu'aucun ne soit oublié.\nRetourne UNIQUEMENT un objet JSON valide, sans texte ni markdown autour :\n{\"role\":\"designer|coder|refactoring|tester\",\"runTests\":false,\"spec\":\"3 à 6 consignes techniques précises et concises en français pour guider l'exécution\"}";
+        let mut arch_prioritized = Vec::new();
+        let mut arch_others = Vec::new();
+        for f in &all_project_files {
+            if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
+                arch_prioritized.push(f.clone());
+            } else {
+                arch_others.push(f.clone());
+            }
+        }
+        arch_prioritized.extend(arch_others);
+        let arch_files_preview: Vec<String> = arch_prioritized.into_iter().take(40).collect();
+        let stack_block = frontend_stack
+            .as_ref()
+            .map(|s| format!("\n\n{}", s.format_summary()))
+            .unwrap_or_default();
+        let files_block = if arch_files_preview.is_empty() {
+            "aucun fichier indexé".to_string()
+        } else {
+            arch_files_preview.join("\n")
+        };
+        let arch_mem_block = load_project_architecture_memory(&project_root_path, 1200)
+            .map(|(src, txt)| format!("\n\n[Architecture & Conventions ({src})]\n{txt}"))
+            .unwrap_or_default();
+        let missing_deps_block = if missing_deps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n[Dépendances manquantes détectées]\n- {}",
+                missing_deps.join("\n- ")
+            )
+        };
+
+        let arch_sys = "Tu es l'Architecte logiciel de vAIx STUDIO. Analyse la demande utilisateur, l'architecture, l'arborescence et la stack détectée.\n\
+        1. Choisis le rôle d'exécution principal (`designer|coder|refactoring|tester`), `runTests` (`bool`), et rédige dans `spec` un plan technique concret respectant strictement la stack CSS détectée (CSS natif obligatoire si Tailwind est inactif).\n\
+        2. Si la tâche est simple ou tient en 1 fichier, laisse `\"steps\": []`.\n\
+        3. Si la tâche est complexe, multi-fichiers ou multi-composants (ex. nouvelle fonctionnalité complète, architecture modulaire), décompose-la dans `steps` en **2 à 5 étapes atomiques et ordonnées** (ex. fondations/types/state -> modules/composants -> styles/câblage -> tests) en privilégiant des fichiers modulaires de 150 à 300 lignes max.\n\
+        4. Si la demande porte sur l'installation ou la configuration de paquets/dépendances (ex. tailwindcss, iconify, npm install) sans refonte visuelle explicite, choisis le rôle `coder`, laisse `\"steps\": []`, et limite la portée à l'installation et aux fichiers de configuration (sans réécrire les composants existants).\n\
+        5. DÉPENDANCES MANQUANTES : vérifie toujours `Paquets installés (package.json)` dans la stack détectée. Si la demande utilise une librairie ou un pack d'icônes absent (ex. Remix Icon -> `remixicon` + import `'remixicon/fonts/remixicon.css'` dans le point d'entrée, ou `@iconify/vue`, `lucide-vue-next`, `pinia`…), prescris EXPLICITEMENT dans `spec` (et en étape 1 si multi-étapes) de l'installer via `run_command` (`npm install ...`) et de l'importer/configurer AVANT de l'utiliser dans les composants.\n\
+        Retourne UNIQUEMENT un objet JSON valide, sans texte ni bloc markdown autour :\n\
+        {\"role\":\"designer|coder|refactoring|tester\",\"runTests\":false,\"spec\":\"Plan technique synthétique\",\"steps\":[{\"title\":\"Titre court\",\"role\":\"coder|designer|refactoring|tester\",\"files\":[\"src/...\"],\"instructions\":\"Consignes précises de cette étape\"}]}";
         let arch_user = format!(
-            "[Contexte projet]\n{}\n\n[Session récente]\n{}\n\n[Demande utilisateur]\n{}",
+            "[Contexte projet]\n{}{}\n\n[Fichiers du projet]\n{}{}{}\n\n[Session récente]\n{}\n\n[Demande utilisateur]\n{}",
             truncate_chars(project.global_context.trim(), 500),
+            arch_mem_block,
+            files_block,
+            stack_block,
+            missing_deps_block,
             truncate_chars(conv_ctx.trim(), 500),
-            truncate_chars(user_prompt.trim(), 900)
+            truncate_chars(user_prompt.trim(), 1600)
         );
         let arch_call_res = tokio::select! {
             biased;
@@ -3306,45 +5178,45 @@ pub async fn run_prompt_pipeline(
                 )
                 .await;
             }
-            res = providers::call_provider_oneshot(
+            res = providers::call_provider_oneshot_with_fallback(
                 &arch_prov,
                 &arch_model,
+                "architect",
+                stack.ollama_running,
                 &settings,
                 arch_sys,
                 &arch_user,
-                450,
+                1200,
                 0.2,
             ) => res,
         };
         match arch_call_res {
-            Ok((reply, p_tok, c_tok)) => {
-                if let (Some(start), Some(end)) = (reply.find('{'), reply.rfind('}')) {
-                    if start < end {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&reply[start..=end]) {
-                            if let Some(r) = val.get("role").and_then(|v| v.as_str()) {
-                                exec_role = match r.trim() {
-                                    "designer" => "designer",
-                                    "coder" => "coder",
-                                    "refactoring" => "refactoring",
-                                    "tester" => "tester",
-                                    _ => exec_role,
-                                };
-                            }
-                            if val.get("runTests").and_then(|v| v.as_bool()) == Some(true) {
-                                run_tests_after = true;
-                            }
-                            if let Some(spec) = val.get("spec").and_then(|v| v.as_str()) {
-                                let clean_spec = spec.trim();
-                                if !clean_spec.is_empty() {
-                                    architect_spec = Some(truncate_chars(clean_spec, 900));
-                                }
-                            }
-                        }
-                    }
+            Ok((reply, p_tok, c_tok, used_prov, used_mdl, fb_reason)) => {
+                used_arch_prov = used_prov;
+                used_arch_model = used_mdl;
+                arch_fb_reason = fb_reason;
+                let parsed = parse_architect_plan(&reply, exec_role);
+                if let Some(r) = parsed.role.as_deref() {
+                    exec_role = match r {
+                        "designer" => "designer",
+                        "coder" => "coder",
+                        "refactoring" => "refactoring",
+                        "tester" => "tester",
+                        _ => exec_role,
+                    };
+                }
+                if parsed.run_tests {
+                    run_tests_after = true;
+                }
+                architect_spec = parsed.spec;
+                architect_steps = parsed.steps;
+                if is_install_or_setup_prompt(&user_prompt) {
+                    exec_role = "coder";
+                    architect_steps.clear();
                 }
                 architect_llm_ran = true;
                 arch_tokens_used = p_tok + c_tok;
-                record_external_api_usage(app, state_lock, &arch_prov, p_tok, c_tok).await;
+                record_external_api_usage(app, state_lock, &used_arch_prov, p_tok, c_tok).await;
                 let _ = app.emit(
                     "aider:tokens",
                     TokenUsageEvent {
@@ -3354,11 +5226,11 @@ pub async fn run_prompt_pipeline(
                         completion_tokens: c_tok,
                         total_tokens: arch_tokens_used,
                         role: "architect".to_string(),
-                        provider: arch_prov.clone(),
-                        model: arch_model.clone(),
+                        provider: used_arch_prov.clone(),
+                        model: used_arch_model.clone(),
                         context_limit: providers::resolve_model_context_limit(
-                            &arch_prov,
-                            &arch_model,
+                            &used_arch_prov,
+                            &used_arch_model,
                             &settings,
                         ),
                     },
@@ -3366,6 +5238,28 @@ pub async fn run_prompt_pipeline(
             }
             Err(e) => {
                 architect_err = Some(synthesize_error_log(&e.to_string()));
+            }
+        }
+    }
+
+    if !missing_deps.is_empty() {
+        let entry_hint = frontend_stack
+            .as_ref()
+            .and_then(|s| s.entry_file.as_deref())
+            .unwrap_or("le point d'entrée");
+        let dep_directive = format!(
+            "PRÉREQUIS DÉPENDANCE OBLIGATOIRE (absent de package.json) :\n- {}\nExécute d'abord l'installation avec `run_command` (`npm install ...`), importe la feuille CSS ou la librairie dans `{entry_hint}` / le composant, puis réalise la demande.",
+            missing_deps.join("\n- ")
+        );
+        match architect_spec {
+            Some(ref mut spec) => {
+                let low_spec = spec.to_lowercase();
+                if !low_spec.contains("npm install") && !low_spec.contains("run_command") {
+                    *spec = format!("{dep_directive}\n\n{spec}");
+                }
+            }
+            None => {
+                architect_spec = Some(dep_directive);
             }
         }
     }
@@ -3407,16 +5301,32 @@ pub async fn run_prompt_pipeline(
     }
 
     let (arch_status, arch_summary) = if architect_llm_ran {
+        let steps_note = if architect_steps.len() >= 2 {
+            format!(" · {} étapes", architect_steps.len())
+        } else {
+            String::new()
+        };
         let spec_note = architect_spec
             .as_deref()
             .map(|s| format!(" · {}", truncate_chars(s.replace('\n', " ").trim(), 120)))
             .unwrap_or_default();
+        let fb_note = if let Some(ref r) = arch_fb_reason {
+            format!(" · Repli auto (`{}`)", truncate_chars(&r.replace('`', "'"), 60))
+        } else {
+            String::new()
+        };
         (
-            "done".to_string(),
+            if arch_fb_reason.is_some() {
+                "fallback".to_string()
+            } else {
+                "done".to_string()
+            },
             format!(
-                "Routé vers **{}** · Plan technique généré{}",
+                "Routé vers **{}**{} · Plan technique généré{}{}",
                 role_display_name(exec_role),
-                spec_note
+                steps_note,
+                spec_note,
+                fb_note
             ),
         )
     } else if let Some(ref err_msg) = architect_err {
@@ -3444,15 +5354,15 @@ pub async fn run_prompt_pipeline(
         AgentTraceStep {
             role: "architect".to_string(),
             role_label: "Architecte".to_string(),
-            provider: arch_prov.clone(),
-            model: arch_model.clone(),
+            provider: used_arch_prov.clone(),
+            model: used_arch_model.clone(),
             summary: arch_summary,
             status: arch_status,
             tokens: arch_tokens_used,
         },
     );
 
-    let (exec_prov, exec_model) = resolve_agent_slot(exec_role, &settings);
+    let (mut exec_prov, mut exec_model) = resolve_agent_slot(exec_role, &settings);
 
     // SUB-AGENT 2/5: Cartographe & Analyseur (toujours actif)
     let (carto_prov, carto_model) = resolve_agent_slot("cartographer", &settings);
@@ -3482,8 +5392,7 @@ pub async fn run_prompt_pipeline(
         },
     );
 
-    let all_project_files = list_source_files_for_cartographer(&project_root_path);
-    let carto = tokio::select! {
+    let mut carto = tokio::select! {
         biased;
         _ = wait_cancelled(&mut cancel_rx) => {
             if let Some(h) = title_handle.take() {
@@ -3509,8 +5418,23 @@ pub async fn run_prompt_pipeline(
             &exec_prov,
             stack.ollama_running,
             exec_role == "designer",
+            frontend_stack.as_ref(),
         ) => p,
     };
+
+    if !missing_deps.is_empty() {
+        if let Some(ref st) = frontend_stack {
+            if let Some(ref entry) = st.entry_file {
+                if !carto
+                    .target_files
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(entry))
+                {
+                    carto.target_files.push(entry.clone());
+                }
+            }
+        }
+    }
 
     if let Some((p_tok, c_tok)) = carto.cartographer_tokens {
         if p_tok + c_tok > 0 {
@@ -3580,67 +5504,15 @@ pub async fn run_prompt_pipeline(
         },
     );
 
-    // SUB-AGENT 3/5: Exécution (Moteur natif multi-tours unifié)
-    let strategy = choose_execution_strategy(
-        &project_root_path,
-        &carto.target_files,
-        carto.explicit_match,
+    // SUB-AGENT 3/5: Exécution (Moteur natif multi-tours unifié ou plan séquentiel multi-étapes)
+    let can_run_exec = has_callable_candidate(
         &exec_prov,
+        &exec_model,
+        exec_role,
         &settings,
+        stack.ollama_running,
     );
-
-    let stage3_label = format!(
-        "3. {} ({} · {})",
-        role_display_name(exec_role),
-        exec_prov,
-        exec_model
-    );
-    let ref_suffix = if carto.read_only_files.is_empty() {
-        String::new()
-    } else {
-        format!(" (+{} réf.)", carto.read_only_files.len())
-    };
-    let global_suffix = if carto.is_global_task {
-        " · vue globale"
-    } else {
-        ""
-    };
-    let stage3_detail = format!(
-        "Moteur natif · {} · map {} tok · {} fichier(s){}{} sur {}:{}",
-        strategy.edit_format,
-        strategy.map_tokens,
-        carto.target_files.len(),
-        ref_suffix,
-        global_suffix,
-        exec_prov,
-        exec_model
-    );
-    emit_stage(
-        app,
-        &conversation_id,
-        3,
-        &stage3_label,
-        &stage3_detail,
-        "running",
-    );
-    record_trace_step(
-        app,
-        &conversation_id,
-        &mut agent_trace,
-        AgentTraceStep {
-            role: exec_role.to_string(),
-            role_label: role_display_name(exec_role).to_string(),
-            provider: exec_prov.clone(),
-            model: exec_model.clone(),
-            summary: stage3_detail.clone(),
-            status: "running".to_string(),
-            tokens: 0,
-        },
-    );
-
-    let can_run_exec = (exec_prov != "ollama"
-        && providers::find_provider_key(&settings, &exec_prov).is_some())
-        || (exec_prov == "ollama" && stack.ollama_running);
+    let is_multi_step = is_agent_mode && architect_steps.len() >= 2 && can_run_exec;
 
     let mut engine_ran = false;
     let mut exec_tokens_used = 0usize;
@@ -3651,128 +5523,615 @@ pub async fn run_prompt_pipeline(
     let mut had_repairs = false;
     let mut raw_exec_output = String::new();
     let mut turn_applied_files: Vec<String> = Vec::new();
+    let (pre_turn_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
     let mut extra_stage_edits = false;
+    let mut init_images_opt = Some(image_base64_list);
 
-    let (cleaned_narrative, stage_note) = if can_run_exec {
+    let (cleaned_narrative, stage_note) = if is_multi_step {
         git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
-        match execute_native_agent_loop(
-            app,
-            state_lock,
-            &conversation_id,
-            &project,
-            &conv_ctx,
-            &user_prompt,
-            attachments.as_deref(),
-            image_base64_list,
-            architect_spec.as_deref(),
-            &exec_prov,
-            &exec_model,
-            exec_role,
-            &settings,
-            &all_project_files,
-            &carto.target_files,
-            &carto.read_only_files,
-            &strategy,
-            &mcp_servers,
-            &mut cancel_rx,
-        )
-        .await
-        {
-            Ok(loop_res) => {
-                engine_ran = true;
-                exec_tokens_used = loop_res.prompt_tokens + loop_res.completion_tokens;
-                extracted_thinking = loop_res.thinking;
-                tool_results = loop_res.tool_results;
-                had_repairs = loop_res.had_repairs;
-                raw_exec_output = loop_res.raw_last_response;
-                push_unique_paths(&mut turn_applied_files, &loop_res.applied_files);
-                exec_note = format!(
-                    "Moteur natif (format `{}`, max {} l., {} tour(s){})",
-                    loop_res.effective_edit_format,
-                    strategy.max_file_lines,
-                    loop_res.turns_run,
-                    if had_repairs { ", auto-réparé" } else { "" }
-                );
-                let out = if loop_res.narrative.trim().is_empty()
-                    && !loop_res.applied_files.is_empty()
-                {
-                    // Laisser vide pour que Stage 5 synthétise un résumé concret basé sur le diff
-                    String::new()
-                } else if loop_res.narrative.trim().is_empty() {
-                    format!(
-                        "Le modèle `{exec_model}` ({exec_prov}) n'a retourné aucun contenu."
-                    )
-                } else {
-                    loop_res.narrative
-                };
-                (
-                    out,
-                    format!(
-                        "{} · {} ({}:{})",
-                        role_display_name(exec_role),
-                        loop_res.effective_edit_format,
-                        exec_prov,
-                        exec_model
-                    ),
-                )
-            }
-            Err(err) => {
-                if is_cancelled(&cancel_rx) || err.to_string().contains("CANCELLED_BY_USER") {
-                    if let Some(h) = title_handle.take() {
-                        h.abort();
-                    }
-                    return finish_cancelled_pipeline(
-                        app,
-                        state_lock,
-                        &conversation_id,
-                        &project.root_path,
-                        &mut agent_trace,
-                    )
-                    .await;
+        let total_steps = architect_steps.len();
+        let plan_banner = format!(
+            "[Plan] {} étapes : {}",
+            total_steps,
+            architect_steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}. {}", i + 1, s.title))
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        );
+        let _ = app.emit("aider:stream", (&conversation_id, &plan_banner));
+
+        let mut completed_steps_summary: Vec<String> = Vec::new();
+        let mut step_narratives: Vec<String> = Vec::new();
+        let mut all_thinking: Vec<String> = Vec::new();
+        let mut had_step_error = false;
+
+        for (idx, step) in architect_steps.iter().enumerate() {
+            if is_cancelled(&cancel_rx) {
+                if let Some(h) = title_handle.take() {
+                    h.abort();
                 }
-                let clean_err = synthesize_error_log(&err.to_string());
-                exec_status = "error".to_string();
-                exec_note = clean_err.clone();
-                (
-                    format!(
-                        "⚠️ Erreur sur `{exec_prov}:{exec_model}` :\n`{clean_err}`\n\nVérifiez le modèle sélectionné, vos quotas API ou qu'Ollama est bien actif."
-                    ),
-                    format!("{exec_prov} erreur"),
+                return finish_cancelled_pipeline(
+                    app,
+                    state_lock,
+                    &conversation_id,
+                    &project.root_path,
+                    &mut agent_trace,
                 )
+                .await;
+            }
+
+            let step_role_static: &'static str = match step.role.trim().to_lowercase().as_str() {
+                "designer" => "designer",
+                "coder" => "coder",
+                "refactoring" => "refactoring",
+                "tester" => "tester",
+                _ => exec_role,
+            };
+            let (step_prov, step_model) = resolve_agent_slot(step_role_static, &settings);
+            let trace_role_key = format!("{}_step_{}", step_role_static, idx + 1);
+            let step_label = format!(
+                "Étape {}/{} · {}",
+                idx + 1,
+                total_steps,
+                truncate_chars(&step.title, 34)
+            );
+
+            let step_all_files = list_source_files_for_cartographer(&project_root_path);
+            let step_frontend_stack =
+                detect_frontend_stack(&project_root_path, &step_all_files);
+
+            let mut step_targets: Vec<String> = Vec::new();
+            for raw_f in &step.files {
+                if let Some(clean) = patcher::sanitize_rel_path(raw_f) {
+                    if !step_targets.iter().any(|x| x == &clean) {
+                        step_targets.push(clean);
+                    }
+                    if step_targets.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+            if step_targets.is_empty() {
+                let query = format!("{} {}", step.title, step.instructions);
+                let (det_matched, _) =
+                    match_files_deterministically(&query, None, &step_all_files);
+                step_targets = if det_matched.is_empty() {
+                    carto.target_files.iter().take(4).cloned().collect()
+                } else {
+                    det_matched.into_iter().take(4).collect()
+                };
+            }
+
+            let step_strategy = choose_execution_strategy(
+                &project_root_path,
+                &step_targets,
+                !step_targets.is_empty(),
+                &step_prov,
+                &settings,
+            );
+
+            emit_stage(
+                app,
+                &conversation_id,
+                3,
+                &format!("3. {} ({} · {})", step_label, step_prov, step_model),
+                &format!(
+                    "Étape {}/{} : {}",
+                    idx + 1,
+                    total_steps,
+                    truncate_chars(&step.title, 80)
+                ),
+                "running",
+            );
+            record_trace_step(
+                app,
+                &conversation_id,
+                &mut agent_trace,
+                AgentTraceStep {
+                    role: trace_role_key.clone(),
+                    role_label: step_label.clone(),
+                    provider: step_prov.clone(),
+                    model: step_model.clone(),
+                    summary: truncate_chars(&step.instructions, 110),
+                    status: "running".to_string(),
+                    tokens: 0,
+                },
+            );
+
+            let stream_hdr = format!(
+                "\n\n── Étape {}/{} : {} ({}) ──\n",
+                idx + 1,
+                total_steps,
+                step.title,
+                role_display_name(step_role_static)
+            );
+            let _ = app.emit("aider:stream", (&conversation_id, &stream_hdr));
+
+            let done_block = if completed_steps_summary.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n[Étapes déjà terminées]\n{}\n",
+                    completed_steps_summary.join("\n")
+                )
+            };
+            let target_list_note = if step_targets.is_empty() {
+                "à créer/déterminer selon l'étape".to_string()
+            } else {
+                step_targets.join(", ")
+            };
+            let step_prompt = format!(
+                "[Objectif global]\n{}\n{}\n[Étape courante {}/{} : {}]\nFichiers cibles : {}\nInstructions précises :\n{}\n\nRègle : Reste strictement concentré sur cette étape, garde les modules propres et concis (150 à 300 lignes max par fichier).",
+                truncate_chars(user_prompt.trim(), 300),
+                done_block,
+                idx + 1,
+                total_steps,
+                step.title,
+                target_list_note,
+                step.instructions
+            );
+
+            let step_conv_ctx = if idx == 0 { conv_ctx.as_str() } else { "" };
+            let step_attachments = if idx == 0 { attachments.as_deref() } else { None };
+            let step_images = if idx == 0 {
+                init_images_opt.take().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            match execute_native_agent_loop(
+                app,
+                state_lock,
+                &conversation_id,
+                &project,
+                step_conv_ctx,
+                &step_prompt,
+                step_attachments,
+                step_images,
+                architect_spec.as_deref(),
+                &step_prov,
+                &step_model,
+                step_role_static,
+                stack.ollama_running,
+                &settings,
+                &step_all_files,
+                &step_targets,
+                &carto.read_only_files,
+                &step_strategy,
+                step_frontend_stack.as_ref(),
+                &mcp_servers,
+                &mut cancel_rx,
+            )
+            .await
+            {
+                Ok(mut step_res) => {
+                    engine_ran = true;
+                    let mut step_tokens = step_res.prompt_tokens + step_res.completion_tokens;
+                    exec_tokens_used += step_tokens;
+                    if let Some(ref th) = step_res.thinking {
+                        if !th.trim().is_empty() {
+                            all_thinking.push(format!(
+                                "### Étape {}/{} : {}\n{}",
+                                idx + 1,
+                                total_steps,
+                                step.title,
+                                th.trim()
+                            ));
+                        }
+                    }
+                    tool_results.extend(step_res.tool_results.drain(..));
+                    had_repairs |= step_res.had_repairs;
+                    raw_exec_output = step_res.raw_last_response.clone();
+                    push_unique_paths(&mut turn_applied_files, &step_res.applied_files);
+                    exec_prov = step_res.actual_provider.clone();
+                    exec_model = step_res.actual_model.clone();
+
+                    if !step_res.narrative.trim().is_empty() {
+                        step_narratives.push(format!(
+                            "- **Étape {} ({})** : {}",
+                            idx + 1,
+                            step.title,
+                            truncate_chars(step_res.narrative.trim(), 280)
+                        ));
+                    }
+
+                    let mut step_files = step_res.applied_files.clone();
+                    let applied_code_files: Vec<String> = step_res
+                        .applied_files
+                        .iter()
+                        .filter(|p| {
+                            matches!(
+                                Path::new(p)
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|s| s.to_ascii_lowercase())
+                                    .as_deref(),
+                                Some("rs" | "ts" | "tsx" | "vue" | "js" | "jsx" | "py")
+                            )
+                        })
+                        .take(3)
+                        .cloned()
+                        .collect();
+
+                    if idx + 1 < total_steps
+                        && !applied_code_files.is_empty()
+                        && !is_cancelled(&cancel_rx)
+                    {
+                        let vr = run_test_verifier(&project_root_path).await;
+                        if vr.ran && !vr.success {
+                            let vr_msg = format!(
+                                "[Étape {}/{}] Erreur `{}` détectée — auto-correction ciblée...",
+                                idx + 1,
+                                total_steps,
+                                vr.command
+                            );
+                            let _ = app.emit("aider:stream", (&conversation_id, &vr_msg));
+                            let fix_prompt = format!(
+                                "La vérification `{}` a échoué après l'étape « {} » :\n```\n{}\n```\nCorrige uniquement ces erreurs dans les fichiers cibles avec `SEARCH/REPLACE`.",
+                                vr.command, step.title, vr.output_summary
+                            );
+                            let fix_strategy = ExecutionStrategy {
+                                edit_format: "diff".to_string(),
+                                map_tokens: 0,
+                                max_turns: 2,
+                                max_file_lines: 0,
+                            };
+                            let refreshed_files =
+                                list_source_files_for_cartographer(&project_root_path);
+                            let refreshed_stack =
+                                detect_frontend_stack(&project_root_path, &refreshed_files);
+                            match execute_native_agent_loop(
+                                app,
+                                state_lock,
+                                &conversation_id,
+                                &project,
+                                "",
+                                &fix_prompt,
+                                None,
+                                Vec::new(),
+                                None,
+                                &exec_prov,
+                                &exec_model,
+                                step_role_static,
+                                stack.ollama_running,
+                                &settings,
+                                &refreshed_files,
+                                &applied_code_files,
+                                &[],
+                                &fix_strategy,
+                                refreshed_stack.as_ref(),
+                                &mcp_servers,
+                                &mut cancel_rx,
+                            )
+                            .await
+                            {
+                                Ok(fix_res) => {
+                                    let fix_tok =
+                                        fix_res.prompt_tokens + fix_res.completion_tokens;
+                                    step_tokens += fix_tok;
+                                    exec_tokens_used += fix_tok;
+                                    tool_results.extend(fix_res.tool_results);
+                                    if !fix_res.applied_files.is_empty() {
+                                        push_unique_paths(
+                                            &mut turn_applied_files,
+                                            &fix_res.applied_files,
+                                        );
+                                        push_unique_paths(&mut step_files, &fix_res.applied_files);
+                                        had_repairs = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    if is_cancelled(&cancel_rx)
+                                        || e.to_string().contains("CANCELLED_BY_USER")
+                                    {
+                                        if let Some(h) = title_handle.take() {
+                                            h.abort();
+                                        }
+                                        return finish_cancelled_pipeline(
+                                            app,
+                                            state_lock,
+                                            &conversation_id,
+                                            &project.root_path,
+                                            &mut agent_trace,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let files_note = if step_files.is_empty() {
+                        "aucun fichier modifié".to_string()
+                    } else {
+                        step_files.join(", ")
+                    };
+                    completed_steps_summary.push(format!(
+                        "- Étape {} ({}) : {}",
+                        idx + 1,
+                        step.title,
+                        files_note
+                    ));
+
+                    let fb_note = if let Some(ref r) = step_res.fallback_reason {
+                        format!(" · Repli (`{}`)", truncate_chars(&r.replace('`', "'"), 55))
+                    } else {
+                        String::new()
+                    };
+                    record_trace_step(
+                        app,
+                        &conversation_id,
+                        &mut agent_trace,
+                        AgentTraceStep {
+                            role: trace_role_key,
+                            role_label: step_label,
+                            provider: step_res.actual_provider,
+                            model: step_res.actual_model,
+                            summary: format!(
+                                "{} · {} tour(s){}",
+                                files_note, step_res.turns_run, fb_note
+                            ),
+                            status: if step_res.fallback_reason.is_some() {
+                                "fallback".to_string()
+                            } else {
+                                "done".to_string()
+                            },
+                            tokens: step_tokens,
+                        },
+                    );
+                }
+                Err(err) => {
+                    if is_cancelled(&cancel_rx) || err.to_string().contains("CANCELLED_BY_USER") {
+                        if let Some(h) = title_handle.take() {
+                            h.abort();
+                        }
+                        return finish_cancelled_pipeline(
+                            app,
+                            state_lock,
+                            &conversation_id,
+                            &project.root_path,
+                            &mut agent_trace,
+                        )
+                        .await;
+                    }
+                    let clean_err = synthesize_error_log(&err.to_string());
+                    had_step_error = true;
+                    record_trace_step(
+                        app,
+                        &conversation_id,
+                        &mut agent_trace,
+                        AgentTraceStep {
+                            role: trace_role_key,
+                            role_label: step_label,
+                            provider: step_prov,
+                            model: step_model,
+                            summary: format!("Erreur : `{clean_err}`"),
+                            status: "error".to_string(),
+                            tokens: 0,
+                        },
+                    );
+                    step_narratives.push(format!(
+                        "- **Étape {} ({})** : ⚠️ Erreur (`{clean_err}`)",
+                        idx + 1,
+                        step.title
+                    ));
+                    break;
+                }
             }
         }
-    } else {
-        exec_status = "error".to_string();
-        exec_note = "Ollama arrêté et aucune clé API externe configurée".to_string();
-        let diag = format!(
-            "### Stack locale non démarrée\n\n- **Moteur natif Rust** : Prêt\n- **Ollama** : {}\n- **Modèle cible** : `{}:{}`\n\nLancez Ollama (`ollama serve` puis `ollama pull {}`), ou sélectionnez un fournisseur API externe validé dans les paramètres pour exécuter ce prompt sur `{}`.",
-            if stack.ollama_installed {
-                "Installé mais arrêté"
-            } else {
-                "Non détecté"
-            },
-            exec_prov,
-            exec_model,
-            settings.ollama_model,
-            project.root_path
+
+        if !all_thinking.is_empty() {
+            extracted_thinking = Some(all_thinking.join("\n\n"));
+        }
+        extra_stage_edits = true;
+        exec_status = if had_step_error {
+            "error".to_string()
+        } else {
+            "done".to_string()
+        };
+        exec_note = format!(
+            "Plan séquentiel ({}/{total_steps} étapes)",
+            completed_steps_summary.len()
         );
-        (diag, "Diagnostic stack".to_string())
+        (
+            step_narratives.join("\n"),
+            format!("Plan séquentiel · {total_steps} étapes"),
+        )
+    } else {
+        let strategy = choose_execution_strategy(
+            &project_root_path,
+            &carto.target_files,
+            carto.explicit_match,
+            &exec_prov,
+            &settings,
+        );
+
+        let stage3_label = format!(
+            "3. {} ({} · {})",
+            role_display_name(exec_role),
+            exec_prov,
+            exec_model
+        );
+        let ref_suffix = if carto.read_only_files.is_empty() {
+            String::new()
+        } else {
+            format!(" (+{} réf.)", carto.read_only_files.len())
+        };
+        let global_suffix = if carto.is_global_task {
+            " · vue globale"
+        } else {
+            ""
+        };
+        let stage3_detail = format!(
+            "Moteur natif · {} · map {} tok · {} fichier(s){}{} sur {}:{}",
+            strategy.edit_format,
+            strategy.map_tokens,
+            carto.target_files.len(),
+            ref_suffix,
+            global_suffix,
+            exec_prov,
+            exec_model
+        );
+        emit_stage(
+            app,
+            &conversation_id,
+            3,
+            &stage3_label,
+            &stage3_detail,
+            "running",
+        );
+        record_trace_step(
+            app,
+            &conversation_id,
+            &mut agent_trace,
+            AgentTraceStep {
+                role: exec_role.to_string(),
+                role_label: role_display_name(exec_role).to_string(),
+                provider: exec_prov.clone(),
+                model: exec_model.clone(),
+                summary: stage3_detail.clone(),
+                status: "running".to_string(),
+                tokens: 0,
+            },
+        );
+
+        if can_run_exec {
+            git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
+            let single_images = init_images_opt.take().unwrap_or_default();
+            match execute_native_agent_loop(
+                app,
+                state_lock,
+                &conversation_id,
+                &project,
+                &conv_ctx,
+                &user_prompt,
+                attachments.as_deref(),
+                single_images,
+                architect_spec.as_deref(),
+                &exec_prov,
+                &exec_model,
+                exec_role,
+                stack.ollama_running,
+                &settings,
+                &all_project_files,
+                &carto.target_files,
+                &carto.read_only_files,
+                &strategy,
+                frontend_stack.as_ref(),
+                &mcp_servers,
+                &mut cancel_rx,
+            )
+            .await
+            {
+                Ok(loop_res) => {
+                    engine_ran = true;
+                    exec_tokens_used = loop_res.prompt_tokens + loop_res.completion_tokens;
+                    extracted_thinking = loop_res.thinking;
+                    tool_results = loop_res.tool_results;
+                    had_repairs = loop_res.had_repairs;
+                    raw_exec_output = loop_res.raw_last_response;
+                    exec_prov = loop_res.actual_provider.clone();
+                    exec_model = loop_res.actual_model.clone();
+                    push_unique_paths(&mut turn_applied_files, &loop_res.applied_files);
+                    let fb_note = if let Some(ref r) = loop_res.fallback_reason {
+                        exec_status = "fallback".to_string();
+                        format!(", repli auto: {}", truncate_chars(&r.replace('`', "'"), 60))
+                    } else {
+                        String::new()
+                    };
+                    exec_note = format!(
+                        "Moteur natif (format `{}`, max {} l., {} tour(s){}{})",
+                        loop_res.effective_edit_format,
+                        strategy.max_file_lines,
+                        loop_res.turns_run,
+                        if had_repairs { ", auto-réparé" } else { "" },
+                        fb_note
+                    );
+                    let out = if loop_res.narrative.trim().is_empty()
+                        && !loop_res.applied_files.is_empty()
+                    {
+                        // Laisser vide pour que Stage 5 synthétise un résumé concret basé sur le diff
+                        String::new()
+                    } else if loop_res.narrative.trim().is_empty() {
+                        format!(
+                            "Le modèle `{exec_model}` ({exec_prov}) n'a retourné aucun contenu."
+                        )
+                    } else {
+                        loop_res.narrative
+                    };
+                    (
+                        out,
+                        format!(
+                            "{} · {} ({}:{})",
+                            role_display_name(exec_role),
+                            loop_res.effective_edit_format,
+                            exec_prov,
+                            exec_model
+                        ),
+                    )
+                }
+                Err(err) => {
+                    if is_cancelled(&cancel_rx) || err.to_string().contains("CANCELLED_BY_USER") {
+                        if let Some(h) = title_handle.take() {
+                            h.abort();
+                        }
+                        return finish_cancelled_pipeline(
+                            app,
+                            state_lock,
+                            &conversation_id,
+                            &project.root_path,
+                            &mut agent_trace,
+                        )
+                        .await;
+                    }
+                    let clean_err = synthesize_error_log(&err.to_string());
+                    exec_status = "error".to_string();
+                    exec_note = clean_err.clone();
+                    (
+                        format!(
+                            "⚠️ Erreur sur `{exec_prov}:{exec_model}` :\n`{clean_err}`\n\nVérifiez le modèle sélectionné, vos quotas API ou qu'Ollama est bien actif."
+                        ),
+                        format!("{exec_prov} erreur"),
+                    )
+                }
+            }
+        } else {
+            exec_status = "error".to_string();
+            exec_note = "Ollama arrêté et aucune clé API externe configurée".to_string();
+            let diag = format!(
+                "### Stack locale non démarrée\n\n- **Moteur natif Rust** : Prêt\n- **Ollama** : {}\n- **Modèle cible** : `{}:{}`\n\nLancez Ollama (`ollama serve` puis `ollama pull {}`), ou sélectionnez un fournisseur API externe validé dans les paramètres pour exécuter ce prompt sur `{}`.",
+                if stack.ollama_installed {
+                    "Installé mais arrêté"
+                } else {
+                    "Non détecté"
+                },
+                exec_prov,
+                exec_model,
+                settings.ollama_model,
+                project.root_path
+            );
+            (diag, "Diagnostic stack".to_string())
+        }
     };
 
-    record_trace_step(
-        app,
-        &conversation_id,
-        &mut agent_trace,
-        AgentTraceStep {
-            role: exec_role.to_string(),
-            role_label: role_display_name(exec_role).to_string(),
-            provider: exec_prov.clone(),
-            model: exec_model.clone(),
-            summary: exec_note.clone(),
-            status: exec_status.clone(),
-            tokens: exec_tokens_used,
-        },
-    );
+    if !is_multi_step {
+        record_trace_step(
+            app,
+            &conversation_id,
+            &mut agent_trace,
+            AgentTraceStep {
+                role: exec_role.to_string(),
+                role_label: role_display_name(exec_role).to_string(),
+                provider: exec_prov.clone(),
+                model: exec_model.clone(),
+                summary: exec_note.clone(),
+                status: exec_status.clone(),
+                tokens: exec_tokens_used,
+            },
+        );
+    }
 
     if is_cancelled(&cancel_rx) {
         if let Some(h) = title_handle.take() {
@@ -3801,7 +6160,7 @@ pub async fn run_prompt_pipeline(
     let mut tester_note = String::new();
     let mut tester_ran = false;
     let mut tester_tokens_used = 0usize;
-    let (test_prov, test_model) = resolve_agent_slot("tester", &settings);
+    let (mut test_prov, mut test_model) = resolve_agent_slot("tester", &settings);
     let mut tester_status = "done".to_string();
     let mut tester_summary = String::new();
 
@@ -3809,9 +6168,13 @@ pub async fn run_prompt_pipeline(
         let (pre_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
         let changed_paths: Vec<String> = pre_diffs.into_iter().map(|d| d.path).take(3).collect();
         let can_run_tester = !changed_paths.is_empty()
-            && (test_prov != "ollama" || stack.ollama_running)
-            && (test_prov == "ollama"
-                || providers::find_provider_key(&settings, &test_prov).is_some());
+            && has_callable_candidate(
+                &test_prov,
+                &test_model,
+                "tester",
+                &settings,
+                stack.ollama_running,
+            );
         if can_run_tester {
             emit_stage(
                 app,
@@ -3870,11 +6233,13 @@ pub async fn run_prompt_pipeline(
                 &test_prov,
                 &test_model,
                 "tester",
+                stack.ollama_running,
                 &settings,
                 &all_project_files,
                 &changed_paths,
                 &[],
                 &test_strategy,
+                frontend_stack.as_ref(),
                 &mcp_servers,
                 &mut cancel_rx,
             )
@@ -3883,6 +6248,11 @@ pub async fn run_prompt_pipeline(
                 Ok(t_res) => {
                     tester_ran = true;
                     tester_tokens_used = t_res.prompt_tokens + t_res.completion_tokens;
+                    test_prov = t_res.actual_provider.clone();
+                    test_model = t_res.actual_model.clone();
+                    if t_res.fallback_reason.is_some() {
+                        tester_status = "fallback".to_string();
+                    }
                     tool_results.extend(t_res.tool_results);
                     if !t_res.applied_files.is_empty() {
                         push_unique_paths(&mut turn_applied_files, &t_res.applied_files);
@@ -3918,6 +6288,235 @@ pub async fn run_prompt_pipeline(
                     tester_summary = format!(
                         "Échec rédaction tests : `{}`",
                         synthesize_error_log(&e.to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    // Garde-fou CSS statique & auto-correction ciblée (Stage 4)
+    let mut css_verifier_note = String::new();
+    let mut latest_all_files = if is_multi_step {
+        list_source_files_for_cartographer(&project_root_path)
+    } else {
+        all_project_files.clone()
+    };
+    let mut latest_frontend_stack = if is_multi_step {
+        detect_frontend_stack(&project_root_path, &latest_all_files)
+    } else {
+        frontend_stack.clone()
+    };
+
+    if engine_ran && can_run_exec && !is_install_or_setup_prompt(&user_prompt) && !is_cancelled(&cancel_rx) {
+        let mut post_exec_touched = turn_applied_files.clone();
+        if post_exec_touched.is_empty() {
+            let (post_exec_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
+            let diff_paths: Vec<String> = post_exec_diffs.into_iter().map(|d| d.path).collect();
+            push_unique_paths(&mut post_exec_touched, &diff_paths);
+        }
+
+        let has_frontend_touched = post_exec_touched
+            .iter()
+            .any(|p| is_ui_component_or_page(p) || is_stylesheet_path(p));
+
+        if exec_role == "designer" || has_frontend_touched {
+            latest_all_files = list_source_files_for_cartographer(&project_root_path);
+            latest_frontend_stack = detect_frontend_stack(&project_root_path, &latest_all_files);
+
+            let css_audit = audit_frontend_css_issues(
+                &project_root_path,
+                &latest_all_files,
+                &post_exec_touched,
+                exec_role == "designer",
+            );
+
+            if !css_audit.issues.is_empty() {
+                let _ = app.emit(
+                    "aider:stream",
+                    (
+                        &conversation_id,
+                        "[Vérifieur CSS] Anomalie de style détectée — auto-correction ciblée...",
+                    ),
+                );
+                emit_stage(
+                    app,
+                    &conversation_id,
+                    4,
+                    "4. Testeur & Vérifieur",
+                    "Anomalie CSS détectée — auto-correction ciblée...",
+                    "running",
+                );
+
+                let mut css_fix_targets = css_audit.flagged_files.clone();
+                if let Some(ref entry) = css_audit.needs_entry_import {
+                    if css_fix_targets.len() < 5
+                        && !css_fix_targets.iter().any(|f| f.eq_ignore_ascii_case(entry))
+                    {
+                        css_fix_targets.push(entry.clone());
+                    }
+                }
+                if let Some(ref st) = latest_frontend_stack {
+                    if (css_audit.needs_entry_import.is_some() || !st.tailwind_active)
+                        && css_fix_targets.len() < 5
+                    {
+                        if let Some(first_css) = st.global_css_files.first() {
+                            if !css_fix_targets
+                                .iter()
+                                .any(|f| f.eq_ignore_ascii_case(first_css))
+                            {
+                                css_fix_targets.push(first_css.clone());
+                            }
+                        }
+                    }
+                }
+                css_fix_targets.truncate(5);
+
+                if !css_fix_targets.is_empty() {
+                    let all_small = css_fix_targets.iter().all(|rel| {
+                        std::fs::read_to_string(project_root_path.join(rel))
+                            .map(|c| c.lines().count() <= 220)
+                            .unwrap_or(true)
+                    });
+                    let css_fix_strategy = ExecutionStrategy {
+                        edit_format: if all_small {
+                            "whole".to_string()
+                        } else {
+                            "diff".to_string()
+                        },
+                        map_tokens: 0,
+                        max_turns: 2,
+                        max_file_lines: 0,
+                    };
+                    let css_fix_prompt = format!(
+                        "AUDIT CSS — Anomalies bloquantes détectées juste après l'exécution :\n- {}\n\n\
+                        Rappel de la demande utilisateur :\n« {} »\n\n\
+                        Corrige IMPÉRATIVEMENT ces anomalies dans les fichiers cibles (écris du vrai CSS natif complet et explicite avec reset `html, body, #app`, et/ou importe la feuille CSS dans le point d'entrée).",
+                        css_audit.issues.join("\n- "),
+                        truncate_chars(user_prompt.trim(), 600)
+                    );
+
+                    match execute_native_agent_loop(
+                        app,
+                        state_lock,
+                        &conversation_id,
+                        &project,
+                        "",
+                        &css_fix_prompt,
+                        None,
+                        Vec::new(),
+                        None,
+                        &exec_prov,
+                        &exec_model,
+                        "designer",
+                        stack.ollama_running,
+                        &settings,
+                        &latest_all_files,
+                        &css_fix_targets,
+                        &[],
+                        &css_fix_strategy,
+                        latest_frontend_stack.as_ref(),
+                        &mcp_servers,
+                        &mut cancel_rx,
+                    )
+                    .await
+                    {
+                        Ok(css_res) => {
+                            let css_fix_tokens =
+                                css_res.prompt_tokens + css_res.completion_tokens;
+                            exec_tokens_used += css_fix_tokens;
+                            tool_results.extend(css_res.tool_results);
+                            if !css_res.applied_files.is_empty() {
+                                push_unique_paths(&mut turn_applied_files, &css_res.applied_files);
+                                extra_stage_edits = true;
+                                had_repairs = true;
+                            }
+
+                            latest_all_files =
+                                list_source_files_for_cartographer(&project_root_path);
+                            latest_frontend_stack =
+                                detect_frontend_stack(&project_root_path, &latest_all_files);
+                            let (re_diffs, _, _) =
+                                git_diff::collect_project_diffs(&project.root_path).await;
+                            let mut re_touched = turn_applied_files.clone();
+                            let re_diff_paths: Vec<String> =
+                                re_diffs.into_iter().map(|d| d.path).collect();
+                            push_unique_paths(&mut re_touched, &re_diff_paths);
+
+                            let re_audit = audit_frontend_css_issues(
+                                &project_root_path,
+                                &latest_all_files,
+                                &re_touched,
+                                exec_role == "designer",
+                            );
+                            if re_audit.issues.is_empty() {
+                                css_verifier_note =
+                                    "• ✅ **Vérifieur CSS** : anomalies de style auto-corrigées."
+                                        .to_string();
+                                record_trace_step(
+                                    app,
+                                    &conversation_id,
+                                    &mut agent_trace,
+                                    AgentTraceStep {
+                                        role: "tester".to_string(),
+                                        role_label: "Vérifieur CSS".to_string(),
+                                        provider: exec_prov.clone(),
+                                        model: exec_model.clone(),
+                                        summary: "✅ Anomalies de style auto-corrigées"
+                                            .to_string(),
+                                        status: "done".to_string(),
+                                        tokens: css_fix_tokens,
+                                    },
+                                );
+                            } else {
+                                css_verifier_note = format!(
+                                    "• ⚠️ **Vérifieur CSS** : {}",
+                                    re_audit.issues.join(" ; ")
+                                );
+                                record_trace_step(
+                                    app,
+                                    &conversation_id,
+                                    &mut agent_trace,
+                                    AgentTraceStep {
+                                        role: "tester".to_string(),
+                                        role_label: "Vérifieur CSS".to_string(),
+                                        provider: exec_prov.clone(),
+                                        model: exec_model.clone(),
+                                        summary: format!(
+                                            "⚠️ {}",
+                                            truncate_chars(&re_audit.issues.join(" ; "), 110)
+                                        ),
+                                        status: "error".to_string(),
+                                        tokens: css_fix_tokens,
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if is_cancelled(&cancel_rx)
+                                || e.to_string().contains("CANCELLED_BY_USER")
+                            {
+                                if let Some(h) = title_handle.take() {
+                                    h.abort();
+                                }
+                                return finish_cancelled_pipeline(
+                                    app,
+                                    state_lock,
+                                    &conversation_id,
+                                    &project.root_path,
+                                    &mut agent_trace,
+                                )
+                                .await;
+                            }
+                            css_verifier_note = format!(
+                                "• ⚠️ **Vérifieur CSS** : {}",
+                                css_audit.issues.join(" ; ")
+                            );
+                        }
+                    }
+                } else {
+                    css_verifier_note = format!(
+                        "• ⚠️ **Vérifieur CSS** : {}",
+                        css_audit.issues.join(" ; ")
                     );
                 }
             }
@@ -3995,11 +6594,13 @@ pub async fn run_prompt_pipeline(
             &exec_prov,
             &exec_model,
             exec_role,
+            stack.ollama_running,
             &settings,
-            &all_project_files,
+            &latest_all_files,
             &broken_paths,
             &[],
             &fix_strategy,
+            latest_frontend_stack.as_ref(),
             &mcp_servers,
             &mut cancel_rx,
         )
@@ -4016,10 +6617,10 @@ pub async fn run_prompt_pipeline(
         }
     }
 
-    let mut verifier_note = String::new();
+    let mut build_verifier_note = String::new();
     if test_res.ran {
         if test_res.success {
-            verifier_note = format!(
+            build_verifier_note = format!(
                 "• ✅ **Vérifieur ({})** : {}",
                 test_res.command, test_res.output_summary
             );
@@ -4046,7 +6647,7 @@ pub async fn run_prompt_pipeline(
                 );
             }
         } else {
-            verifier_note = format!(
+            build_verifier_note = format!(
                 "• ⚠️ **Vérifieur ({})** : Compilation en erreur :\n```\n{}\n```",
                 test_res.command, test_res.output_summary
             );
@@ -4075,6 +6676,14 @@ pub async fn run_prompt_pipeline(
             }
         }
     }
+    let mut verifier_parts = Vec::new();
+    if !css_verifier_note.is_empty() {
+        verifier_parts.push(css_verifier_note);
+    }
+    if !build_verifier_note.is_empty() {
+        verifier_parts.push(build_verifier_note);
+    }
+    let verifier_note = verifier_parts.join("\n");
     if tester_ran {
         record_trace_step(
             app,
@@ -4124,13 +6733,47 @@ pub async fn run_prompt_pipeline(
     let (modified_files, lines_added, lines_removed) =
         git_diff::collect_project_diffs(&project.root_path).await;
 
-    if !modified_files.is_empty() && exec_status != "error" {
+    // Calcul du diff exclusif à ce tour (fichiers touchés durant ce tour uniquement, avec delta de lignes)
+    let turn_modified_files: Vec<ModifiedFileDiff> = if !turn_applied_files.is_empty() {
+        let mut diffs: Vec<ModifiedFileDiff> = Vec::new();
+        for f in &modified_files {
+            if turn_applied_files.iter().any(|p| paths_match(&f.path, p)) {
+                let mut turn_f = f.clone();
+                if let Some(pre) = pre_turn_diffs.iter().find(|p| paths_match(&p.path, &f.path)) {
+                    turn_f.added = f.added.saturating_sub(pre.added);
+                    turn_f.removed = f.removed.saturating_sub(pre.removed);
+                    turn_f.modified = f.modified.saturating_sub(pre.modified);
+                }
+                diffs.push(turn_f);
+            }
+        }
+        for app_p in &turn_applied_files {
+            let norm = normalize_diff_path(app_p);
+            if !diffs.iter().any(|d| paths_match(&d.path, &norm)) {
+                diffs.push(ModifiedFileDiff {
+                    path: norm,
+                    added: 1,
+                    removed: 0,
+                    modified: 0,
+                    lines: Vec::new(),
+                });
+            }
+        }
+        diffs
+    } else {
+        Vec::new()
+    };
+    let turn_files_summary = build_files_summary(&turn_modified_files);
+    let turn_added: usize = turn_modified_files.iter().map(|f| f.added + f.modified).sum();
+    let turn_removed: usize = turn_modified_files.iter().map(|f| f.removed + f.modified).sum();
+
+    if !is_multi_step && !turn_modified_files.is_empty() && exec_status != "error" {
         let enriched_summary = format!(
-            "{} · **{} fichier(s)** modifié(s) (`+{}` / `-{}`)",
+            "{} · **{} fichier(s)** modifié(s) sur ce tour (`+{}` / `-{}`)",
             exec_note,
-            modified_files.len(),
-            lines_added,
-            lines_removed
+            turn_modified_files.len(),
+            turn_added,
+            turn_removed
         );
         record_trace_step(
             app,
@@ -4174,7 +6817,7 @@ pub async fn run_prompt_pipeline(
             &synth_prov,
             &synth_model,
             &settings,
-            &modified_files,
+            &turn_modified_files,
             &turn_applied_files,
             extra_stage_edits,
             &verifier_note,
@@ -4183,13 +6826,13 @@ pub async fn run_prompt_pipeline(
 
     let synth_summary = if synth_tokens > 0 {
         format!(
-            "Synthèse finale (**{} fichier(s)** modifié(s)) et mise à jour mémoire",
-            modified_files.len()
+            "Synthèse finale (**{} fichier(s)** sur ce tour) et mise à jour mémoire",
+            turn_modified_files.len()
         )
     } else {
         format!(
-            "Mise en forme finale (**{} fichier(s)** modifié(s)) sans appel LLM",
-            modified_files.len()
+            "Mise en forme finale (**{} fichier(s)** sur ce tour) sans appel LLM",
+            turn_modified_files.len()
         )
     };
     record_trace_step(
@@ -4258,24 +6901,63 @@ pub async fn run_prompt_pipeline(
             .position(|c| c.id == conversation_id)
             .ok_or_else(|| anyhow::anyhow!("Conversation introuvable"))?;
 
+        let (commit_id, commit_summary) = if !turn_files_summary.is_empty() {
+            let commit_num = guard.conversations[conv_idx]
+                .messages
+                .iter()
+                .filter(|m| m.commit_id.is_some())
+                .count() + 1;
+            let id = format!("vAIx #{commit_num}");
+            let files_txt = if turn_files_summary.len() == 1 {
+                turn_files_summary[0].path.clone()
+            } else {
+                format!("{} fichiers ({}, ...)", turn_files_summary.len(), turn_files_summary[0].path)
+            };
+            let summary = format!("{files_txt} (+{turn_added}/-{turn_removed})");
+            (Some(id), Some(summary))
+        } else {
+            (None, None)
+        };
+
+        let assistant_msg_id = Uuid::new_v4().to_string();
         guard.conversations[conv_idx].messages.push(ChatMessage {
-            id: Uuid::new_v4().to_string(),
+            id: assistant_msg_id.clone(),
             role: "assistant".to_string(),
             content: synthesized_text.clone(),
             thinking: thinking_with_tools,
             attachments: None,
             created_at: now.clone(),
             stage_summary: Some(stage_note),
-            files_changed: modified_files.len(),
-            lines_added,
-            lines_removed,
-            files_summary: build_files_summary(&modified_files),
+            files_changed: turn_modified_files.len(),
+            lines_added: turn_added,
+            lines_removed: turn_removed,
+            files_summary: turn_files_summary,
             agent_trace,
+            commit_id: commit_id.clone(),
+            commit_summary: commit_summary.clone(),
         });
+
+        // Mise à jour continue de l'artefact Journal d'évolution si des modifications de code ont eu lieu
+        if let (Some(ref c_id), Some(ref c_sum)) = (&commit_id, &commit_summary) {
+            let turn_paths: Vec<&str> = turn_modified_files.iter().map(|f| f.path.as_str()).collect();
+            crate::models::update_conversation_evolution_artifact(
+                &mut guard.conversations[conv_idx],
+                c_id,
+                &assistant_msg_id,
+                &user_prompt,
+                exec_role,
+                &turn_paths,
+                turn_added,
+                turn_removed,
+                c_sum,
+                &now,
+            );
+        }
 
         for art in new_artifacts {
             guard.conversations[conv_idx].artifacts.push(art);
         }
+        // Le diff total cumulé de la discussion reste accessible dans la conversation
         guard.conversations[conv_idx].modified_files = modified_files.clone();
         guard.conversations[conv_idx].lines_added = lines_added;
         guard.conversations[conv_idx].lines_removed = lines_removed;
@@ -4381,7 +7063,7 @@ mod tests {
 
         let settings = AppSettings::default();
 
-        // Single small explicit file on Ollama 8K -> whole + map 0 + 2 turns
+        // Single small explicit file on Ollama 8K -> whole + map 0 + 3 turns
         let s1 = choose_execution_strategy(
             &dir,
             &["vite.config.js".to_string()],
@@ -4391,7 +7073,7 @@ mod tests {
         );
         assert_eq!(s1.edit_format, "whole");
         assert_eq!(s1.map_tokens, 0);
-        assert_eq!(s1.max_turns, 2);
+        assert_eq!(s1.max_turns, 3);
 
         // Large single explicit file -> diff + map 0
         let s2 = choose_execution_strategy(
@@ -4415,7 +7097,7 @@ mod tests {
         assert_eq!(s2b.edit_format, "diff");
         assert_eq!(s2b.map_tokens, 192);
 
-        // Ollama 16K -> 3 turns + map 256 for single explicit
+        // Ollama 16K -> 5 turns + map 256 for single explicit
         let mut settings_16k = settings.clone();
         settings_16k.context_window_tokens = 16_384;
         let s_16k = choose_execution_strategy(
@@ -4425,10 +7107,10 @@ mod tests {
             "ollama",
             &settings_16k,
         );
-        assert_eq!(s_16k.max_turns, 3);
+        assert_eq!(s_16k.max_turns, 5);
         assert_eq!(s_16k.map_tokens, 256);
 
-        // Cloud provider on 150-line file (> 120 threshold) -> diff + 5 turns + map 1024
+        // Cloud provider on 150-line file (> 120 threshold) -> diff + 7 turns + map 1024
         let s_cloud = choose_execution_strategy(
             &dir,
             &["src/Medium.ts".to_string()],
@@ -4437,7 +7119,7 @@ mod tests {
             &settings,
         );
         assert_eq!(s_cloud.edit_format, "diff");
-        assert_eq!(s_cloud.max_turns, 5);
+        assert_eq!(s_cloud.max_turns, 7);
         assert_eq!(s_cloud.map_tokens, 1024);
 
         // 2 small files -> whole + map 192
@@ -4474,6 +7156,10 @@ mod tests {
             ("designer", false)
         );
         assert_eq!(
+            classify_prompt_role("mets un fond gris anthracite sur la page"),
+            ("designer", false)
+        );
+        assert_eq!(
             classify_prompt_role("Prépare un README.md avec architecture du projet"),
             ("coder", false)
         );
@@ -4504,6 +7190,25 @@ mod tests {
         assert!(matched.contains(&"src/style.css".to_string()));
         assert!(matched.contains(&"src/App.vue".to_string()));
         assert!(matched.len() <= 3);
+
+        let all_files_alt = vec![
+            "index.html".to_string(),
+            "src/styles/main.css".to_string(),
+            "package.json".to_string(),
+        ];
+        let mut matched_alt = Vec::new();
+        augment_design_target_files(&all_files_alt, &mut matched_alt);
+        assert!(matched_alt.contains(&"src/styles/main.css".to_string()));
+        assert!(matched_alt.contains(&"index.html".to_string()));
+    }
+
+    #[test]
+    fn test_prompt_expects_code_changes() {
+        assert!(prompt_expects_code_changes("mets un fond gris anthracite sur la page"));
+        assert!(prompt_expects_code_changes("ajoute un bouton"));
+        assert!(prompt_expects_code_changes("Créé un layout avec menu à gauche"));
+        assert!(!prompt_expects_code_changes("Explique-moi comment fonctionne le routeur ?"));
+        assert!(!prompt_expects_code_changes("Pourquoi Vite échoue ?"));
     }
 
     #[test]
@@ -4563,13 +7268,20 @@ mod tests {
             enabled: true,
             project_id: None,
         };
-        let p_diff = build_native_system_prompt("diff", &[&srv], "Outil `read_query`");
+        let p_diff = build_native_system_prompt(
+            "coder",
+            "diff",
+            &[&srv],
+            "Outil `read_query`",
+            None,
+        );
         assert!(p_diff.contains("SEARCH/REPLACE"));
         assert!(p_diff.contains("mcp_call"));
         assert!(p_diff.contains("sqlite-db"));
         assert!(p_diff.contains("read_query"));
+        assert!(p_diff.contains("CONSIGNES DU RÔLE (`Codeur`)"));
 
-        let p_whole = build_native_system_prompt("whole", &[], "");
+        let p_whole = build_native_system_prompt("coder", "whole", &[], "", None);
         assert!(p_whole.contains("FORMAT D'ÉDITION (`whole`)"));
         assert!(!p_whole.contains("mcp_call"));
     }
@@ -4590,11 +7302,18 @@ const a = 2;
 export function cleanHelper(x: number): number {
   return x + 1;
 }
+```
+
+### Rapport d'audit de sécurité
+```markdown
+# Audit complet
+- Vulnérabilité X résolue
+- Dépendances validées
 ```"#;
         let arts = extract_artifacts_from_markdown(md);
         assert_eq!(arts.len(), 1);
-        assert_eq!(arts[0].language, "ts");
-        assert!(!arts[0].content.contains("<<<<<<< SEARCH"));
+        assert_eq!(arts[0].language, "markdown");
+        assert!(arts[0].title.contains("Rapport d'audit"));
     }
 
     #[test]
@@ -4792,5 +7511,408 @@ const p = "LeHud.vue";
             "1. Modifie App.vue\n2. Modifie main.css",
             true
         ));
+    }
+
+    #[test]
+    fn test_detect_frontend_stack_native_vs_tailwind_broken_vs_active() {
+        // 1. Projet Rust pur -> None
+        let rust_dir = make_temp_dir("stack_rust");
+        std::fs::write(rust_dir.join("Cargo.toml"), "[package]\nname = \"cli\"\n").unwrap();
+        assert!(detect_frontend_stack(&rust_dir, &["Cargo.toml".to_string()]).is_none());
+        let _ = std::fs::remove_dir_all(&rust_dir);
+
+        // 2. Projet Vue + Vite CSS natif avec import CSS manquant
+        let native_dir = make_temp_dir("stack_native");
+        std::fs::create_dir_all(native_dir.join("src")).unwrap();
+        std::fs::write(
+            native_dir.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            native_dir.join("src/main.js"),
+            "import { createApp } from 'vue';\nimport App from './App.vue';\ncreateApp(App).mount('#app');\n",
+        )
+        .unwrap();
+        std::fs::write(native_dir.join("src/index.css"), "body { margin: 0; }\n").unwrap();
+        std::fs::write(native_dir.join("src/App.vue"), "<template><div></div></template>\n").unwrap();
+
+        let files_native = vec![
+            "package.json".to_string(),
+            "src/main.js".to_string(),
+            "src/index.css".to_string(),
+            "src/App.vue".to_string(),
+        ];
+        let info_native = detect_frontend_stack(&native_dir, &files_native).unwrap();
+        assert_eq!(info_native.framework.as_deref(), Some("Vue"));
+        assert_eq!(info_native.bundler.as_deref(), Some("Vite"));
+        assert!(!info_native.tailwind_in_pkg);
+        assert!(!info_native.tailwind_active);
+        assert!(info_native.css_entry_missing_import);
+        assert!(info_native.format_summary().contains("CSS NATIF UNIQUEMENT"));
+        assert!(info_native.format_summary().contains("ALERTE CSS"));
+        let _ = std::fs::remove_dir_all(&native_dir);
+
+        // 3. Tailwind dans package.json mais vite.config.js sans plugin tailwindcss -> cassé
+        let broken_tw_dir = make_temp_dir("stack_broken_tw");
+        std::fs::create_dir_all(broken_tw_dir.join("src")).unwrap();
+        std::fs::write(
+            broken_tw_dir.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0","tailwindcss":"^4.0.0","@tailwindcss/vite":"^4.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            broken_tw_dir.join("vite.config.js"),
+            "import vue from '@vitejs/plugin-vue';\nexport default { plugins: [vue()] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            broken_tw_dir.join("src/main.js"),
+            "import './index.css';\nimport App from './App.vue';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            broken_tw_dir.join("src/index.css"),
+            "@import \"tailwindcss\";\n",
+        )
+        .unwrap();
+        let files_broken = vec![
+            "package.json".to_string(),
+            "vite.config.js".to_string(),
+            "src/main.js".to_string(),
+            "src/index.css".to_string(),
+        ];
+        let info_broken = detect_frontend_stack(&broken_tw_dir, &files_broken).unwrap();
+        assert!(info_broken.tailwind_in_pkg);
+        assert!(!info_broken.tailwind_active);
+        assert!(!info_broken.css_entry_missing_import);
+        assert!(info_broken
+            .tailwind_broken_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("plugin Vite/PostCSS manquant"));
+
+        // 4. Activation Tailwind via vite.config.js + directive + import CSS
+        std::fs::write(
+            broken_tw_dir.join("vite.config.js"),
+            "import vue from '@vitejs/plugin-vue';\nimport tailwindcss from '@tailwindcss/vite';\nexport default { plugins: [vue(), tailwindcss()] };\n",
+        )
+        .unwrap();
+        let info_active = detect_frontend_stack(&broken_tw_dir, &files_broken).unwrap();
+        assert!(info_active.tailwind_active);
+        assert!(info_active.tailwind_broken_reason.is_none());
+        let _ = std::fs::remove_dir_all(&broken_tw_dir);
+    }
+
+    #[test]
+    fn test_extract_relative_imports_and_expand_design_targets() {
+        let dir = make_temp_dir("expand_imports");
+        std::fs::create_dir_all(dir.join("src/components")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/main.js"),
+            "import { createApp } from 'vue';\nimport App from './App.vue';\ncreateApp(App).mount('#app');\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/index.css"), "body { margin: 0; }\n").unwrap();
+        std::fs::write(
+            dir.join("src/App.vue"),
+            "<script setup>\nimport ConversationList from './components/ConversationList.vue';\nimport ChatDiscussion from '@/components/ChatDiscussion';\n</script>\n<template><ConversationList /><ChatDiscussion /></template>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/components/ConversationList.vue"),
+            "<template><aside></aside></template>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/components/ChatDiscussion.vue"),
+            "<template><main></main></template>\n",
+        )
+        .unwrap();
+
+        let all_files = vec![
+            "package.json".to_string(),
+            "src/main.js".to_string(),
+            "src/index.css".to_string(),
+            "src/App.vue".to_string(),
+            "src/components/ConversationList.vue".to_string(),
+            "src/components/ChatDiscussion.vue".to_string(),
+        ];
+
+        let app_content = std::fs::read_to_string(dir.join("src/App.vue")).unwrap();
+        let imps = extract_relative_imports("src/App.vue", &app_content, &all_files);
+        assert_eq!(
+            imps,
+            vec![
+                "src/components/ConversationList.vue",
+                "src/components/ChatDiscussion.vue"
+            ]
+        );
+
+        let stack = detect_frontend_stack(&dir, &all_files);
+        let mut targets = Vec::new();
+        expand_design_targets_with_imports(&dir, &all_files, &mut targets, stack.as_ref(), 6);
+        assert!(targets.contains(&"src/index.css".to_string()));
+        assert!(targets.contains(&"src/App.vue".to_string()));
+        assert!(targets.contains(&"src/components/ConversationList.vue".to_string()));
+        assert!(targets.contains(&"src/components/ChatDiscussion.vue".to_string()));
+        assert!(targets.contains(&"src/main.js".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_native_system_prompt_designer_css_rules() {
+        let mut stack_native = FrontendStackInfo::default();
+        stack_native.tailwind_active = false;
+        let p_native =
+            build_native_system_prompt("designer", "whole", &[], "", Some(&stack_native));
+        assert!(p_native.contains("CONSIGNES DU RÔLE (`Designer UI/UX`)"));
+        assert!(p_native.contains("INTERDICTION STRICTE"));
+        assert!(p_native.contains("box-sizing: border-box"));
+
+        let mut stack_tw = FrontendStackInfo::default();
+        stack_tw.tailwind_active = true;
+        let p_tw = build_native_system_prompt("designer", "whole", &[], "", Some(&stack_tw));
+        assert!(p_tw.contains("Tailwind CSS est ACTIF"));
+        assert!(!p_tw.contains("INTERDICTION STRICTE d'écrire des classes utilitaires Tailwind"));
+    }
+
+    #[test]
+    fn test_audit_frontend_css_issues_catches_orphan_tailwind_and_missing_import() {
+        let dir = make_temp_dir("css_audit");
+        std::fs::create_dir_all(dir.join("src/components")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/main.js"),
+            "import App from './App.vue';\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/index.css"), "body { margin: 0; }\n").unwrap();
+        std::fs::write(
+            dir.join("src/App.vue"),
+            "<template><div class=\"flex-col h-screen w-[170px] bg-[#2b2d31] bg-gradient-to-r from-blue-900 to-blue-400\"></div></template>\n",
+        )
+        .unwrap();
+
+        let all_files = vec![
+            "package.json".to_string(),
+            "src/main.js".to_string(),
+            "src/index.css".to_string(),
+            "src/App.vue".to_string(),
+        ];
+
+        let report = audit_frontend_css_issues(&dir, &all_files, &["src/App.vue".to_string()], true);
+        assert!(report.flagged_files.contains(&"src/App.vue".to_string()));
+        assert_eq!(report.needs_entry_import.as_deref(), Some("src/main.js"));
+        assert!(report.issues.iter().any(|i| i.contains("classes utilitaires Tailwind")));
+        assert!(report.issues.iter().any(|i| i.contains("n'est importée ni dans `src/main.js`")));
+
+        // Une fois import CSS ajouté et vrai CSS natif écrit dans App.vue, plus aucune anomalie
+        std::fs::write(
+            dir.join("src/main.js"),
+            "import './index.css';\nimport App from './App.vue';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/App.vue"),
+            "<template><div class=\"layout\"><aside class=\"sidebar\"></aside></div></template>\n<style scoped>\n.layout { display: flex; height: 100vh; }\n.sidebar { width: 170px; background: #2b2d31; }\n</style>\n",
+        )
+        .unwrap();
+        let clean = audit_frontend_css_issues(&dir, &all_files, &["src/App.vue".to_string()], true);
+        assert!(clean.issues.is_empty());
+        assert!(clean.flagged_files.is_empty());
+        assert!(clean.needs_entry_import.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_file_line_range_and_large_file_truncation() {
+        let dir = make_temp_dir("read_range");
+        let lines: Vec<String> = (1..=260).map(|i| format!("line_{i}")).collect();
+        std::fs::write(dir.join("big.ts"), lines.join("\n")).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let range_res = rt
+            .block_on(execute_local_tool_internal(
+                &dir,
+                "read_file",
+                &serde_json::json!({"path": "big.ts", "start_line": 200, "end_line": 210}),
+            ))
+            .unwrap();
+        assert!(range_res.message.contains("[Lignes 200-210 / 260]"));
+        assert!(range_res.message.contains("200: line_200"));
+        assert!(range_res.message.contains("210: line_210"));
+        assert!(!range_res.message.contains("199: line_199"));
+
+        let full_res = rt
+            .block_on(execute_local_tool_internal(
+                &dir,
+                "read_file",
+                &serde_json::json!({"path": "big.ts"}),
+            ))
+            .unwrap();
+        assert!(full_res.message.contains("[Lignes 1-160 / 260]"));
+        assert!(full_res.message.contains("start_line"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_architect_plan() {
+        let raw = r#"```json
+{
+  "role": "coder",
+  "runTests": true,
+  "spec": "Architecture modulaire",
+  "steps": [
+    {"title": "Types", "role": "coder", "files": ["src/types.ts"], "instructions": "Créer les types"},
+    {"title": "", "role": "coder", "files": [], "instructions": "Ignorer car titre vide"},
+    {"title": "Store", "role": "unknown_role", "files": ["src/store.ts"], "instructions": "Créer le store"},
+    {"title": "UI", "role": "designer", "files": ["src/App.vue"], "instructions": "Composer la vue"},
+    {"title": "CSS", "role": "designer", "files": ["src/style.css"], "instructions": "Ajouter le CSS"},
+    {"title": "Tests", "role": "tester", "files": ["src/store.spec.ts"], "instructions": "Écrire les tests"},
+    {"title": "Extra ignoré", "role": "coder", "files": [], "instructions": "6e étape hors plafond"}
+  ]
+}
+```"#;
+        let parsed = parse_architect_plan(raw, "coder");
+        assert_eq!(parsed.role.as_deref(), Some("coder"));
+        assert!(parsed.run_tests);
+        assert_eq!(parsed.spec.as_deref(), Some("Architecture modulaire"));
+        assert_eq!(parsed.steps.len(), 5);
+        assert_eq!(parsed.steps[0].title, "Types");
+        assert_eq!(parsed.steps[0].role, "coder");
+        assert_eq!(parsed.steps[1].title, "Store");
+        assert_eq!(parsed.steps[1].role, "coder");
+        assert_eq!(parsed.steps[2].role, "designer");
+        assert_eq!(parsed.steps[4].title, "Tests");
+    }
+
+    #[test]
+    fn test_load_project_architecture_memory() {
+        let dir = make_temp_dir("arch_mem");
+        assert!(load_project_architecture_memory(&dir, 500).is_none());
+
+        std::fs::write(dir.join("AGENTS.md"), "Règles AGENTS globales").unwrap();
+        let (src1, txt1) = load_project_architecture_memory(&dir, 500).unwrap();
+        assert_eq!(src1, "AGENTS.md");
+        assert_eq!(txt1, "Règles AGENTS globales");
+
+        std::fs::create_dir_all(dir.join(".vaix")).unwrap();
+        std::fs::write(
+            dir.join(".vaix/architecture.md"),
+            "Architecture prioritaire vAIx STUDIO avec détails",
+        )
+        .unwrap();
+        let (src2, txt2) = load_project_architecture_memory(&dir, 24).unwrap();
+        assert_eq!(src2, ".vaix/architecture.md");
+        assert_eq!(txt2, "Architecture prioritaire…");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_install_prompt_routes_to_coder_and_targets_config_only() {
+        assert!(is_install_or_setup_prompt("Installe tailwindcss et iconify-vue"));
+        assert!(!is_install_or_setup_prompt(
+            "Installe tailwindcss et refais le layout avec une sidebar gris anthracite"
+        ));
+
+        assert_eq!(
+            classify_prompt_role("Installe tailwindcss et iconify-vue"),
+            ("coder", false)
+        );
+        assert_eq!(
+            classify_prompt_role(
+                "Installe tailwindcss et refais le layout avec une sidebar gris anthracite"
+            ),
+            ("designer", false)
+        );
+
+        let all_files = vec![
+            "package.json".to_string(),
+            "vite.config.js".to_string(),
+            "src/index.css".to_string(),
+            "src/App.vue".to_string(),
+            "src/components/Sidebar.vue".to_string(),
+        ];
+        let (matched, explicit) =
+            match_files_deterministically("Installe tailwindcss et iconify-vue", None, &all_files);
+        assert!(!explicit);
+        assert_eq!(
+            matched,
+            vec![
+                "package.json".to_string(),
+                "vite.config.js".to_string(),
+                "src/index.css".to_string(),
+            ]
+        );
+        assert!(!matched.iter().any(|f| f.ends_with(".vue")));
+    }
+
+    #[test]
+    fn test_detect_installed_packages_and_missing_library() {
+        let dir = make_temp_dir("missing_lib");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/main.js"),
+            "import { createApp } from 'vue';\nimport App from './App.vue';\ncreateApp(App).mount('#app');\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/App.vue"), "<template><div></div></template>\n").unwrap();
+
+        let all_files = vec![
+            "package.json".to_string(),
+            "src/main.js".to_string(),
+            "src/App.vue".to_string(),
+        ];
+
+        let stack = detect_frontend_stack(&dir, &all_files).unwrap();
+        assert!(stack.installed_packages.contains(&"vue".to_string()));
+        assert!(stack.installed_packages.contains(&"vite".to_string()));
+        assert!(stack.format_summary().contains("Paquets installés (package.json)"));
+
+        let missing = prompt_mentions_uninstalled_library(
+            "Ajoute une icône Remix-Icon sur le bouton Envoyer",
+            Some(&stack),
+        );
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("remixicon"));
+
+        let no_false_pos = prompt_mentions_uninstalled_library(
+            "Ajoute une priorité haute sur les cartes",
+            Some(&stack),
+        );
+        assert!(no_false_pos.is_empty());
+
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"vue":"^3.5.0","remixicon":"^4.6.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
+        )
+        .unwrap();
+        let stack_after = detect_frontend_stack(&dir, &all_files).unwrap();
+        assert!(prompt_mentions_uninstalled_library(
+            "Ajoute une icône Remix-Icon sur le bouton Envoyer",
+            Some(&stack_after),
+        )
+        .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

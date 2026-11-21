@@ -13,6 +13,7 @@ pub enum EditBlock {
     WholeFile {
         path: String,
         content: String,
+        implicit_target: bool,
     },
 }
 
@@ -60,6 +61,12 @@ pub fn sanitize_rel_path(raw: &str) -> Option<String> {
     if s.contains("..") {
         return None;
     }
+    if s.chars().any(|c| {
+        matches!(c, '[' | ']' | '(' | ')' | '<' | '>' | '{' | '}' | '|' | '?' | '*')
+            || c.is_whitespace()
+    }) {
+        return None;
+    }
     let lower = s.to_lowercase();
     if lower == ".git" || lower.starts_with(".git/") || lower.contains("/.git/") {
         return None;
@@ -93,6 +100,124 @@ fn is_shell_script_path(path: &str) -> bool {
         || low.ends_with(".cmd")
 }
 
+pub fn is_search_marker(line: &str) -> bool {
+    let t = line.trim();
+    let chev = t.bytes().take_while(|&b| b == b'<').count();
+    if chev < 5 {
+        return false;
+    }
+    let rest = t[chev..].trim().to_ascii_lowercase();
+    rest == "search"
+        || rest.starts_with("search ")
+        || rest == "original"
+        || rest.starts_with("original ")
+}
+
+fn is_divider_marker(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= 5 && t.bytes().all(|b| b == b'=')
+}
+
+pub fn is_replace_marker(line: &str) -> bool {
+    let t = line.trim();
+    let chev = t.bytes().take_while(|&b| b == b'>').count();
+    if chev < 5 {
+        return false;
+    }
+    let rest = t[chev..].trim().to_ascii_lowercase();
+    rest == "replace"
+        || rest.starts_with("replace ")
+        || rest == "updated"
+        || rest.starts_with("updated ")
+}
+
+fn body_has_search_replace_pair(body: &str) -> bool {
+    let has_s = body.lines().any(is_search_marker);
+    let has_r = body.lines().any(is_replace_marker);
+    has_s && has_r
+}
+
+fn body_has_any_search_or_replace_marker(body: &str) -> bool {
+    body.lines()
+        .any(|l| is_search_marker(l) || is_replace_marker(l))
+}
+
+fn resolve_project_rel_path(
+    raw_path: &str,
+    allowed_targets: &[String],
+    all_project_files: &[String],
+) -> String {
+    let clean = raw_path.trim().replace('\\', "/");
+    let clean = clean.strip_prefix("./").unwrap_or(&clean);
+
+    // 1. Correspondance exacte insensible à la casse dans allowed_targets puis all_project_files
+    if let Some(exact) = allowed_targets
+        .iter()
+        .find(|p| p.eq_ignore_ascii_case(clean))
+    {
+        return exact.clone();
+    }
+    if let Some(exact) = all_project_files
+        .iter()
+        .find(|p| p.eq_ignore_ascii_case(clean))
+    {
+        return exact.clone();
+    }
+
+    // 2. Correspondance unique par suffixe "/<clean>" ou basename
+    let suffix = format!("/{}", clean.to_lowercase());
+    let is_basename_only = !clean.contains('/');
+    let find_unique = |list: &[String]| -> Option<String> {
+        let mut matches: Vec<&String> = list
+            .iter()
+            .filter(|p| {
+                let low = p.to_lowercase();
+                low.ends_with(&suffix)
+                    || (is_basename_only
+                        && low.rsplit('/').next().unwrap_or("") == clean.to_lowercase())
+            })
+            .collect();
+        matches.dedup();
+        if matches.len() == 1 {
+            Some(matches[0].clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(found) = find_unique(allowed_targets) {
+        return found;
+    }
+    if let Some(found) = find_unique(all_project_files) {
+        return found;
+    }
+
+    clean.to_string()
+}
+
+fn lang_matches_path(lang: &str, path: &str) -> bool {
+    let l = lang.trim().to_ascii_lowercase();
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if l.is_empty() || ext.is_empty() {
+        return false;
+    }
+    if l == ext {
+        return true;
+    }
+    matches!(
+        (l.as_str(), ext.as_str()),
+        ("css" | "scss" | "sass" | "less", "css" | "scss" | "sass" | "less")
+            | ("html" | "htm", "html" | "htm")
+            | ("ts" | "typescript" | "tsx", "ts" | "tsx")
+            | ("js" | "javascript" | "jsx", "js" | "jsx")
+            | ("rs" | "rust", "rs")
+            | ("py" | "python", "py")
+            | ("json" | "jsonc", "json")
+            | ("yaml" | "yml", "yaml" | "yml")
+            | ("md" | "markdown", "md")
+    )
+}
+
 fn extract_path_from_text_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -107,6 +232,18 @@ fn extract_path_from_text_line(line: &str) -> Option<String> {
         || low.starts_with("git ")
     {
         return None;
+    }
+
+    // Support d'un en-tête/mention au format lien Markdown [NomFichier](chemin/relatif.ext#L10)
+    if let Ok(md_link_re) = Regex::new(r"\[[^\]]+\]\(([^)\s]+)\)") {
+        for cap in md_link_re.captures_iter(trimmed) {
+            if let Some(href_m) = cap.get(1) {
+                let raw_href = href_m.as_str().split('#').next().unwrap_or("");
+                if let Some(p) = sanitize_rel_path(raw_href) {
+                    return Some(p);
+                }
+            }
+        }
     }
 
     let path_re =
@@ -199,6 +336,7 @@ fn heuristic_fallback_path(
     code: &str,
     user_prompt: &str,
     already_seen: &HashSet<String>,
+    all_project_files: &[String],
 ) -> Option<String> {
     let lower_prompt = user_prompt.to_lowercase();
     let is_html = code.contains("<!DOCTYPE html>") || code.contains("<html");
@@ -207,6 +345,7 @@ fn heuristic_fallback_path(
         && (code.contains("margin:")
             || code.contains("padding:")
             || code.contains("color:")
+            || code.contains("background")
             || code.contains("font-family:"));
     let is_js = code.contains("function ")
         || code.contains("const ")
@@ -218,17 +357,65 @@ fn heuristic_fallback_path(
             || lower_prompt.contains("site web")
             || lower_prompt.contains("page html")
             || lower_prompt.contains("vitrine")
-            || lower_prompt.contains("site"))
+            || lower_prompt.contains("site")
+            || lower_prompt.contains("page")
+            || lower_prompt.contains("fond"))
         && !already_seen.contains("index.html")
     {
-        return Some("index.html".to_string());
+        return Some(
+            all_project_files
+                .iter()
+                .find(|f| f.eq_ignore_ascii_case("index.html"))
+                .cloned()
+                .unwrap_or_else(|| "index.html".to_string()),
+        );
     }
-    if is_css
-        && (lower_prompt.contains("css") || lower_prompt.contains("style"))
-        && !already_seen.contains("style.css")
-        && !already_seen.contains("styles.css")
-    {
-        return Some("styles.css".to_string());
+
+    let wants_css_or_visual = lower_prompt.contains("css")
+        || lower_prompt.contains("style")
+        || lower_prompt.contains("fond")
+        || lower_prompt.contains("arrière-plan")
+        || lower_prompt.contains("arriere-plan")
+        || lower_prompt.contains("background")
+        || lower_prompt.contains("couleur")
+        || lower_prompt.contains("gris")
+        || lower_prompt.contains("page");
+
+    if is_css && wants_css_or_visual {
+        let css_candidates = [
+            "src/style.css",
+            "src/styles.css",
+            "src/styles/main.css",
+            "src/assets/main.css",
+            "src/index.css",
+            "src/main.css",
+            "src/app.css",
+            "style.css",
+            "styles.css",
+        ];
+        for cand in css_candidates {
+            if let Some(found) = all_project_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
+                if !already_seen.contains(found) {
+                    return Some(found.clone());
+                }
+            }
+        }
+        if let Some(any_css) = all_project_files
+            .iter()
+            .filter(|f| {
+                let l = f.to_lowercase();
+                (l.ends_with(".css") || l.ends_with(".scss")) && !already_seen.contains(*f)
+            })
+            .min_by_key(|f| (f.matches('/').count(), f.len()))
+        {
+            return Some(any_css.clone());
+        }
+        if (lower_prompt.contains("css") || lower_prompt.contains("style"))
+            && !already_seen.contains("style.css")
+            && !already_seen.contains("styles.css")
+        {
+            return Some("styles.css".to_string());
+        }
     }
     if is_js
         && (lower_prompt.contains("script.js") || lower_prompt.contains("app.js"))
@@ -248,18 +435,16 @@ fn parse_search_replace_hunks(body: &str) -> Vec<(String, String)> {
     let mut i = 0usize;
 
     while i < lines.len() {
-        let t = lines[i].trim();
-        if t.starts_with("<<<<<<< SEARCH") {
+        if is_search_marker(lines[i]) {
             let mut search_lines = Vec::new();
             let mut replace_lines = Vec::new();
             let mut in_replace = false;
             let mut closed = false;
             i += 1;
             while i < lines.len() {
-                let lt = lines[i].trim();
-                if !in_replace && lt == "=======" {
+                if !in_replace && is_divider_marker(lines[i]) {
                     in_replace = true;
-                } else if in_replace && lt.starts_with(">>>>>>> REPLACE") {
+                } else if in_replace && is_replace_marker(lines[i]) {
                     closed = true;
                     break;
                 } else if in_replace {
@@ -282,6 +467,7 @@ fn parse_search_replace_hunks(body: &str) -> Vec<(String, String)> {
 pub fn parse_edit_blocks(
     text: &str,
     allowed_targets: &[String],
+    all_project_files: &[String],
     user_prompt: &str,
 ) -> Vec<EditBlock> {
     let norm = text.replace("\r\n", "\n");
@@ -332,23 +518,40 @@ pub fn parse_edit_blocks(
             }
 
             let (lang, info_path) = detect_path_from_info(info);
-            let has_sr_markers =
-                body.contains("<<<<<<< SEARCH") && body.contains(">>>>>>> REPLACE");
+            let has_sr_markers = body_has_search_replace_pair(&body);
 
-            let mut detected_path = info_path
+            let explicit_or_context_path = info_path
                 .or_else(|| detect_path_from_preceding_lines(&lines, fence_start_idx))
                 .or_else(|| detect_path_from_first_code_line(&body));
+
+            let mut implicit_target = false;
+            let mut detected_path = explicit_or_context_path;
 
             if detected_path.is_none() && has_sr_markers && allowed_targets.len() == 1 {
                 detected_path = sanitize_rel_path(&allowed_targets[0]);
             }
             if detected_path.is_none() && !has_sr_markers {
-                detected_path = heuristic_fallback_path(&body, user_prompt, &seen_whole_paths);
+                if allowed_targets.len() == 1 && lang_matches_path(&lang, &allowed_targets[0]) {
+                    detected_path = sanitize_rel_path(&allowed_targets[0]);
+                    implicit_target = detected_path.is_some();
+                }
+            }
+            if detected_path.is_none() && !has_sr_markers {
+                if let Some(fb) = heuristic_fallback_path(
+                    &body,
+                    user_prompt,
+                    &seen_whole_paths,
+                    all_project_files,
+                ) {
+                    detected_path = Some(fb);
+                    implicit_target = true;
+                }
             }
 
-            let Some(path) = detected_path else {
+            let Some(raw_path) = detected_path else {
                 continue;
             };
+            let path = resolve_project_rel_path(&raw_path, allowed_targets, all_project_files);
 
             if is_shell_lang(&lang) && !is_shell_script_path(&path) && !has_sr_markers {
                 continue;
@@ -362,18 +565,19 @@ pub fn parse_edit_blocks(
                         replace,
                     });
                 }
-            } else if !body.contains("<<<<<<< SEARCH") {
+            } else if !body_has_any_search_or_replace_marker(&body) {
                 seen_whole_paths.insert(path.clone());
                 blocks.push(EditBlock::WholeFile {
                     path,
                     content: body,
+                    implicit_target,
                 });
             }
             continue;
         }
 
         // 2. Bloc SEARCH/REPLACE nu (hors fence Markdown)
-        if lines[i].trim().starts_with("<<<<<<< SEARCH") {
+        if is_search_marker(lines[i]) {
             let sr_start_idx = i;
             let mut search_lines = Vec::new();
             let mut replace_lines = Vec::new();
@@ -381,10 +585,9 @@ pub fn parse_edit_blocks(
             let mut closed = false;
             i += 1;
             while i < lines.len() {
-                let lt = lines[i].trim();
-                if !in_replace && lt == "=======" {
+                if !in_replace && is_divider_marker(lines[i]) {
                     in_replace = true;
-                } else if in_replace && lt.starts_with(">>>>>>> REPLACE") {
+                } else if in_replace && is_replace_marker(lines[i]) {
                     closed = true;
                     break;
                 } else if in_replace {
@@ -404,7 +607,9 @@ pub fn parse_edit_blocks(
                         }
                     },
                 );
-                if let Some(path) = detected {
+                if let Some(raw_path) = detected {
+                    let path =
+                        resolve_project_rel_path(&raw_path, allowed_targets, all_project_files);
                     blocks.push(EditBlock::SearchReplace {
                         path,
                         search: search_lines.join("\n"),
@@ -849,10 +1054,7 @@ pub fn extract_clean_replace_code(patch: &str) -> String {
     patch
         .lines()
         .filter(|l| {
-            let t = l.trim();
-            !t.starts_with("<<<<<<< SEARCH")
-                && t != "======="
-                && !t.starts_with(">>>>>>> REPLACE")
+            !is_search_marker(l) && !is_divider_marker(l) && !is_replace_marker(l)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -863,16 +1065,21 @@ pub async fn apply_edits_from_response(
     project_root: &Path,
     assistant_text: &str,
     target_files: &[String],
+    all_project_files: &[String],
     truncated_files: &HashSet<String>,
     user_prompt: &str,
 ) -> ApplyEditsOutcome {
-    let blocks = parse_edit_blocks(assistant_text, target_files, user_prompt);
+    let blocks = parse_edit_blocks(assistant_text, target_files, all_project_files, user_prompt);
     let mut outcome = ApplyEditsOutcome::default();
     let mut seen_applied = HashSet::new();
 
     for block in blocks {
         match block {
-            EditBlock::WholeFile { path, content } => {
+            EditBlock::WholeFile {
+                path,
+                content,
+                implicit_target,
+            } => {
                 if truncated_files.contains(&path) {
                     outcome.failures.push(PatchFailure {
                         path: path.clone(),
@@ -888,6 +1095,31 @@ pub async fn apply_edits_from_response(
                 }
 
                 let target_path = project_root.join(&path);
+
+                if implicit_target && target_path.is_file() {
+                    if let Ok(existing) = tokio::fs::read_to_string(&target_path).await {
+                        let existing_non_empty =
+                            existing.lines().filter(|l| !l.trim().is_empty()).count();
+                        let new_non_empty =
+                            content.lines().filter(|l| !l.trim().is_empty()).count();
+                        if existing_non_empty >= 15 && new_non_empty * 10 < existing_non_empty * 4 {
+                            outcome.failures.push(PatchFailure {
+                                path: path.clone(),
+                                search_snippet: String::new(),
+                                closest_match: Some(
+                                    existing.lines().take(12).collect::<Vec<_>>().join("\n"),
+                                ),
+                                closest_line: Some(1),
+                                reason: format!(
+                                    "Bloc partiel sans nom de fichier explicite ({} lignes contre {} existantes dans '{}') : utilisez un bloc `SEARCH/REPLACE` ciblé ou fournissez le fichier complet précédé de `### {}`.",
+                                    new_non_empty, existing_non_empty, path, path
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 if let Some(parent) = target_path.parent() {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
                         outcome.failures.push(PatchFailure {
@@ -901,12 +1133,11 @@ pub async fn apply_edits_from_response(
                     }
                 }
 
-                let final_content =
-                    if content.contains("<<<<<<< SEARCH") && content.contains(">>>>>>> REPLACE") {
-                        extract_clean_replace_code(&content)
-                    } else {
-                        content
-                    };
+                let final_content = if body_has_search_replace_pair(&content) {
+                    extract_clean_replace_code(&content)
+                } else {
+                    content
+                };
 
                 if let Err(e) = tokio::fs::write(&target_path, &final_content).await {
                     outcome.failures.push(PatchFailure {
@@ -1024,6 +1255,13 @@ fn is_orphan_file_header_line(
         if low.starts_with(prefix) && s.len() >= prefix.len() {
             s = s[prefix.len()..].trim();
             break;
+        }
+    }
+
+    // Support d'un en-tête/étiquette au format lien Markdown (ex. "### [App.vue](src/App.vue)")
+    if s.starts_with('[') && s.ends_with(')') {
+        if let Some(p) = extract_path_from_text_line(trimmed) {
+            return allow_any || applied_set.contains(&p);
         }
     }
 
@@ -1281,7 +1519,7 @@ pub fn strip_edit_blocks_for_display(text: &str, applied_files: &[String]) -> St
             let is_tool_fence = info_low == "tool_call"
                 || info_low == "json:tool_call"
                 || (body.trim().starts_with("{\"name\"") && body.contains("\"arguments\""));
-            let has_sr = body.contains("<<<<<<< SEARCH") || body.contains(">>>>>>> REPLACE");
+            let has_sr = body_has_any_search_or_replace_marker(&body);
 
             let (lang, info_path) = detect_path_from_info(info);
             let is_shell = is_shell_lang(&lang)
@@ -1315,11 +1553,11 @@ pub fn strip_edit_blocks_for_display(text: &str, applied_files: &[String]) -> St
         }
 
         // Bloc SEARCH/REPLACE nu hors fence
-        if lines[i].trim().starts_with("<<<<<<< SEARCH") {
+        if is_search_marker(lines[i]) {
             cleanup_before_removed_block(&mut out_lines, &applied_set, true);
             i += 1;
             while i < lines.len() {
-                if lines[i].trim().starts_with(">>>>>>> REPLACE") {
+                if is_replace_marker(lines[i]) {
                     i += 1;
                     break;
                 }
@@ -1440,7 +1678,7 @@ const b = 20;
 >>>>>>> REPLACE
 ```"#;
 
-        let blocks = parse_edit_blocks(reply, &[], "");
+        let blocks = parse_edit_blocks(reply, &[], &[], "");
         assert_eq!(blocks.len(), 2);
         match &blocks[0] {
             EditBlock::SearchReplace { path, search, replace } => {
@@ -1470,7 +1708,7 @@ const b = 20;
         truncated.insert("src/big.rs".to_string());
 
         let reply = "### src/big.rs\n```rust\nfn truncated_overwrite() {}\n```";
-        let outcome = apply_edits_from_response(&dir, reply, &[], &truncated, "").await;
+        let outcome = apply_edits_from_response(&dir, reply, &[], &[], &truncated, "").await;
 
         assert!(outcome.applied_files.is_empty());
         assert_eq!(outcome.failures.len(), 1);
@@ -1502,7 +1740,7 @@ npm run build
 ```"#;
 
         let outcome =
-            apply_edits_from_response(&dir, reply, &[], &HashSet::new(), "crée math.ts").await;
+            apply_edits_from_response(&dir, reply, &[], &[], &HashSet::new(), "crée math.ts").await;
         assert_eq!(outcome.applied_files, vec!["src/utils/math.ts"]);
         assert!(dir.join("src/utils/math.ts").exists());
 
@@ -1606,5 +1844,128 @@ npm run dev
         let display = strip_edit_blocks_for_display(reply, &[]);
         assert!(display.contains("Voici la commande à lancer :"));
         assert!(display.contains("```bash\nnpm run dev\n```"));
+    }
+
+    #[test]
+    fn test_sanitize_and_extract_markdown_link_header() {
+        assert_eq!(sanitize_rel_path("[App.vue](src/App.vue)"), None);
+        assert_eq!(
+            extract_path_from_text_line("### [App.vue](src/App.vue)").as_deref(),
+            Some("src/App.vue")
+        );
+        assert_eq!(
+            extract_path_from_text_line("Dans [index.css](src/index.css#L12) :").as_deref(),
+            Some("src/index.css")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_basename_against_project_files() {
+        let dir = make_temp_dir("resolve_base");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/index.css"), "body {\n  background: #ffffff;\n}\n").unwrap();
+        std::fs::write(dir.join("src/App.vue"), "<template><div/></template>\n").unwrap();
+
+        let all_files = vec!["src/index.css".to_string(), "src/App.vue".to_string()];
+        let reply = r#"### index.css
+```css
+<<<<<<< SEARCH
+body {
+  background: #ffffff;
+}
+=======
+body {
+  background: #2b2d31;
+}
+>>>>>>> REPLACE
+```"#;
+
+        let outcome = apply_edits_from_response(
+            &dir,
+            reply,
+            &[],
+            &all_files,
+            &HashSet::new(),
+            "mets un fond gris anthracite sur la page",
+        )
+        .await;
+        assert_eq!(outcome.applied_files, vec!["src/index.css"]);
+        let disk = std::fs::read_to_string(dir.join("src/index.css")).unwrap();
+        assert!(disk.contains("#2b2d31"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tolerant_five_char_search_replace_markers() {
+        let reply = r#"### src/index.css
+```css
+<<<<< SEARCH
+body { background: white; }
+=====
+body { background: #2f3136; }
+>>>>> REPLACE
+```"#;
+        let blocks = parse_edit_blocks(reply, &[], &[], "");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            EditBlock::SearchReplace {
+                path,
+                search,
+                replace,
+            } => {
+                assert_eq!(path, "src/index.css");
+                assert_eq!(search, "body { background: white; }");
+                assert_eq!(replace, "body { background: #2f3136; }");
+            }
+            _ => panic!("Expected SearchReplace"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_target_implicit_whole_file_and_partial_guardrail() {
+        let dir = make_temp_dir("implicit_guard");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+
+        // 1. Petit fichier -> remplacement sans en-tête accepté si cible unique de même langage
+        std::fs::write(dir.join("src/index.css"), "body { color: black; }\n").unwrap();
+        let targets = vec!["src/index.css".to_string()];
+        let reply_small = "```css\nbody {\n  background: #2f3136;\n  color: #ffffff;\n}\n```";
+        let out1 = apply_edits_from_response(
+            &dir,
+            reply_small,
+            &targets,
+            &targets,
+            &HashSet::new(),
+            "mets un fond gris anthracite",
+        )
+        .await;
+        assert_eq!(out1.applied_files, vec!["src/index.css"]);
+        assert!(std::fs::read_to_string(dir.join("src/index.css"))
+            .unwrap()
+            .contains("#2f3136"));
+
+        // 2. Gros fichier (>= 15 lignes) -> extrait partiel sans en-tête refusé avec PatchFailure
+        let big_css: String = (1..=20)
+            .map(|i| format!(".rule-{i} {{ margin: {i}px; }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("src/index.css"), &big_css).unwrap();
+        let reply_partial = "```css\nbody { background: #2f3136; }\n```";
+        let out2 = apply_edits_from_response(
+            &dir,
+            reply_partial,
+            &targets,
+            &targets,
+            &HashSet::new(),
+            "mets un fond gris anthracite",
+        )
+        .await;
+        assert!(out2.applied_files.is_empty());
+        assert_eq!(out2.failures.len(), 1);
+        assert!(out2.failures[0].reason.contains("Bloc partiel"));
+        assert_eq!(std::fs::read_to_string(dir.join("src/index.css")).unwrap(), big_css);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
