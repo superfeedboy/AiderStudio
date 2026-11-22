@@ -2,12 +2,13 @@ mod engine;
 mod git_diff;
 mod mcp;
 mod models;
+pub mod orchestrator;
 mod patcher;
 mod providers;
 mod repo_map;
 mod storage;
 mod telemetry;
-mod tools;
+pub mod tools;
 
 use chrono::Utc;
 use models::{
@@ -96,6 +97,7 @@ async fn validate_provider_key(
             .filter(|b| !b.is_empty());
         slot.validated = true;
         slot.available_models = models;
+        providers::clear_provider_cooldown(&provider_id);
         slot.clone()
     } else {
         return Err(format!("Fournisseur inconnu : {provider_id}"));
@@ -124,17 +126,25 @@ async fn create_project(
     name: String,
     root_path: String,
     global_context: String,
+    init_rules: Option<bool>,
+    initial_prompt: Option<String>,
 ) -> Result<AppStateData, String> {
     let mut guard = state.0.lock().await;
     let now = Utc::now().to_rfc3339();
     let project_id = Uuid::new_v4().to_string();
     let conv_id = Uuid::new_v4().to_string();
 
+    let final_global_context = if global_context.trim().is_empty() {
+        initial_prompt.clone().unwrap_or_default()
+    } else {
+        global_context
+    };
+
     let project = Project {
         id: project_id.clone(),
         name: name.trim().to_string(),
         root_path: root_path.trim().to_string(),
-        global_context,
+        global_context: final_global_context,
         shared_directories: Vec::new(),
         updated_at: now.clone(),
     };
@@ -157,6 +167,16 @@ async fn create_project(
     guard.conversations.insert(0, conv);
     guard.active_project_id = Some(project_id);
     guard.active_conversation_id = Some(conv_id);
+
+    // Initialiser AGENTS.md et .agents/rules/ si demandé
+    if init_rules.unwrap_or(true) {
+        let _ = engine::init_project_agent_rules(
+            std::path::Path::new(&root_path),
+            &name,
+            initial_prompt.as_deref(),
+        )
+        .await;
+    }
 
     // Create recommended .aiderignore automatically to protect 8K context
     let _ = engine::ensure_aiderignore(std::path::Path::new(&root_path)).await;
@@ -800,6 +820,46 @@ async fn ensure_project_aiderignore(
     engine::ensure_aiderignore(std::path::Path::new(&proj.root_path)).await
 }
 
+#[tauri::command]
+async fn list_project_rules(
+    state: State<'_, ManagedState>,
+    project_id: Option<String>,
+) -> Result<Vec<engine::ProjectRuleItem>, String> {
+    let guard = state.0.lock().await;
+    let pid = project_id
+        .or_else(|| guard.active_project_id.clone())
+        .ok_or_else(|| "Aucun projet actif".to_string())?;
+    let proj = guard
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| "Projet introuvable".to_string())?;
+    Ok(engine::list_project_rules(std::path::Path::new(&proj.root_path)))
+}
+
+#[tauri::command]
+async fn init_project_agent_rules(
+    state: State<'_, ManagedState>,
+    project_id: Option<String>,
+    initial_prompt: Option<String>,
+) -> Result<Vec<String>, String> {
+    let guard = state.0.lock().await;
+    let pid = project_id
+        .or_else(|| guard.active_project_id.clone())
+        .ok_or_else(|| "Aucun projet actif".to_string())?;
+    let proj = guard
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| "Projet introuvable".to_string())?;
+    engine::init_project_agent_rules(
+        std::path::Path::new(&proj.root_path),
+        &proj.name,
+        initial_prompt.as_deref(),
+    )
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -847,7 +907,9 @@ pub fn run() {
             test_mcp_server,
             execute_mcp_tool,
             check_project_aiderignore,
-            ensure_project_aiderignore
+            ensure_project_aiderignore,
+            list_project_rules,
+            init_project_agent_rules
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

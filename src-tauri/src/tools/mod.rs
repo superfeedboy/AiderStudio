@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod fs;
 pub mod shell;
+pub mod web;
 
 use crate::models::ToolExecutionResult;
 use std::path::Path;
@@ -53,12 +54,12 @@ pub fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Crée un nouveau fichier ou remplace intégralement le contenu d'un fichier existant (préférer `edit_file` pour des modifications ciblées sur un fichier déjà existant).",
+                "description": "Crée un nouveau fichier ou remplace intégralement le contenu d'un fichier existant sans aucune limite de lignes. Utiliser impérativement cet outil pour toute création de nouveau fichier ou réécriture complète (ex: index.html, main.ts, App.vue).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Chemin relatif exact du fichier à créer ou écrire" },
-                        "content": { "type": "string", "description": "Contenu complet du fichier" }
+                        "content": { "type": "string", "description": "Contenu complet et opérationnel du fichier" }
                     },
                     "required": ["path", "content"]
                 }
@@ -68,13 +69,13 @@ pub fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Modifie chirurgicalement un fichier existant via un ou plusieurs blocs SEARCH/REPLACE exacts, de manière atomique.",
+                "description": "Patch court : modifie chirurgicalement un fichier existant via un ou plusieurs blocs SEARCH/REPLACE exacts et atomiques. Ne jamais utiliser pour créer un nouveau fichier (utiliser write_file).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Chemin relatif exact du fichier existant" },
-                        "search": { "type": "string", "description": "Extrait exact existant à remplacer (pour une modification unique)" },
-                        "replace": { "type": "string", "description": "Nouveau code de remplacement (pour une modification unique)" },
+                        "search": { "type": "string", "description": "Extrait exact existant à remplacer (patch court)" },
+                        "replace": { "type": "string", "description": "Nouveau code de remplacement" },
                         "edits": {
                             "type": "array",
                             "description": "Liste ordonnée d'éditions {search, replace} à appliquer atomiquement",
@@ -122,6 +123,36 @@ pub fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Recherche des informations actualisées sur le web (documentation, erreurs de compilation/dépendances, paquets, solutions) sans nécessiter de clé API.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Mots-clés ciblés de la recherche web" },
+                        "max_results": { "type": "integer", "description": "Nombre maximal de résultats à extraire (défaut 5, borné entre 1 et 10)" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Télécharge et extrait le contenu textuel/markdown épuré d'une page web ou documentation via son URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "URL complète de la page web ou documentation à lire (http:// ou https://)" },
+                        "max_chars": { "type": "integer", "description": "Nombre maximal de caractères à extraire (défaut 12000, max 50000)" }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
     ];
 
     if has_mcp {
@@ -159,6 +190,8 @@ pub async fn execute_local_tool(
         "list_files" => fs::list_files(project_root).await,
         "delete_file" => fs::delete_file(project_root, args).await,
         "run_command" => shell::run_command_simple(project_root, args).await,
+        "web_search" => web::web_search(args).await,
+        "fetch_url" => web::fetch_url(args).await,
         other => Err(format!("Outil inconnu : {}", other)),
     }
 }

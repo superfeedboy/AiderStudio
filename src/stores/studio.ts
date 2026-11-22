@@ -10,12 +10,14 @@ import type {
   AppSettings,
   AppStateData,
   AttachedFile,
+  ChatMessage,
   CodeDrawerMode,
   Conversation,
   HardwareTelemetry,
   McpServerConfig,
   McpToolInfo,
   Project,
+  ProjectRuleItem,
   PromptStageEvent,
   ProviderConfig,
   SendPromptResult,
@@ -820,17 +822,49 @@ export const useStudioStore = defineStore("studio", () => {
   async function createProject(
     name: string,
     rootPath: string,
-    globalContext: string
+    globalContext: string,
+    initRules: boolean = true,
+    initialPrompt: string = ""
   ) {
     if (isTauri()) {
       const next = await invoke<AppStateData>("create_project", {
         name,
         rootPath,
         globalContext,
+        initRules,
+        initialPrompt,
       });
       applyStateData(next);
     }
     newProjectModalOpen.value = false;
+  }
+
+  async function listProjectRules(projectId?: string): Promise<ProjectRuleItem[]> {
+    if (!isTauri()) return [];
+    try {
+      return await invoke<ProjectRuleItem[]>("list_project_rules", {
+        projectId: projectId ?? activeProjectId.value,
+      });
+    } catch (e) {
+      console.warn("Impossible de lister les règles projet:", e);
+      return [];
+    }
+  }
+
+  async function initProjectRules(
+    projectId?: string,
+    initialPrompt?: string
+  ): Promise<string[]> {
+    if (!isTauri()) return [];
+    try {
+      return await invoke<string[]>("init_project_agent_rules", {
+        projectId: projectId ?? activeProjectId.value,
+        initialPrompt,
+      });
+    } catch (e) {
+      console.warn("Impossible d'initialiser les règles projet:", e);
+      return [];
+    }
   }
 
   function openProjectSettings(project?: Project | null) {
@@ -1081,40 +1115,72 @@ export const useStudioStore = defineStore("studio", () => {
     if (convIdx === -1) return;
 
     const targetConv = conversations.value[convIdx];
-    if (targetConv.messages.length <= 1) return;
 
-    const olderMessages = targetConv.messages.slice(0, Math.max(1, targetConv.messages.length - 2));
-    const recentMessages = targetConv.messages.slice(Math.max(1, targetConv.messages.length - 2));
-
-    const summaryBulletPoints = olderMessages
+    const userPrompts = targetConv.messages
       .filter((m) => m.role === "user")
-      .map((m) => `• ${m.content.slice(0, 100).replace(/\n/g, " ")}`)
-      .join("\n");
+      .map((m) => `• ${m.content.slice(0, 100).replace(/\n/g, " ")}`);
 
-    const compactNotice = `[Session compactée - Mémoire libérée]\nHistorique résumé:\n${summaryBulletPoints}`;
+    const summaryText =
+      userPrompts.length > 0
+        ? `[Session compactée (${userPrompts.length} échanges)]\n${userPrompts.slice(-5).join("\n")}`
+        : "[Mémoire de session réinitialisée]";
 
-    targetConv.conversationContext = targetConv.conversationContext
-      ? `${targetConv.conversationContext}\n\n${compactNotice}`
-      : compactNotice;
+    targetConv.conversationContext = summaryText;
+
+    // Réinitialiser les compteurs de tokens pour le HUD
+    delete conversationTokenSteps.value[cid];
+    delete conversationTokenUsage.value[cid];
+    delete conversationPeakTokens.value[cid];
 
     const now = new Date().toISOString();
-    targetConv.messages = [
-      {
-        id: "compact-" + Date.now(),
-        role: "assistant",
-        content: `🧹 **Contexte compacté (/compact)** : La mémoire de conversation a été résumée et compactée. L'espace de la fenêtre de contexte a été libéré avec succès tout en conservant les acquis du projet.`,
-        stageSummary: "Nettoyage contexte (/compact)",
-        createdAt: now,
-        filesChanged: 0,
-        linesAdded: 0,
-        linesRemoved: 0,
-      },
-      ...recentMessages,
-    ];
+    targetConv.messages.push({
+      id: "compact-" + Date.now(),
+      role: "assistant",
+      content: `🧹 **Contexte compacté (/compact)** : La mémoire de travail LLM a été allégée avec succès. L'historique et les directives du projet restent intacts.`,
+      stageSummary: "Nettoyage contexte (/compact)",
+      createdAt: now,
+      filesChanged: 0,
+      linesAdded: 0,
+      linesRemoved: 0,
+    });
     targetConv.updatedAt = now;
 
     if (isTauri()) {
-      await invoke("save_settings", { settings: settings.value });
+      try {
+        await invoke("update_conversation_context", {
+          conversationId: targetConv.id,
+          conversationContext: targetConv.conversationContext,
+        });
+      } catch (e) {
+        console.warn("Erreur sauvegarde compactage:", e);
+      }
+    }
+  }
+
+  async function clearConversation(conversationId?: string) {
+    const cid = conversationId || activeConversationId.value;
+    if (!cid) return;
+    const convIdx = conversations.value.findIndex((c) => c.id === cid);
+    if (convIdx === -1) return;
+
+    const targetConv = conversations.value[convIdx];
+    const now = new Date().toISOString();
+    targetConv.messages = [];
+    targetConv.conversationContext = "";
+    delete conversationTokenSteps.value[cid];
+    delete conversationTokenUsage.value[cid];
+    delete conversationPeakTokens.value[cid];
+    targetConv.updatedAt = now;
+
+    if (isTauri()) {
+      try {
+        await invoke("update_conversation_context", {
+          conversationId: targetConv.id,
+          conversationContext: "",
+        });
+      } catch (e) {
+        console.warn("Erreur réinitialisation conversation:", e);
+      }
     }
   }
 
@@ -1172,6 +1238,19 @@ export const useStudioStore = defineStore("studio", () => {
       detail: "Initialisation du pipeline multi-agents...",
       status: "running",
     };
+
+    // Affichage optimiste immédiat du prompt utilisateur pour qu'il reste visible pendant la réflexion
+    const tempUserMsgId = `optimistic-user-${Date.now()}`;
+    const optimisticMsg: ChatMessage = {
+      id: tempUserMsgId,
+      role: "user",
+      content: prompt.trim(),
+      thinking: null,
+      attachments: hasAttachments ? attachments : undefined,
+      createdAt: new Date().toISOString(),
+      stageSummary: null,
+    };
+    conv.messages = [...conv.messages, optimisticMsg];
 
     try {
       if (isTauri()) {
@@ -1502,6 +1581,8 @@ export const useStudioStore = defineStore("studio", () => {
     setTheme,
     pickProjectDirectory,
     createProject,
+    listProjectRules,
+    initProjectRules,
     deleteProject,
     updateProjectContext,
     createConversation,
@@ -1551,5 +1632,6 @@ export const useStudioStore = defineStore("studio", () => {
     contextPercent,
     activeContextPercent,
     compactConversation,
+    clearConversation,
   };
 });

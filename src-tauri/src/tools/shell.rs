@@ -188,6 +188,43 @@ pub fn is_destructive_command(cmd: &str) -> Option<&'static str> {
     None
 }
 
+pub fn is_daemon_or_dev_server_command(cmd: &str) -> Option<&'static str> {
+    let norm = cmd
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+
+    // Commandes de serveurs de développement ou processus persistants qui ne terminent jamais
+    if norm.starts_with("npm run dev")
+        || norm.starts_with("pnpm run dev")
+        || norm.starts_with("pnpm dev")
+        || norm.starts_with("yarn dev")
+        || norm.starts_with("bun dev")
+        || norm.starts_with("npx vite dev")
+        || norm.starts_with("vite dev")
+        || norm == "vite"
+        || norm.starts_with("vite --")
+        || norm.starts_with("npm start")
+        || norm.starts_with("pnpm start")
+        || norm.starts_with("yarn start")
+        || norm.starts_with("cargo run")
+        || norm.starts_with("python -m http.server")
+        || norm.starts_with("python3 -m http.server")
+        || norm.starts_with("tauri dev")
+        || norm.starts_with("cargo tauri dev")
+        || norm.starts_with("npm run tauri dev")
+        || norm.starts_with("pnpm tauri dev")
+    {
+        return Some("Les serveurs de développement (ex: `npm run dev`, `vite`, `cargo run`) tournent en continu et bloquent le moteur. Pour tester ou diagnostiquer, utilise une commande de validation déterministe qui se termine automatiquement (ex: `npm run build`, `npx vue-tsc --noEmit`, `cargo check`).");
+    }
+
+    None
+}
+
 pub fn parse_timeout_secs(args: &serde_json::Value) -> u64 {
     args.get("timeout_secs")
         .or_else(|| args.get("timeoutSecs"))
@@ -261,6 +298,11 @@ where
         .env("PATH", build_enriched_path())
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
+        .env("CI", "true")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("npm_config_yes", "true")
+        .env("DEBIAN_FRONTEND", "noninteractive")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -464,5 +506,23 @@ mod tests {
         .await;
         assert_eq!(res.unwrap_err(), "CANCELLED_BY_USER");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_is_daemon_or_dev_server_detection() {
+        assert!(is_daemon_or_dev_server_command("npm run dev").is_some());
+        assert!(is_daemon_or_dev_server_command("pnpm dev").is_some());
+        assert!(is_daemon_or_dev_server_command("vite").is_some());
+        assert!(is_daemon_or_dev_server_command("vite --port 3000").is_some());
+        assert!(is_daemon_or_dev_server_command("cargo run").is_some());
+        assert!(is_daemon_or_dev_server_command("python -m http.server 8000").is_some());
+
+        // Safe deterministic commands should NOT be flagged
+        assert!(is_daemon_or_dev_server_command("npm run build").is_none());
+        assert!(is_daemon_or_dev_server_command("npm test").is_none());
+        assert!(is_daemon_or_dev_server_command("pnpm build").is_none());
+        assert!(is_daemon_or_dev_server_command("cargo test").is_none());
+        assert!(is_daemon_or_dev_server_command("cargo check").is_none());
+        assert!(is_daemon_or_dev_server_command("npx vue-tsc --noEmit").is_none());
     }
 }

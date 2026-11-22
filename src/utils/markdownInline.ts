@@ -3,7 +3,8 @@ export type InlineToken =
   | { kind: "bold"; children: InlineToken[] }
   | { kind: "italic"; text: string }
   | { kind: "code"; text: string }
-  | { kind: "link"; label: string; href: string };
+  | { kind: "link"; label: string; href: string }
+  | { kind: "tool-call"; toolName: string; tools: string[]; raw: string };
 
 export interface ResolvedFileTarget {
   path: string;
@@ -14,7 +15,8 @@ export function tokenizeInline(input: string): InlineToken[] {
   const tokens: InlineToken[] = [];
   if (!input) return tokens;
 
-  const regex = /(\[[^\]]+\]\([^)\s]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  const regex =
+    /(\[Appel d'outils?(?:\s+natifs?)?\s*:[^\]]+\]|\[[^\]]+\]\([^)\s]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/gi;
   let lastIdx = 0;
   let match: RegExpExecArray | null;
 
@@ -25,16 +27,30 @@ export function tokenizeInline(input: string): InlineToken[] {
 
     const raw = match[0];
     if (raw.startsWith("[")) {
-      const linkMatch = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(raw);
-      if (linkMatch) {
-        const cleanLabel = linkMatch[1].trim().replace(/^`+|`+$/g, "");
+      const toolMatch = /^\[Appel d'outils?(?:\s+natifs?)?\s*:\s*([^\]]+)\]$/i.exec(raw);
+      if (toolMatch) {
+        const tools = toolMatch[1]
+          .split(",")
+          .map((t) => t.trim().replace(/^`+|`+$/g, ""))
+          .filter(Boolean);
         tokens.push({
-          kind: "link",
-          label: cleanLabel || linkMatch[2],
-          href: linkMatch[2].trim(),
+          kind: "tool-call",
+          toolName: tools[0] || "tool",
+          tools,
+          raw,
         });
       } else {
-        tokens.push({ kind: "text", text: raw });
+        const linkMatch = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(raw);
+        if (linkMatch) {
+          const cleanLabel = linkMatch[1].trim().replace(/^`+|`+$/g, "");
+          tokens.push({
+            kind: "link",
+            label: cleanLabel || linkMatch[2],
+            href: linkMatch[2].trim(),
+          });
+        } else {
+          tokens.push({ kind: "text", text: raw });
+        }
       }
     } else if (raw.startsWith("`") && raw.endsWith("`")) {
       tokens.push({ kind: "code", text: raw.slice(1, -1) });

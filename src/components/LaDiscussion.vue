@@ -3,7 +3,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import hljs from "highlight.js";
 import "highlight.js/styles/github-dark.css";
 import { useStudioStore } from "../stores/studio";
-import type { AttachedFile, ChatMessage, FileChangeSummary } from "../types/studio";
+import type {
+  AgentTraceStep,
+  AttachedFile,
+  ChatMessage,
+  FileChangeSummary,
+  ProjectRuleItem,
+} from "../types/studio";
 import AppLogo from "./AppLogo.vue";
 import LeHud from "./LeHud.vue";
 import MarkdownInline from "./MarkdownInline.vue";
@@ -91,20 +97,117 @@ async function toggleThinking(msgId: string) {
 // File and image attachments
 const attachedFiles = ref<AttachedFile[]>([]);
 
+// Slash commands system (/)
+interface SlashCommandItem {
+  id: string;
+  name: string;
+  command: string;
+  description: string;
+  icon: string;
+  needsArg?: boolean;
+  argPlaceholder?: string;
+}
+
+const slashOpen = ref(false);
+const slashQuery = ref("");
+const slashActiveIndex = ref(0);
+
+const availableSlashCommands: SlashCommandItem[] = [
+  {
+    id: "slash-rules",
+    name: "rules",
+    command: "/rules",
+    description: "Afficher ou ajouter des règles projet (AGENTS.md & .agents/rules/)",
+    icon: "📜",
+    needsArg: false,
+    argPlaceholder: "<consigne optionnelle>",
+  },
+  {
+    id: "slash-plan",
+    name: "plan",
+    command: "/plan",
+    description: "Générer un plan d'action structuré avant de coder",
+    icon: "🗺️",
+    needsArg: true,
+    argPlaceholder: "<votre objectif ou feature>",
+  },
+  {
+    id: "slash-compact",
+    name: "compact",
+    command: "/compact",
+    description: "Nettoyer et alléger le contexte LLM de la session active",
+    icon: "🧹",
+    needsArg: false,
+  },
+  {
+    id: "slash-diff",
+    name: "diff",
+    command: "/diff",
+    description: "Ouvrir le panneau de revue des modifications Git",
+    icon: "🔍",
+    needsArg: false,
+  },
+  {
+    id: "slash-test",
+    name: "test",
+    command: "/test",
+    description: "Exécuter les vérifications de validation (build & tests)",
+    icon: "🧪",
+    needsArg: false,
+    argPlaceholder: "<commande optionnelle>",
+  },
+  {
+    id: "slash-mcp",
+    name: "mcp",
+    command: "/mcp",
+    description: "Ouvrir la gestion des serveurs et outils MCP",
+    icon: "🔌",
+    needsArg: false,
+  },
+  {
+    id: "slash-clear",
+    name: "clear",
+    command: "/clear",
+    description: "Vider les messages de la discussion active",
+    icon: "🗑️",
+    needsArg: false,
+  },
+  {
+    id: "slash-help",
+    name: "help",
+    command: "/help",
+    description: "Afficher l'aide des commandes et raccourcis",
+    icon: "❓",
+    needsArg: false,
+  },
+];
+
+const filteredSlashCommands = computed<SlashCommandItem[]>(() => {
+  const q = slashQuery.value.trim().toLowerCase();
+  if (!q) return availableSlashCommands;
+  return availableSlashCommands.filter(
+    (c) =>
+      c.name.toLowerCase().includes(q) ||
+      c.command.toLowerCase().includes(q) ||
+      c.description.toLowerCase().includes(q)
+  );
+});
+
 // Mention system (@)
 interface MentionItem {
   id: string;
   name: string;
   description: string;
-  category: "file" | "tool" | "plugin" | "mcp";
+  category: "file" | "tool" | "plugin" | "mcp" | "rule";
   tag: string;
 }
 
 const mentionOpen = ref(false);
 const mentionQuery = ref("");
 const mentionActiveIndex = ref(0);
-const mentionCategory = ref<"all" | "file" | "tool" | "plugin" | "mcp">("all");
+const mentionCategory = ref<"all" | "file" | "tool" | "plugin" | "mcp" | "rule">("all");
 const projectFiles = ref<string[]>([]);
+const projectRules = ref<ProjectRuleItem[]>([]);
 
 const builtInTools: MentionItem[] = [
   { id: "tool-write", name: "write_file", description: "Créer ou écraser un fichier local", category: "tool", tag: "@tool:write_file" },
@@ -166,6 +269,11 @@ const mcpMentions = computed<MentionItem[]>(() => {
 
 async function refreshProjectFiles() {
   projectFiles.value = await store.listProjectFiles();
+  projectRules.value = await store.listProjectRules();
+}
+
+async function refreshProjectRules() {
+  projectRules.value = await store.listProjectRules();
 }
 
 const allMentions = computed<MentionItem[]>(() => {
@@ -176,7 +284,31 @@ const allMentions = computed<MentionItem[]>(() => {
     category: "file",
     tag: `@file:${f}`,
   }));
-  return [...fileItems, ...builtInTools, ...builtInPlugins, ...mcpMentions.value];
+
+  const ruleItems: MentionItem[] = [
+    {
+      id: "rule-add",
+      name: "rules",
+      description: "Ajouter ou modifier une règle (.agents/rules/ ou AGENTS.md)",
+      category: "rule",
+      tag: "@rules",
+    },
+    ...projectRules.value.map((r) => ({
+      id: `rule-${r.name}`,
+      name: r.name,
+      description: r.description || `Règle projet ${r.relativePath}`,
+      category: "rule" as const,
+      tag: `@rule:${r.name}`,
+    })),
+  ];
+
+  return [
+    ...ruleItems,
+    ...fileItems,
+    ...builtInTools,
+    ...builtInPlugins,
+    ...mcpMentions.value,
+  ];
 });
 
 const targetPickerRef = ref<HTMLElement | null>(null);
@@ -218,6 +350,8 @@ const roleTraceColors: Record<string, string> = {
   coder: "#3b82f6",
   refactoring: "#f59e0b",
   tester: "#10b981",
+  terminal: "#f97316",
+  research: "#14b8a6",
   synthesizer: "#94a3b8",
 };
 
@@ -247,6 +381,97 @@ function formatCompactTok(n?: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}k`;
   return String(n);
+}
+
+interface TraceGroup {
+  id: string;
+  kind: "phase" | "wave";
+  waveNumber?: number;
+  totalWaves?: number;
+  isParallel?: boolean;
+  label: string;
+  steps: AgentTraceStep[];
+}
+
+function roleIcon(role: string): string {
+  const base = role.split("_step_")[0].toLowerCase();
+  switch (base) {
+    case "terminal":
+      return "💻";
+    case "research":
+      return "🌐";
+    case "coder":
+      return "🛠️";
+    case "designer":
+      return "🎨";
+    case "refactoring":
+      return "⚡";
+    case "tester":
+      return "🧪";
+    case "architect":
+      return "📐";
+    case "cartographer":
+      return "🗺️";
+    case "synthesizer":
+      return "📝";
+    default:
+      return "🤖";
+  }
+}
+
+function groupTraceSteps(steps?: AgentTraceStep[]): TraceGroup[] {
+  if (!steps || steps.length === 0) return [];
+
+  const groups: TraceGroup[] = [];
+  let currentWaveNumber: number | null = null;
+  let currentWaveSteps: AgentTraceStep[] = [];
+  let currentTotalWaves = 1;
+
+  function flushWave() {
+    if (currentWaveSteps.length > 0 && currentWaveNumber !== null) {
+      const isParallel = currentWaveSteps.length > 1;
+      groups.push({
+        id: `wave-${currentWaveNumber}`,
+        kind: "wave",
+        waveNumber: currentWaveNumber,
+        totalWaves: currentTotalWaves,
+        isParallel,
+        label: isParallel
+          ? `Vague ${currentWaveNumber}/${currentTotalWaves} · ${currentWaveSteps.length} tâches en parallèle`
+          : `Vague ${currentWaveNumber}/${currentTotalWaves} · Séquentielle`,
+        steps: [...currentWaveSteps],
+      });
+      currentWaveSteps = [];
+      currentWaveNumber = null;
+    }
+  }
+
+  for (const step of steps) {
+    const match = step.roleLabel.match(/Vague\s+(\d+)(?:\/(\d+))?/i);
+    if (match) {
+      const waveNum = parseInt(match[1], 10);
+      const totalW = match[2] ? parseInt(match[2], 10) : 1;
+
+      if (currentWaveNumber !== null && currentWaveNumber !== waveNum) {
+        flushWave();
+      }
+
+      currentWaveNumber = waveNum;
+      currentTotalWaves = totalW;
+      currentWaveSteps.push(step);
+    } else {
+      flushWave();
+      groups.push({
+        id: `phase-${step.role}`,
+        kind: "phase",
+        label: step.roleLabel,
+        steps: [step],
+      });
+    }
+  }
+
+  flushWave();
+  return groups;
 }
 
 const providerGroups = computed(() => {
@@ -1376,6 +1601,20 @@ function handleTextareaInput(ev: Event) {
   const el = ev.target as HTMLTextAreaElement;
   const cursor = el.selectionStart;
   const textBefore = promptDraft.value.slice(0, cursor);
+
+  // Commandes slash (/)
+  const slashMatch = /(?:^|\n)\/([a-zA-Z0-9_-]*)$/.exec(textBefore);
+  if (slashMatch) {
+    slashOpen.value = true;
+    slashQuery.value = slashMatch[1];
+    slashActiveIndex.value = 0;
+    mentionOpen.value = false;
+    return;
+  } else {
+    slashOpen.value = false;
+  }
+
+  // Mentions (@)
   const match = /(?:^|\s)@([a-zA-Z0-9_\-./:]*)$/.exec(textBefore);
   if (match) {
     mentionOpen.value = true;
@@ -1383,6 +1622,135 @@ function handleTextareaInput(ev: Event) {
     mentionActiveIndex.value = 0;
   } else {
     mentionOpen.value = false;
+  }
+}
+
+async function selectSlashCommand(cmd?: SlashCommandItem) {
+  if (!cmd) return;
+  slashOpen.value = false;
+  const el = textareaRef.value;
+
+  if (cmd.needsArg) {
+    promptDraft.value = `${cmd.command} `;
+    nextTick(() => {
+      if (el) {
+        el.focus();
+        el.setSelectionRange(promptDraft.value.length, promptDraft.value.length);
+        autoResizeTextarea();
+      }
+    });
+  } else {
+    promptDraft.value = "";
+    if (el) el.style.height = "";
+    await executeSlashCommand(cmd.command, "");
+  }
+}
+
+async function executeSlashCommand(command: string, args: string): Promise<boolean> {
+  const norm = command.toLowerCase().trim();
+  const conv = store.activeConversation;
+
+  switch (norm) {
+    case "/compact":
+      await store.compactConversation();
+      return true;
+
+    case "/clear":
+      await store.clearConversation();
+      return true;
+
+    case "/diff":
+    case "/review":
+      store.openReview();
+      return true;
+
+    case "/mcp":
+      store.mcpModalOpen = true;
+      return true;
+
+    case "/rules": {
+      if (args.trim()) {
+        const prompt = `@rules ${args.trim()}`;
+        await store.sendPrompt(prompt, []);
+        return true;
+      }
+      const rules = await store.listProjectRules();
+      const now = new Date().toISOString();
+      let content = "📜 **Directives actives du projet** :\n\n";
+      if (rules.length === 0) {
+        content += "Aucun fichier `AGENTS.md` ou `.agents/rules/*.md` détecté dans ce projet.\nUtilisez `/rules <consigne>` ou `@rules <consigne>` pour en créer.";
+      } else {
+        content += rules
+          .map((r) => `- **${r.name}** (\`${r.relativePath}\`) : ${r.description}`)
+          .join("\n");
+        content += "\n\n💡 *Pour ajouter ou modifier une règle, écrivez `/rules <votre consigne>`.*";
+      }
+      conv?.messages.push({
+        id: "rules-" + Date.now(),
+        role: "assistant",
+        content,
+        stageSummary: "Consultation des règles (/rules)",
+        createdAt: now,
+        filesChanged: 0,
+        linesAdded: 0,
+        linesRemoved: 0,
+      });
+      return true;
+    }
+
+    case "/plan": {
+      const planGoal = args.trim();
+      const prompt = planGoal
+        ? `[MODE PLANIFICATION] Analyse la demande suivante et génère un plan d'action structuré par étapes (sans modifier de code immédiatement) : ${planGoal}`
+        : "[MODE PLANIFICATION] Analyse l'état du projet et propose un plan d'action structuré pour les prochaines étapes.";
+      await store.sendPrompt(prompt, []);
+      return true;
+    }
+
+    case "/test": {
+      const testGoal = args.trim();
+      const prompt = testGoal
+        ? `[TEST & VALIDATION] Exécute la vérification ou les tests suivants : ${testGoal}`
+        : "[TEST & VALIDATION] Exécute la vérification de compilation et les tests du projet (build & test) via l'outil terminal et synthétise le résultat.";
+      await store.sendPrompt(prompt, []);
+      return true;
+    }
+
+    case "/help": {
+      const now = new Date().toISOString();
+      const helpContent = `### 💡 Guide des Commandes Slash (\`/\`) & Mentions (\`@\`)
+
+#### ⚡ Commandes rapides (\`/\`) :
+- **\`/rules [consigne]\`** : Affiche les règles actives du projet ou en enregistre une nouvelle dans \`.agents/rules/\`.
+- **\`/plan <objectif>\`** : Force l'Orchestrateur à générer une feuille de route détaillée sans modifier le code immédiatement.
+- **\`/compact\`** : Allège et nettoie la mémoire LLM de la session active sans effacer l'historique visuel.
+- **\`/diff\`** ou **\`/review\`** : Ouvre le tiroir de revue des modifications Git en cours.
+- **\`/test [cmd]\`** : Lance les tests de validation du projet (\`npm run build\`, \`cargo check\`).
+- **\`/mcp\`** : Ouvre la modale de configuration des serveurs MCP.
+- **\`/clear\`** : Nettoie l'écran de la discussion active.
+- **\`/help\`** : Affiche ce panneau d'aide.
+
+#### 🎯 Mentions contextuelles (\`@\`) :
+- **\`@rules\`** : Cible l'ajout ou la mise à jour des règles projet.
+- **\`@file:<chemin>\`** : Injecte le contenu d'un fichier source.
+- **\`@tool:<nom>\`** : Invoque un outil spécifique (\`run_command\`, \`search_code\`, etc.).
+- **\`@mcp:<serveur>\`** : Invoque une requête ou un outil MCP.`;
+
+      conv?.messages.push({
+        id: "help-" + Date.now(),
+        role: "assistant",
+        content: helpContent,
+        stageSummary: "Aide (/help)",
+        createdAt: now,
+        filesChanged: 0,
+        linesAdded: 0,
+        linesRemoved: 0,
+      });
+      return true;
+    }
+
+    default:
+      return false;
   }
 }
 
@@ -1418,16 +1786,57 @@ async function handleSubmit() {
   promptDraft.value = "";
   attachedFiles.value = [];
   mentionOpen.value = false;
+  slashOpen.value = false;
   await nextTick();
   if (textareaRef.value) {
     textareaRef.value.style.height = "";
   }
+
+  // Interception des commandes slash (/)
+  if (text.startsWith("/")) {
+    const firstSpace = text.indexOf(" ");
+    const cmd = firstSpace === -1 ? text : text.slice(0, firstSpace);
+    const args = firstSpace === -1 ? "" : text.slice(firstSpace + 1);
+    if (await executeSlashCommand(cmd, args)) {
+      scrollToBottom(true);
+      return;
+    }
+  }
+
   scrollToBottom(true);
   await store.sendPrompt(text, files);
   scrollToBottom(false);
 }
 
 function handleKeydown(ev: KeyboardEvent) {
+  // Navigation clavier pour le menu Slash (/)
+  if (slashOpen.value && filteredSlashCommands.value.length > 0) {
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      slashActiveIndex.value =
+        (slashActiveIndex.value + 1) % filteredSlashCommands.value.length;
+      return;
+    }
+    if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      slashActiveIndex.value =
+        (slashActiveIndex.value - 1 + filteredSlashCommands.value.length) %
+        filteredSlashCommands.value.length;
+      return;
+    }
+    if (ev.key === "Enter" || ev.key === "Tab") {
+      ev.preventDefault();
+      void selectSlashCommand(filteredSlashCommands.value[slashActiveIndex.value]);
+      return;
+    }
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      slashOpen.value = false;
+      return;
+    }
+  }
+
+  // Navigation clavier pour le menu Mention (@)
   if (mentionOpen.value && filteredMentions.value.length > 0) {
     if (ev.key === "ArrowDown") {
       ev.preventDefault();
@@ -1902,54 +2311,88 @@ async function copyCodeBlock(key: string, code: string) {
               <div v-if="openThinkingIds.has(msg.id)" class="thinking-body custom-scroll">
                 <div
                   v-if="msg.agentTrace && msg.agentTrace.length > 0"
-                  class="trace-timeline"
+                  class="trace-tree-container"
                 >
                   <div
-                    v-for="(step, sIdx) in msg.agentTrace"
-                    :key="`${step.role}-${sIdx}`"
-                    class="trace-step-card"
-                    :style="{ '--step-role-color': roleTraceDotColor(step.role) }"
+                    v-for="grp in groupTraceSteps(msg.agentTrace)"
+                    :key="grp.id"
+                    class="trace-group-node"
+                    :class="{
+                      'is-wave': grp.kind === 'wave',
+                      'is-parallel-wave': grp.isParallel,
+                      'is-phase': grp.kind === 'phase'
+                    }"
                   >
-                    <div class="trace-step-top">
-                      <div class="trace-role-wrap">
-                        <span
-                          class="trace-role-dot"
-                          :style="{ backgroundColor: roleTraceDotColor(step.role) }"
-                        />
-                        <strong class="trace-role-label">{{ step.roleLabel }}</strong>
-                      </div>
-                      <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
-                        <span
-                          class="trace-prov-dot"
-                          :style="{ backgroundColor: providerDotColor(step.provider) }"
-                        />
-                        <span class="trace-prov-name">{{ providerShortName(step.provider) }}</span>
-                        <span class="trace-model-name">{{ step.model }}</span>
+                    <!-- EN-TÊTE DE VAGUE (DAG Wave) -->
+                    <div v-if="grp.kind === 'wave'" class="dag-wave-header">
+                      <span
+                        class="dag-wave-badge"
+                        :class="grp.isParallel ? 'badge-parallel' : 'badge-sequential'"
+                      >
+                        <span class="wave-icon">{{ grp.isParallel ? '⚡' : '▶' }}</span>
+                        <span class="wave-text">{{ grp.label }}</span>
                       </span>
-                      <div class="trace-step-right">
-                        <span v-if="step.tokens && step.tokens > 0" class="trace-tok-pill">
-                          {{ formatCompactTok(step.tokens) }} tok
-                        </span>
-                        <span
-                          class="trace-status"
-                          :class="`is-${step.status}`"
-                          :title="step.status"
-                        >
-                          <span v-if="step.status === 'running'" class="pulse-dot" />
-                          <template v-else-if="step.status === 'done'">✓</template>
-                          <template v-else-if="step.status === 'fallback'">⚠</template>
-                          <template v-else>✕</template>
-                        </span>
-                      </div>
+                      <span v-if="grp.isParallel" class="wave-tag-parallel">Simultané sans conflit</span>
                     </div>
-                    <div class="trace-step-summary">
-                      <MarkdownInline
-                        :tokens="tokenizeInline(step.summary)"
-                        :available-paths="getAvailableDiffPaths(msg)"
-                        :project-root="store.activeProject?.rootPath"
-                        variant="thinking"
-                        @open-file="handleOpenFileInReview"
-                      />
+
+                    <!-- ARBORESCENCE DES BRANCHES -->
+                    <div :class="grp.kind === 'wave' ? 'dag-branch-tree' : 'dag-phase-wrap'">
+                      <div
+                        v-for="(step, sIdx) in grp.steps"
+                        :key="`${step.role}-${sIdx}`"
+                        class="dag-tree-item"
+                        :class="{ 'is-last-branch': sIdx === grp.steps.length - 1 }"
+                      >
+                        <!-- CARTE DE LA TÂCHE -->
+                        <div
+                          class="trace-step-card"
+                          :class="{ 'in-parallel': grp.isParallel }"
+                          :style="{ '--step-role-color': roleTraceDotColor(step.role) }"
+                        >
+                          <div class="trace-step-top">
+                            <div class="trace-role-wrap">
+                              <span class="trace-role-emoji">{{ roleIcon(step.role) }}</span>
+                              <span
+                                class="trace-role-dot"
+                                :style="{ backgroundColor: roleTraceDotColor(step.role) }"
+                              />
+                              <strong class="trace-role-label">{{ step.roleLabel }}</strong>
+                            </div>
+                            <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
+                              <span
+                                class="trace-prov-dot"
+                                :style="{ backgroundColor: providerDotColor(step.provider) }"
+                              />
+                              <span class="trace-prov-name">{{ providerShortName(step.provider) }}</span>
+                              <span class="trace-model-name">{{ step.model }}</span>
+                            </span>
+                            <div class="trace-step-right">
+                              <span v-if="step.tokens && step.tokens > 0" class="trace-tok-pill">
+                                {{ formatCompactTok(step.tokens) }} tok
+                              </span>
+                              <span
+                                class="trace-status"
+                                :class="`is-${step.status}`"
+                                :title="step.status"
+                              >
+                                <span v-if="step.status === 'running'" class="pulse-dot" />
+                                <template v-else-if="step.status === 'done'">✓</template>
+                                <template v-else-if="step.status === 'fallback'">⚠</template>
+                                <template v-else>✕</template>
+                              </span>
+                            </div>
+                          </div>
+                          <div class="trace-step-summary">
+                            <MarkdownInline
+                              :tokens="tokenizeInline(step.summary)"
+                              :available-paths="getAvailableDiffPaths(msg)"
+                              :project-root="store.activeProject?.rootPath"
+                              variant="thinking"
+                              @open-file="handleOpenFileInReview"
+                            />
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -2359,54 +2802,88 @@ async function copyCodeBlock(key: string, code: string) {
                 <template v-if="liveTab === 'thinking'">
                   <div
                     v-if="store.liveAgentTrace.length > 0"
-                    class="trace-timeline"
+                    class="trace-tree-container"
                   >
                     <div
-                      v-for="(step, sIdx) in store.liveAgentTrace"
-                      :key="`live-${step.role}-${sIdx}`"
-                      class="trace-step-card"
-                      :style="{ '--step-role-color': roleTraceDotColor(step.role) }"
+                      v-for="grp in groupTraceSteps(store.liveAgentTrace)"
+                      :key="grp.id"
+                      class="trace-group-node"
+                      :class="{
+                        'is-wave': grp.kind === 'wave',
+                        'is-parallel-wave': grp.isParallel,
+                        'is-phase': grp.kind === 'phase'
+                      }"
                     >
-                      <div class="trace-step-top">
-                        <div class="trace-role-wrap">
-                          <span
-                            class="trace-role-dot"
-                            :style="{ backgroundColor: roleTraceDotColor(step.role) }"
-                          />
-                          <strong class="trace-role-label">{{ step.roleLabel }}</strong>
-                        </div>
-                        <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
-                          <span
-                            class="trace-prov-dot"
-                            :style="{ backgroundColor: providerDotColor(step.provider) }"
-                          />
-                          <span class="trace-prov-name">{{ providerShortName(step.provider) }}</span>
-                          <span class="trace-model-name">{{ step.model }}</span>
+                      <!-- EN-TÊTE DE VAGUE (DAG Wave) -->
+                      <div v-if="grp.kind === 'wave'" class="dag-wave-header">
+                        <span
+                          class="dag-wave-badge"
+                          :class="grp.isParallel ? 'badge-parallel' : 'badge-sequential'"
+                        >
+                          <span class="wave-icon">{{ grp.isParallel ? '⚡' : '▶' }}</span>
+                          <span class="wave-text">{{ grp.label }}</span>
                         </span>
-                        <div class="trace-step-right">
-                          <span v-if="step.tokens && step.tokens > 0" class="trace-tok-pill">
-                            {{ formatCompactTok(step.tokens) }} tok
-                          </span>
-                          <span
-                            class="trace-status"
-                            :class="`is-${step.status}`"
-                            :title="step.status"
-                          >
-                            <span v-if="step.status === 'running'" class="pulse-dot" />
-                            <template v-else-if="step.status === 'done'">✓</template>
-                            <template v-else-if="step.status === 'fallback'">⚠</template>
-                            <template v-else>✕</template>
-                          </span>
-                        </div>
+                        <span v-if="grp.isParallel" class="wave-tag-parallel">Simultané sans conflit</span>
                       </div>
-                      <div class="trace-step-summary">
-                        <MarkdownInline
-                          :tokens="tokenizeInline(step.summary)"
-                          :available-paths="getAvailableDiffPaths()"
-                          :project-root="store.activeProject?.rootPath"
-                          variant="thinking"
-                          @open-file="handleOpenFileInReview"
-                        />
+
+                      <!-- ARBORESCENCE DES BRANCHES -->
+                      <div :class="grp.kind === 'wave' ? 'dag-branch-tree' : 'dag-phase-wrap'">
+                        <div
+                          v-for="(step, sIdx) in grp.steps"
+                          :key="`live-${step.role}-${sIdx}`"
+                          class="dag-tree-item"
+                          :class="{ 'is-last-branch': sIdx === grp.steps.length - 1 }"
+                        >
+                          <!-- CARTE DE LA TÂCHE -->
+                          <div
+                            class="trace-step-card"
+                            :class="{ 'in-parallel': grp.isParallel }"
+                            :style="{ '--step-role-color': roleTraceDotColor(step.role) }"
+                          >
+                            <div class="trace-step-top">
+                              <div class="trace-role-wrap">
+                                <span class="trace-role-emoji">{{ roleIcon(step.role) }}</span>
+                                <span
+                                  class="trace-role-dot"
+                                  :style="{ backgroundColor: roleTraceDotColor(step.role) }"
+                                />
+                                <strong class="trace-role-label">{{ step.roleLabel }}</strong>
+                              </div>
+                              <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
+                                <span
+                                  class="trace-prov-dot"
+                                  :style="{ backgroundColor: providerDotColor(step.provider) }"
+                                />
+                                <span class="trace-prov-name">{{ providerShortName(step.provider) }}</span>
+                                <span class="trace-model-name">{{ step.model }}</span>
+                              </span>
+                              <div class="trace-step-right">
+                                <span v-if="step.tokens && step.tokens > 0" class="trace-tok-pill">
+                                  {{ formatCompactTok(step.tokens) }} tok
+                                </span>
+                                <span
+                                  class="trace-status"
+                                  :class="`is-${step.status}`"
+                                  :title="step.status"
+                                >
+                                  <span v-if="step.status === 'running'" class="pulse-dot" />
+                                  <template v-else-if="step.status === 'done'">✓</template>
+                                  <template v-else-if="step.status === 'fallback'">⚠</template>
+                                  <template v-else>✕</template>
+                                </span>
+                              </div>
+                            </div>
+                            <div class="trace-step-summary">
+                              <MarkdownInline
+                                :tokens="tokenizeInline(step.summary)"
+                                :available-paths="getAvailableDiffPaths()"
+                                :project-root="store.activeProject?.rootPath"
+                                variant="thinking"
+                                @open-file="handleOpenFileInReview"
+                              />
+                            </div>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2663,6 +3140,33 @@ async function copyCodeBlock(key: string, code: string) {
 
         <!-- Prompt composer with rotating rainbow border during thinking -->
         <div class="composer-wrapper">
+          <!-- Slash Commands (/) Autocompletion Popover -->
+          <div v-if="slashOpen" class="mention-popover halo-hud custom-scroll">
+            <div class="mention-header">
+              <span class="mention-hint">Commandes rapides de l'IDE (/)</span>
+            </div>
+            <div class="mention-list">
+              <div v-if="filteredSlashCommands.length === 0" class="mention-empty">
+                Aucune commande pour "{{ slashQuery }}"
+              </div>
+              <button
+                v-for="(item, sIdx) in filteredSlashCommands"
+                :key="item.id"
+                class="mention-item"
+                :class="{ active: sIdx === slashActiveIndex }"
+                @mouseenter="slashActiveIndex = sIdx"
+                @click="selectSlashCommand(item)"
+              >
+                <span class="mention-badge">{{ item.icon }}</span>
+                <div class="mention-info">
+                  <span class="mention-name">{{ item.command }}</span>
+                  <span class="mention-desc">{{ item.description }}</span>
+                </div>
+                <code v-if="item.argPlaceholder" class="mention-tag">{{ item.argPlaceholder }}</code>
+              </button>
+            </div>
+          </div>
+
           <!-- Mention (@) Autocompletion Popover -->
           <div v-if="mentionOpen" class="mention-popover halo-hud custom-scroll">
             <div class="mention-header">
@@ -2703,6 +3207,13 @@ async function copyCodeBlock(key: string, code: string) {
                 >
                   MCP (Bases/APIs)
                 </button>
+                <button
+                  class="mention-tab"
+                  :class="{ active: mentionCategory === 'rule' }"
+                  @click="mentionCategory = 'rule'"
+                >
+                  Règles
+                </button>
               </div>
             </div>
 
@@ -2719,7 +3230,7 @@ async function copyCodeBlock(key: string, code: string) {
                 @click="selectMention(item)"
               >
                 <span class="mention-badge" :class="item.category">
-                  {{ item.category === 'file' ? '📁' : item.category === 'tool' ? '⚙️' : item.category === 'plugin' ? '🧩' : '🔌' }}
+                  {{ item.category === 'file' ? '📁' : item.category === 'tool' ? '⚙️' : item.category === 'plugin' ? '🧩' : item.category === 'rule' ? '📜' : '🔌' }}
                 </span>
                 <div class="mention-info">
                   <span class="mention-name">{{ item.name }}</span>
@@ -3857,10 +4368,116 @@ async function copyCodeBlock(key: string, code: string) {
   padding: 0 5px;
 }
 
-.trace-timeline {
+.trace-tree-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trace-group-node {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dag-wave-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0 2px 2px;
+}
+
+.dag-wave-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2.5px 9px;
+  border-radius: 9999px;
+  letter-spacing: 0.01em;
+}
+
+.dag-wave-badge.badge-parallel {
+  background: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.12);
+}
+
+.dag-wave-badge.badge-sequential {
+  background: rgba(99, 102, 241, 0.12);
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.wave-tag-parallel {
+  font-size: 10px;
+  color: #fbbf24;
+  opacity: 0.85;
+  font-style: italic;
+}
+
+.dag-branch-tree {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding-left: 20px;
+  margin-top: 4px;
+}
+
+.dag-phase-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dag-tree-item {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+}
+
+/* Ligne verticale de liaison d'arbre pour les étapes intermédiaires */
+.dag-branch-tree .dag-tree-item::before {
+  content: '';
+  position: absolute;
+  left: -12px;
+  top: 0;
+  bottom: -6px; /* Franchit le gap entre tâches */
+  width: 1.5px;
+  background: rgba(255, 255, 255, 0.15);
+  pointer-events: none;
+}
+
+/* Le dernier enfant de la vague ne continue pas sous son coude */
+.dag-branch-tree .dag-tree-item:last-child::before {
+  display: none;
+}
+
+/* Coude d'arborescence reliant le tronc vertical à la carte de tâche */
+.dag-branch-tree .dag-tree-item::after {
+  content: '';
+  position: absolute;
+  left: -12px;
+  top: 0;
+  width: 12px;
+  height: 16px;
+  border-left: 1.5px solid rgba(255, 255, 255, 0.15);
+  border-bottom: 1.5px solid rgba(255, 255, 255, 0.15);
+  border-bottom-left-radius: 6px;
+  pointer-events: none;
+}
+
+/* Coloration distinctive ambrée pour les vagues parallèles */
+.trace-group-node.is-parallel-wave .dag-tree-item::before {
+  background: rgba(245, 158, 11, 0.45);
+}
+
+.trace-group-node.is-parallel-wave .dag-tree-item::after {
+  border-color: rgba(245, 158, 11, 0.45);
 }
 
 .trace-step-card {
@@ -3872,6 +4489,18 @@ async function copyCodeBlock(key: string, code: string) {
   border: 1px solid var(--border-subtle);
   border-left: 2.5px solid var(--step-role-color, var(--accent));
   background: var(--hover-bg);
+  width: 100%;
+}
+
+.trace-step-card.in-parallel {
+  border-left-width: 3px;
+  background: rgba(255, 255, 255, 0.025);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+.trace-role-emoji {
+  font-size: 13px;
+  line-height: 1;
 }
 
 .trace-step-top {

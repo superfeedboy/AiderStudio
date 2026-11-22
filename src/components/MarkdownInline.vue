@@ -39,6 +39,10 @@ function handleMessageLinkClick(href: string) {
   }
 }
 
+function handleRerunWriteClick() {
+  store.sendPrompt("Écris et applique directement le code complet des fichiers nécessaires sur le disque maintenant.");
+}
+
 function resolveLink(href: string) {
   return resolveFileLinkTarget(href, props.availablePaths, props.projectRoot, true);
 }
@@ -57,6 +61,16 @@ function formatCodeFileLabel(codeText: string, resolvedPath: string): string {
   }
   return base;
 }
+
+function getToolCategory(toolName: string): "terminal" | "search" | "edit" | "delete" | "mcp" | "file" {
+  const t = (toolName || "").toLowerCase();
+  if (t === "run_command" || t === "terminal" || t === "bash" || t === "shell") return "terminal";
+  if (t.includes("search") || t.includes("fetch") || t.includes("web")) return "search";
+  if (t === "edit_file" || t === "write_file" || t.includes("patch")) return "edit";
+  if (t === "delete_file" || t.includes("remove")) return "delete";
+  if (t.includes("mcp") || t.includes("server")) return "mcp";
+  return "file";
+}
 </script>
 
 <template>
@@ -71,6 +85,44 @@ function formatCodeFileLabel(codeText: string, resolvedPath: string): string {
       />
     </strong>
     <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
+    <span v-else-if="tok.kind === 'tool-call'" class="md-tool-call-group">
+      <span
+        v-for="tool in tok.tools"
+        :key="tool"
+        class="md-tool-call-pill"
+        :class="[`is-${getToolCategory(tool)}`, { 'is-thinking': variant === 'thinking' }]"
+        :title="`Appel d'outil natif exécuté : ${tool}`"
+      >
+        <span class="tool-icon">
+          <svg v-if="getToolCategory(tool) === 'terminal'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <polyline points="4 17 10 11 4 5" />
+            <line x1="12" y1="19" x2="20" y2="19" />
+          </svg>
+          <svg v-else-if="getToolCategory(tool) === 'search'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <svg v-else-if="getToolCategory(tool) === 'edit'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+          </svg>
+          <svg v-else-if="getToolCategory(tool) === 'delete'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <polyline points="3 6 5 6 21 6" />
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+          </svg>
+          <svg v-else-if="getToolCategory(tool) === 'mcp'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M12 2v6m0 8v6M4.93 4.93l4.24 4.24m5.66 5.66l4.24 4.24M2 12h6m8 0h6M4.93 19.07l4.24-4.24m5.66-5.66l4.24-4.24" />
+          </svg>
+          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+          </svg>
+        </span>
+        <span class="tool-tag">Outil</span>
+        <code class="tool-name">{{ tool }}</code>
+        <span class="tool-pulse-dot" />
+      </span>
+    </span>
     <template v-else-if="tok.kind === 'link'">
       <a
         v-if="isExternalHref(tok.href)"
@@ -81,6 +133,16 @@ function formatCodeFileLabel(codeText: string, resolvedPath: string): string {
       >
         {{ tok.label }}
       </a>
+      <button
+        v-else-if="tok.href === '#rerun-write' || tok.href === 'action:rerun-write'"
+        type="button"
+        class="md-rerun-write-pill"
+        title="Relancer l'écriture des fichiers sur le disque"
+        @click.stop="handleRerunWriteClick"
+      >
+        <span class="rerun-icon">⚡</span>
+        <span>{{ tok.label }}</span>
+      </button>
       <button
         v-else-if="isMessageLink(tok.href)"
         type="button"
@@ -221,6 +283,185 @@ function formatCodeFileLabel(codeText: string, resolvedPath: string): string {
 }
 
 .md-commit-pill-btn:active {
+  transform: translateY(0);
+}
+
+/* --- Badges Graphiques d'Appels d'Outils --- */
+.md-tool-call-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 3px;
+  vertical-align: middle;
+}
+
+.md-tool-call-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 7px;
+  font-family: var(--font-code);
+  font-size: 0.85em;
+  line-height: 1.35;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(6px);
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.md-tool-call-pill.is-thinking {
+  font-size: 11px;
+  padding: 1px 6px;
+}
+
+.md-tool-call-pill:hover {
+  transform: translateY(-0.5px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.tool-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+}
+
+.tool-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.tool-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-weight: 700;
+  opacity: 0.75;
+}
+
+.tool-name {
+  font-size: 11px;
+  font-weight: 600;
+  background: transparent;
+  padding: 0;
+  border: none;
+  color: inherit;
+}
+
+.tool-pulse-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+  animation: toolPulse 2s infinite ease-in-out;
+}
+
+@keyframes toolPulse {
+  0%, 100% {
+    opacity: 0.4;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+/* Couleurs par rôle/catégorie d'outil */
+.md-tool-call-pill.is-terminal {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.35);
+  color: #fbbf24;
+}
+.md-tool-call-pill.is-terminal:hover {
+  border-color: #f59e0b;
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.25);
+}
+
+.md-tool-call-pill.is-search {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #34d399;
+}
+.md-tool-call-pill.is-search:hover {
+  border-color: #10b981;
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.25);
+}
+
+.md-tool-call-pill.is-edit {
+  background: rgba(168, 85, 247, 0.12);
+  border-color: rgba(168, 85, 247, 0.35);
+  color: #c084fc;
+}
+.md-tool-call-pill.is-edit:hover {
+  border-color: #a855f7;
+  box-shadow: 0 0 10px rgba(168, 85, 247, 0.25);
+}
+
+.md-tool-call-pill.is-delete {
+  background: rgba(244, 63, 94, 0.12);
+  border-color: rgba(244, 63, 94, 0.35);
+  color: #fb7185;
+}
+.md-tool-call-pill.is-delete:hover {
+  border-color: #f43f5e;
+  box-shadow: 0 0 10px rgba(244, 63, 94, 0.25);
+}
+
+.md-tool-call-pill.is-mcp {
+  background: rgba(236, 72, 153, 0.12);
+  border-color: rgba(236, 72, 153, 0.35);
+  color: #f472b6;
+}
+.md-tool-call-pill.is-mcp:hover {
+  border-color: #ec4899;
+  box-shadow: 0 0 10px rgba(236, 72, 153, 0.25);
+}
+
+.md-tool-call-pill.is-file {
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.35);
+  color: #38bdf8;
+}
+.md-tool-call-pill.is-file:hover {
+  border-color: #38bdf8;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
+}
+
+.md-rerun-write-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  margin: 6px 2px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.22), rgba(234, 88, 12, 0.3));
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  color: #fef3c7;
+  font-family: var(--font-ui, system-ui);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(245, 158, 11, 0.2);
+  transition: all 0.2s ease;
+  vertical-align: middle;
+}
+
+.md-rerun-write-pill:hover {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.35), rgba(234, 88, 12, 0.45));
+  border-color: #f59e0b;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(245, 158, 11, 0.35);
+  color: #ffffff;
+}
+
+.md-rerun-write-pill:active {
   transform: translateY(0);
 }
 </style>

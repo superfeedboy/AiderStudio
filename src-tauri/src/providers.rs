@@ -1,6 +1,9 @@
 use crate::models::{AppSettings, ProviderConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 pub fn default_providers() -> Vec<ProviderConfig> {
     vec![
@@ -792,6 +795,9 @@ pub async fn call_provider_oneshot(
     max_tokens: usize,
     temperature: f32,
 ) -> anyhow::Result<(String, usize, usize)> {
+    let system_prompt_with_lang = ensure_mandatory_french_prefix(system_prompt);
+    let system_prompt = system_prompt_with_lang.as_str();
+
     let timeout_secs = if provider == "ollama" { 300 } else { 90 };
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -1958,6 +1964,23 @@ where
         .map(|t| !t.is_empty())
         .unwrap_or(false);
 
+    let mut messages_with_lang: Vec<LlmMessage> = messages.to_vec();
+    if let Some(first_sys) = messages_with_lang.iter_mut().find(|m| m.role == "system") {
+        first_sys.content = ensure_mandatory_french_prefix(&first_sys.content);
+    } else {
+        messages_with_lang.insert(
+            0,
+            LlmMessage::system(MANDATORY_FRENCH_DIRECTIVE.trim_end()),
+        );
+    }
+
+    let effective_messages = if provider == "ollama" {
+        prune_messages_for_local_model(&messages_with_lang)
+    } else {
+        messages_with_lang
+    };
+    let messages = &effective_messages;
+
     if provider == "ollama" {
         let url = format!("{}/api/chat", settings.ollama_url.trim_end_matches('/'));
         let api_msgs: Vec<Value> = messages
@@ -2329,6 +2352,117 @@ where
     anyhow::bail!("Échec de l'appel en streaming vers {provider}:{model} après tentatives.")
 }
 
+fn cooldown_map() -> &'static RwLock<HashMap<String, Instant>> {
+    static MAP: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
+    MAP.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub const PROVIDER_COOLDOWN_DURATION: Duration = Duration::from_secs(600); // 10 minutes en quarantaine
+
+pub fn is_provider_in_cooldown(provider: &str) -> bool {
+    if provider == "ollama" {
+        return false;
+    }
+    if let Ok(guard) = cooldown_map().read() {
+        if let Some(&expires_at) = guard.get(provider) {
+            if Instant::now() < expires_at {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn record_provider_cooldown(provider: &str, duration: Duration) {
+    if provider == "ollama" {
+        return;
+    }
+    let expires_at = Instant::now() + duration;
+    if let Ok(mut guard) = cooldown_map().write() {
+        guard.insert(provider.to_string(), expires_at);
+    }
+}
+
+pub fn clear_provider_cooldown(provider: &str) {
+    if let Ok(mut guard) = cooldown_map().write() {
+        guard.remove(provider);
+    }
+}
+
+#[allow(dead_code)]
+pub fn clear_all_provider_cooldowns() {
+    if let Ok(mut guard) = cooldown_map().write() {
+        guard.clear();
+    }
+}
+
+pub fn is_circuit_breaker_error(err_msg: &str) -> bool {
+    if err_msg.contains("CANCELLED_BY_USER") {
+        return false;
+    }
+    let low = err_msg.to_lowercase();
+    let markers = [
+        "429",
+        "too many requests",
+        "resource_exhausted",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "insufficient_quota",
+        "insufficient balance",
+        "402",
+        "credits",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "authentication_error",
+        "permission_denied",
+        "clé api absente",
+        "api key not found",
+        "api_key_invalid",
+    ];
+    markers.iter().any(|m| low.contains(m))
+}
+
+pub const MANDATORY_FRENCH_DIRECTIVE: &str =
+    "Langue de réponse obligatoire : Français (sauf code et identifiants techniques).\n\n";
+
+pub fn ensure_mandatory_french_prefix(system_prompt: &str) -> String {
+    let trimmed = system_prompt.trim_start();
+    if trimmed.contains("Langue de réponse obligatoire : Français") {
+        system_prompt.to_string()
+    } else {
+        format!("{MANDATORY_FRENCH_DIRECTIVE}{system_prompt}")
+    }
+}
+
+/// Garde uniquement Synthèse de l'état actuel + Tour N-1 + Requête N sur le modèle local (Ollama).
+pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+    if messages.len() <= 3 {
+        return messages.to_vec();
+    }
+
+    let sys_msg = messages.first().cloned();
+    let non_sys: Vec<&LlmMessage> = messages.iter().filter(|m| m.role != "system").collect();
+
+    let kept_non_sys: Vec<LlmMessage> = if non_sys.len() > 3 {
+        non_sys[non_sys.len() - 3..].iter().map(|&m| m.clone()).collect()
+    } else {
+        non_sys.into_iter().cloned().collect()
+    };
+
+    let mut out = Vec::with_capacity(1 + kept_non_sys.len());
+    if let Some(sys) = sys_msg {
+        out.push(sys);
+    }
+    out.extend(kept_non_sys);
+    out
+}
+
 pub fn is_quota_or_fallback_error(err_msg: &str) -> bool {
     if err_msg.contains("CANCELLED_BY_USER") {
         return false;
@@ -2389,7 +2523,13 @@ pub fn build_fallback_candidates(
     settings: &AppSettings,
     ollama_running: bool,
 ) -> Vec<(String, String)> {
-    let mut out = vec![(primary_provider.to_string(), primary_model.to_string())];
+    let mut out: Vec<(String, String)> = Vec::new();
+    let primary_in_cooldown = is_provider_in_cooldown(primary_provider);
+
+    // Si le fournisseur principal n'est pas en quarantaine, il est notre 1er candidat
+    if !primary_in_cooldown {
+        out.push((primary_provider.to_string(), primary_model.to_string()));
+    }
 
     let priority: &[&str] = match role {
         "architect" | "designer" => &[
@@ -2416,7 +2556,7 @@ pub fn build_fallback_candidates(
 
     let mut external_added = 0usize;
     for &pid in priority {
-        if pid == primary_provider || external_added >= 3 {
+        if pid == primary_provider || external_added >= 3 || is_provider_in_cooldown(pid) {
             continue;
         }
         if let Some(cfg) = find_provider_config(settings, pid) {
@@ -2429,11 +2569,18 @@ pub fn build_fallback_candidates(
         }
     }
 
-    if primary_provider != "ollama" && ollama_running {
+    if ollama_running {
         let ol_model = settings.ollama_model.trim();
         if !ol_model.is_empty() {
-            out.push(("ollama".to_string(), ol_model.to_string()));
+            if out.is_empty() || out[0].0 != "ollama" {
+                out.push(("ollama".to_string(), ol_model.to_string()));
+            }
         }
+    }
+
+    // Repli de dernier recours : si tout est en quarantaine, tente le fournisseur principal
+    if out.is_empty() {
+        out.push((primary_provider.to_string(), primary_model.to_string()));
     }
 
     out
@@ -2468,6 +2615,7 @@ pub async fn call_provider_oneshot_with_fallback(
         .await
         {
             Ok((text, p_tok, c_tok)) => {
+                clear_provider_cooldown(prov);
                 let fb_reason = if idx > 0 { first_err_reason.clone() } else { None };
                 return Ok((text, p_tok, c_tok, prov.clone(), mdl.clone(), fb_reason));
             }
@@ -2475,6 +2623,9 @@ pub async fn call_provider_oneshot_with_fallback(
                 let err_str = e.to_string();
                 if first_err_reason.is_none() {
                     first_err_reason = Some(err_str.clone());
+                }
+                if is_circuit_breaker_error(&err_str) {
+                    record_provider_cooldown(prov, PROVIDER_COOLDOWN_DURATION);
                 }
                 if idx + 1 < candidates.len() && is_quota_or_fallback_error(&err_str) {
                     continue;
@@ -2532,6 +2683,7 @@ where
 
         match res {
             Ok(stream_res) => {
+                clear_provider_cooldown(prov);
                 let fb_reason = if idx > 0 { first_err_reason.clone() } else { None };
                 return Ok((stream_res, prov.clone(), mdl.clone(), fb_reason));
             }
@@ -2539,6 +2691,9 @@ where
                 let err_str = e.to_string();
                 if first_err_reason.is_none() {
                     first_err_reason = Some(err_str.clone());
+                }
+                if is_circuit_breaker_error(&err_str) {
+                    record_provider_cooldown(prov, PROVIDER_COOLDOWN_DURATION);
                 }
                 if !emitted_any
                     && idx + 1 < candidates.len()
@@ -2848,5 +3003,68 @@ mod tests {
         assert_eq!(res.tool_calls[0].arguments["path"], "src/App.vue");
         assert_eq!(res.tool_calls[0].arguments["start_line"], 10);
         assert_eq!(res.tool_calls[0].arguments["end_line"], 20);
+    }
+
+    #[test]
+    fn test_circuit_breaker_cooldown_and_skip() {
+        clear_all_provider_cooldowns();
+        assert!(!is_provider_in_cooldown("gemini"));
+
+        // Enregistrer une quarantaine
+        record_provider_cooldown("gemini", Duration::from_secs(600));
+        assert!(is_provider_in_cooldown("gemini"));
+        // Ollama n'est jamais mis en quarantaine
+        assert!(!is_provider_in_cooldown("ollama"));
+
+        let mut s = AppSettings::default();
+        s.ollama_model = "qwen2.5-coder:7b".to_string();
+        for p in &mut s.providers {
+            if p.id == "openrouter" {
+                p.validated = true;
+                p.api_key = "key-openrouter".to_string();
+                p.available_models = vec!["qwen:free".to_string()];
+            }
+        }
+
+        // Gemini étant en quarantaine, il est sauté et openrouter/ollama prend la priorité
+        let cands = build_fallback_candidates("gemini", "gemini-2.5-pro", "coder", &s, true);
+        assert_ne!(cands[0].0, "gemini");
+        assert_eq!(cands[0].0, "openrouter");
+        assert_eq!(cands.last().unwrap().0, "ollama");
+
+        // Nettoyage de la quarantaine
+        clear_provider_cooldown("gemini");
+        assert!(!is_provider_in_cooldown("gemini"));
+    }
+
+    #[test]
+    fn test_ensure_mandatory_french_prefix() {
+        let p1 = "Tu es un assistant.";
+        let res1 = ensure_mandatory_french_prefix(p1);
+        assert!(res1.starts_with(MANDATORY_FRENCH_DIRECTIVE));
+
+        // Ne pas dupliquer si déjà présent
+        let res2 = ensure_mandatory_french_prefix(&res1);
+        assert_eq!(res1, res2);
+    }
+
+    #[test]
+    fn test_prune_messages_for_local_model() {
+        let msgs = vec![
+            LlmMessage::system("System instructions"),
+            LlmMessage::user("Question 1"),
+            LlmMessage::assistant("Reponse 1"),
+            LlmMessage::user("Question 2 (Tour N-1)"),
+            LlmMessage::assistant("Reponse 2 (Tour N-1)"),
+            LlmMessage::user("Question 3 (Requete N)"),
+        ];
+
+        let pruned = prune_messages_for_local_model(&msgs);
+        assert_eq!(pruned.len(), 4);
+        assert_eq!(pruned[0].role, "system");
+        assert_eq!(pruned[0].content, "System instructions");
+        assert_eq!(pruned[1].content, "Question 2 (Tour N-1)");
+        assert_eq!(pruned[2].content, "Reponse 2 (Tour N-1)");
+        assert_eq!(pruned[3].content, "Question 3 (Requete N)");
     }
 }

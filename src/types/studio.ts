@@ -254,3 +254,11 @@ export interface SendPromptResult {
   conversation: Conversation;
   project: Project;
 }
+
+export interface ProjectRuleItem {
+  name: string;
+  relativePath: string;
+  category: "root" | "frontend" | "backend" | "git" | "validation" | "custom" | string;
+  description: string;
+  content: string;
+}

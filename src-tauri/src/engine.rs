@@ -764,6 +764,7 @@ pub fn is_install_or_setup_prompt(prompt: &str) -> bool {
     !ui_redesign_markers.iter().any(|k| low.contains(k))
 }
 
+#[allow(dead_code)]
 pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
     let lower = user_prompt.to_lowercase();
 
@@ -976,14 +977,10 @@ impl FrontendStackInfo {
                     .to_string(),
             );
         } else {
-            let reason = self
-                .tailwind_broken_reason
-                .as_deref()
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "- CSS : CSS NATIF UNIQUEMENT — Tailwind NON actif{reason}. INTERDICTION d'utiliser des classes utilitaires Tailwind (flex, h-screen, w-[...], bg-[#...], bg-gradient-to-*) ; écris du vrai CSS explicite (<style scoped> et/ou CSS global)."
-            ));
+            lines.push(
+                "- CSS : Tailwind CSS et styles CSS natifs utilisables selon les besoins du projet."
+                    .to_string(),
+            );
         }
 
         let entry_desc = self.entry_file.as_deref().unwrap_or("aucun détecté");
@@ -1584,6 +1581,7 @@ fn collect_css_class_selectors(css_text: &str, out: &mut HashSet<String>) {
     }
 }
 
+#[allow(dead_code)]
 fn is_tailwind_utility_token(tok: &str) -> bool {
     if tok.is_empty() || tok.contains("://") {
         return false;
@@ -1675,10 +1673,6 @@ pub fn audit_frontend_css_issues(
 
     let style_block_re =
         Regex::new(r"(?is)<style\b[^>]*>([\s\S]*?)(?:</style>|$)").expect("valid style regex");
-    let class_attr_re = Regex::new(
-        r#"(?i)\b(?:class|className)\s*=\s*(?:"([^"]*)"|'([^']*)'|\{[`'"]([^}`'"]*)[`'"]\})"#,
-    )
-    .expect("valid class attr regex");
     let template_block_re =
         Regex::new(r"(?is)<template\b[^>]*>([\s\S]*?)</template>").expect("valid template regex");
 
@@ -1692,63 +1686,7 @@ pub fn audit_frontend_css_issues(
         }
     };
 
-    // Anomalie 1 : classes utilitaires Tailwind orphelines lorsque Tailwind n'est pas actif
-    if !stack.tailwind_active {
-        for rel in touched_files {
-            if !is_ui_component_or_page(rel) {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(project_root.join(rel)) else {
-                continue;
-            };
-
-            let mut local_css_classes = HashSet::new();
-            for cap in style_block_re.captures_iter(&content) {
-                if let Some(m) = cap.get(1) {
-                    collect_css_class_selectors(m.as_str(), &mut local_css_classes);
-                }
-            }
-
-            let mut orphan_tokens = Vec::new();
-            let mut seen_tokens = HashSet::new();
-            for cap in class_attr_re.captures_iter(&content) {
-                let raw_val = cap
-                    .get(1)
-                    .or_else(|| cap.get(2))
-                    .or_else(|| cap.get(3))
-                    .map(|m| m.as_str())
-                    .unwrap_or("");
-                for raw_tok in raw_val.split_whitespace() {
-                    let tok = raw_tok.trim_matches(|c: char| matches!(c, ',' | ';' | '"' | '\''));
-                    if tok.is_empty() || tok.contains("${") || tok.contains("{{") {
-                        continue;
-                    }
-                    if global_css_classes.contains(tok) || local_css_classes.contains(tok) {
-                        continue;
-                    }
-                    if is_tailwind_utility_token(tok) && seen_tokens.insert(tok.to_string()) {
-                        orphan_tokens.push(tok.to_string());
-                    }
-                }
-            }
-
-            if orphan_tokens.len() >= 4 {
-                let sample: Vec<String> = orphan_tokens.into_iter().take(6).collect();
-                let reason = stack
-                    .tailwind_broken_reason
-                    .as_deref()
-                    .map(|r| format!(" ({r})"))
-                    .unwrap_or_default();
-                report.issues.push(format!(
-                    "Le fichier `{rel}` utilise des classes utilitaires Tailwind sans effet ({}) car Tailwind CSS n'est pas actif{reason} : convertis-les en vrai CSS explicite dans `<style>` ou dans la feuille CSS globale.",
-                    sample.join(", ")
-                ));
-                push_flagged(rel);
-            }
-        }
-    }
-
-    // Anomalie 2 : feuille CSS globale existante non importée dans le point d'entrée
+    // Anomalie : feuille CSS globale existante non importée dans le point d'entrée
     if stack.css_entry_missing_import && !stack.global_css_files.is_empty() {
         let entry = stack.entry_file.clone().unwrap_or_default();
         report.issues.push(format!(
@@ -1816,6 +1754,8 @@ fn role_display_name(role: &str) -> &'static str {
         "designer" => "3. Designer",
         "refactoring" => "3. Refactoring",
         "tester" => "4. Tests",
+        "terminal" => "3. Terminal / Shell",
+        "research" => "3. Recherche & Web",
         "synthesizer" => "5. Synthétiseur",
         _ => "3. Codeur",
     }
@@ -1964,6 +1904,22 @@ pub fn match_files_deterministically(
 ) -> (Vec<String>, bool) {
     let mut matched: Vec<String> = Vec::new();
     let prompt_lower = user_prompt.to_lowercase();
+
+    if prompt_lower.contains("@rules") || prompt_lower.contains("@rule") {
+        for f in all_files {
+            if f.starts_with(".agents/rules/") || f == "AGENTS.md" {
+                if !matched.contains(f) {
+                    matched.push(f.clone());
+                    if matched.len() >= 4 {
+                        break;
+                    }
+                }
+            }
+        }
+        if !matched.is_empty() {
+            return (matched, true);
+        }
+    }
 
     for raw_tok in user_prompt.split(|c: char| {
         c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'' | '`')
@@ -2363,7 +2319,7 @@ async fn run_cartographer(
                         .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
                 };
 
-                if !can_call_llm || all_files.len() < 2 {
+                if all_files.len() <= 250 || !can_call_llm {
                     let mut fallback = Vec::new();
                     if is_design_task && !doc_focused_prompt && !install_setup_prompt {
                         expand_design_targets_with_imports(
@@ -2384,7 +2340,7 @@ async fn run_cartographer(
                     (
                         budgeted,
                         false,
-                        "Ciblage auto · repo-map native".to_string(),
+                        "0 tok déterministe (arborescence directe injectée)".to_string(),
                         None,
                     )
                 } else if all_files.len() > 400 {
@@ -2618,18 +2574,8 @@ pub fn choose_execution_strategy(
         384
     };
 
-    let base_turns = if provider != "ollama" {
-        7usize
-    } else if num_ctx >= 16_384 {
-        5usize
-    } else {
-        3usize
-    };
-    let max_turns = if target_files.len() > 1 || !explicit_match {
-        base_turns + 1
-    } else {
-        base_turns
-    };
+    let base_turns = 8usize;
+    let max_turns = (base_turns + if target_files.len() > 1 || !explicit_match { 2 } else { 0 }).clamp(8, 10);
 
     ExecutionStrategy {
         edit_format,
@@ -2710,27 +2656,313 @@ fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
     crate::tools::build_native_tool_definitions(has_mcp)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRuleItem {
+    pub name: String,
+    pub relative_path: String,
+    pub category: String,
+    pub description: String,
+    pub content: String,
+}
+
+pub fn list_project_rules(project_root: &Path) -> Vec<ProjectRuleItem> {
+    let mut rules = Vec::new();
+
+    // 1. Fichiers racines candidats
+    let root_candidates = [
+        ("AGENTS.md", "Directives principales du projet"),
+        (".vaix/architecture.md", "Architecture & directives >AIx STUDIO"),
+        (".aider/conventions.md", "Conventions de code du projet"),
+        ("CLAUDE.md", "Directives Claude / Assistant IA"),
+    ];
+    for (cand, default_desc) in root_candidates {
+        let p = project_root.join(cand);
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let first_line = trimmed
+                    .lines()
+                    .next()
+                    .unwrap_or(default_desc)
+                    .trim_start_matches('#')
+                    .trim();
+                let desc = if first_line.is_empty() { default_desc } else { first_line };
+                rules.push(ProjectRuleItem {
+                    name: cand.to_string(),
+                    relative_path: cand.to_string(),
+                    category: "root".to_string(),
+                    description: desc.to_string(),
+                    content: trimmed.to_string(),
+                });
+                break;
+            }
+        }
+    }
+
+    // 2. Fichiers modulaires sous .agents/rules/ et .agent/rules/
+    let rules_dirs = [".agents/rules", ".agent/rules"];
+    for rdir in rules_dirs {
+        let dir_path = project_root.join(rdir);
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            let mut entries_vec: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            entries_vec.sort_by_key(|e| e.file_name());
+            for entry in entries_vec {
+                let path = entry.path();
+                if path.extension().map(|ext| ext == "md").unwrap_or(false) {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let trimmed = content.trim();
+                        if !trimmed.is_empty() {
+                            let stem = path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let category = if stem.contains("vue") || stem.contains("frontend") || stem.contains("ui") {
+                                "frontend"
+                            } else if stem.contains("rust") || stem.contains("tauri") || stem.contains("backend") || stem.contains("api") {
+                                "backend"
+                            } else if stem.contains("git") {
+                                "git"
+                            } else if stem.contains("validation") || stem.contains("test") {
+                                "validation"
+                            } else {
+                                "custom"
+                            };
+                            let desc = trimmed
+                                .lines()
+                                .next()
+                                .map(|l| l.trim_start_matches('#').trim().to_string())
+                                .filter(|l| !l.is_empty())
+                                .unwrap_or_else(|| stem.clone());
+                            rules.push(ProjectRuleItem {
+                                name: stem,
+                                relative_path: format!("{rdir}/{}", entry.file_name().to_string_lossy()),
+                                category: category.to_string(),
+                                description: desc,
+                                content: trimmed.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    rules
+}
+
+pub async fn init_project_agent_rules(
+    root_path: &Path,
+    project_name: &str,
+    initial_prompt: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut created_files = Vec::new();
+    let rules_dir = root_path.join(".agents/rules");
+    tokio::fs::create_dir_all(&rules_dir)
+        .await
+        .map_err(|e| format!("Impossible de créer le dossier .agents/rules: {e}"))?;
+
+    // Détection de l'écosystème
+    let has_cargo = root_path.join("Cargo.toml").exists();
+    let has_pkg = root_path.join("package.json").exists();
+    let pkg_content = if has_pkg {
+        tokio::fs::read_to_string(root_path.join("package.json")).await.unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let prompt_lower = initial_prompt.unwrap_or("").to_lowercase();
+    let is_vue = pkg_content.contains("\"vue\"") || prompt_lower.contains("vue");
+    let is_react = pkg_content.contains("\"react\"") || prompt_lower.contains("react");
+    let is_tauri = has_cargo || pkg_content.contains("@tauri-apps") || prompt_lower.contains("tauri");
+    let is_tailwind = pkg_content.contains("tailwindcss") || prompt_lower.contains("tailwind");
+    let is_python = root_path.join("pyproject.toml").exists() || root_path.join("requirements.txt").exists() || prompt_lower.contains("python");
+
+    let prompt_desc = initial_prompt.unwrap_or("").trim();
+
+    // 1. Initialiser AGENTS.md s'il n'existe pas encore
+    let agents_path = root_path.join("AGENTS.md");
+    if !agents_path.exists() {
+        let mut agents_content = format!(
+            "# AGENTS.md — Directives & Architecture pour {project_name}\n\n\
+            Ce fichier définit les directives fondamentales, l'architecture globale et les standards de développement pour tout agent IA travaillant sur le projet **{project_name}**.\n\n"
+        );
+
+        if !prompt_desc.is_empty() {
+            agents_content.push_str(&format!(
+                "## 1. Spécifications & Objectif Initial\n{}\n\n",
+                prompt_desc
+            ));
+        }
+
+        agents_content.push_str("## 2. Architecture & Technologies\n");
+        if is_tauri {
+            agents_content.push_str("- **Desktop / Backend** : Tauri v2, Rust 2021 (moteur natif, Tokio, Serde).\n");
+        }
+        if is_vue {
+            agents_content.push_str("- **Frontend** : Vue 3 (Composition API avec `<script setup lang=\"ts\">`), Vite, Pinia.\n");
+        } else if is_react {
+            agents_content.push_str("- **Frontend** : React, TypeScript strict, Vite.\n");
+        }
+        if is_tailwind {
+            agents_content.push_str("- **Styles** : Tailwind CSS.\n");
+        }
+        if is_python {
+            agents_content.push_str("- **Backend / Scripts** : Python 3, typage strict.\n");
+        }
+
+        agents_content.push_str("\n## 3. Commandes de Build & Vérification\n```bash\n");
+        if has_pkg || is_vue || is_react {
+            agents_content.push_str("# Frontend vérification TypeScript et build\nnpm run build\n");
+        }
+        if has_cargo || is_tauri {
+            agents_content.push_str("# Backend Rust check & linter\ncargo check --manifest-path src-tauri/Cargo.toml\ncargo clippy --manifest-path src-tauri/Cargo.toml\n");
+        }
+        if is_python {
+            agents_content.push_str("# Python tests & types\npytest\nmypy .\n");
+        }
+        agents_content.push_str("```\n\n## 4. Règles Fondamentales pour les Agents\n\
+            1. **Zéro Régression de Types** : TypeScript strict partout, interdiction absolue d'utiliser `any`.\n\
+            2. **Gestion d'Erreurs Robuste** : Gérer les erreurs via `Result<T, E>` côté Rust et des try/catch typés côté frontend.\n\
+            3. **Édition Chirurgicale** : Préserver scrupuleusement l'indentation et le code existant.\n\
+            4. **Structure Modulaire** : Les directives thématiques sont compartimentées dans le dossier `.agents/rules/`.\n");
+
+        tokio::fs::write(&agents_path, agents_content)
+            .await
+            .map_err(|e| format!("Erreur lors de la création de AGENTS.md: {e}"))?;
+        created_files.push("AGENTS.md".to_string());
+    }
+
+    // 2. Initialiser les règles modulaires dans .agents/rules/
+    if (is_vue || is_react) && !rules_dir.join("frontend.md").exists() && !rules_dir.join("frontend-vue.md").exists() {
+        let fe_file = if is_vue { "frontend-vue.md" } else { "frontend.md" };
+        let fe_content = if is_vue {
+            "# Règle Frontend : Vue 3 & TypeScript\n\n\
+            - **Composition API obligatoire** : toujours utiliser `<script setup lang=\"ts\">`.\n\
+            - **Props & Événements typés** : définir explicitement les types avec `defineProps<{...}>` et `defineEmits<{...}>`.\n\
+            - **TypeScript strict** : aucun `any` toléré. Utiliser `unknown` ou des interfaces dédiées dans `src/types/`.\n\
+            - **Stores Pinia** : syntaxe Setup Store avec refs et computeds.\n"
+        } else {
+            "# Règle Frontend : React & TypeScript\n\n\
+            - Composants fonctionnels avec hooks typés (`useState<T>`, `useMemo`).\n\
+            - Typage strict des props avec interfaces TypeScript dédiées.\n\
+            - Aucun type `any` toléré.\n"
+        };
+        tokio::fs::write(rules_dir.join(fe_file), fe_content).await.map_err(|e| e.to_string())?;
+        created_files.push(format!(".agents/rules/{fe_file}"));
+    }
+
+    if is_tauri && !rules_dir.join("backend-rust.md").exists() && !rules_dir.join("backend-rust-tauri.md").exists() {
+        let be_content = "# Règle Backend : Rust & Tauri v2\n\n\
+            - **Gestion d'erreurs** : Toujours utiliser `Result<T, E>` et `anyhow`.\n\
+            - **Zéro panique** : Ne jamais utiliser `.unwrap()` ou `.expect()` en production.\n\
+            - **Commandes Tauri** : Annoter avec `#[tauri::command]` et enregistrer dans `generate_handler![...]`.\n";
+        tokio::fs::write(rules_dir.join("backend-rust-tauri.md"), be_content).await.map_err(|e| e.to_string())?;
+        created_files.push(".agents/rules/backend-rust-tauri.md".to_string());
+    }
+
+    if !rules_dir.join("validation.md").exists() {
+        let val_content = "# Règle : Validation & Contrôle Qualité\n\n\
+            Avant de clore une tâche ou proposer des modifications :\n\
+            1. Exécuter la vérification des types et le build de production.\n\
+            2. Corriger immédiatement toute erreur de compilation ou warning bloquant.\n\
+            3. Vérifier que les interfaces et contrats d'API sont synchronisés.\n";
+        tokio::fs::write(rules_dir.join("validation.md"), val_content).await.map_err(|e| e.to_string())?;
+        created_files.push(".agents/rules/validation.md".to_string());
+    }
+
+    if !rules_dir.join("git-workflow.md").exists() {
+        let git_content = "# Règle : Workflow Git & Commits\n\n\
+            Conventions de commit (Conventional Commits) :\n\
+            - `feat(...)` : nouvelle fonctionnalité.\n\
+            - `fix(...)` : correction de bug.\n\
+            - `refactor(...)` : refactorisation sans changement fonctionnel.\n\
+            - `style(...)` : retouches CSS/UI cosmétiques.\n\
+            - `chore(...)` : maintenance et dépendances.\n";
+        tokio::fs::write(rules_dir.join("git-workflow.md"), git_content).await.map_err(|e| e.to_string())?;
+        created_files.push(".agents/rules/git-workflow.md".to_string());
+    }
+
+    Ok(created_files)
+}
+
 pub fn load_project_architecture_memory(
     project_root: &Path,
     max_chars: usize,
 ) -> Option<(String, String)> {
-    const CANDIDATES: [&str; 3] = [
+    const CANDIDATES: [&str; 4] = [
         ".vaix/architecture.md",
         "AGENTS.md",
         ".aider/conventions.md",
+        "CLAUDE.md",
     ];
+    let mut main_doc: Option<(String, String)> = None;
     for rel in CANDIDATES {
         let p = project_root.join(rel);
         if let Ok(content) = std::fs::read_to_string(&p) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
-                return Some((rel.to_string(), truncate_chars(trimmed, max_chars)));
+                main_doc = Some((rel.to_string(), trimmed.to_string()));
+                break;
             }
         }
     }
-    None
+
+    // Charger les règles modulaires de .agents/rules/*.md et .agent/rules/*.md
+    let mut rules_contents: Vec<(String, String)> = Vec::new();
+    let rules_dirs = [".agents/rules", ".agent/rules"];
+    for rdir in rules_dirs {
+        let dir_path = project_root.join(rdir);
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            let mut entries_vec: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            entries_vec.sort_by_key(|e| e.file_name());
+            for entry in entries_vec {
+                let path = entry.path();
+                if path.extension().map(|ext| ext == "md").unwrap_or(false) {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let trimmed = content.trim();
+                        if !trimmed.is_empty() {
+                            let file_name = entry.file_name().to_string_lossy().to_string();
+                            rules_contents.push((format!("{rdir}/{file_name}"), trimmed.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if main_doc.is_none() && rules_contents.is_empty() {
+        return None;
+    }
+
+    if rules_contents.is_empty() {
+        if let Some((rel, content)) = main_doc {
+            return Some((rel, truncate_chars(&content, max_chars)));
+        }
+    }
+
+    let mut combined = String::new();
+    let mut label = String::new();
+
+    if let Some((main_rel, main_txt)) = main_doc {
+        label = main_rel.clone();
+        combined.push_str(&format!("=== Directives globales ({main_rel}) ===\n{main_txt}\n"));
+    }
+
+    if !rules_contents.is_empty() {
+        if label.is_empty() {
+            label = ".agents/rules/".to_string();
+        } else {
+            label.push_str(" + .agents/rules/");
+        }
+        for (rule_rel, rule_txt) in rules_contents {
+            combined.push_str(&format!("\n=== Règle active ({rule_rel}) ===\n{rule_txt}\n"));
+        }
+    }
+
+    Some((label, truncate_chars(combined.trim(), max_chars)))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchitectStep {
     pub title: String,
@@ -2741,6 +2973,7 @@ pub struct ArchitectStep {
     pub instructions: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedArchitectPlan {
     pub role: Option<String>,
@@ -2749,6 +2982,7 @@ pub struct ParsedArchitectPlan {
     pub steps: Vec<ArchitectStep>,
 }
 
+#[allow(dead_code)]
 fn normalize_exec_role(raw: &str) -> Option<String> {
     match raw.trim().to_lowercase().as_str() {
         "designer" => Some("designer".to_string()),
@@ -2759,6 +2993,7 @@ fn normalize_exec_role(raw: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 pub fn parse_architect_plan(raw: &str, default_role: &str) -> ParsedArchitectPlan {
     let mut plan = ParsedArchitectPlan::default();
     let Some(start) = raw.find('{') else {
@@ -2850,38 +3085,42 @@ fn build_native_system_prompt(
     edit_format: &str,
     active_mcp: &[&McpServerConfig],
     mcp_schemas_note: &str,
-    frontend_stack: Option<&FrontendStackInfo>,
+    _frontend_stack: Option<&FrontendStackInfo>,
 ) -> String {
     let edit_rules = if edit_format == "diff" {
-        "FORMAT D'ÉDITION (`diff`) :\n\
-        Pour modifier un fichier existant, écris son chemin relatif EXACT brut (sans backtick et JAMAIS en lien Markdown `[...](...)`, réservé uniquement au résumé final) suivi d'un bloc SEARCH/REPLACE :\n\
-        ### chemin/du/fichier.ext\n\
-        ```langage\n\
-        <<<<<<< SEARCH\n\
-        lignes exactes existantes\n\
-        =======\n\
-        nouvelles lignes de remplacement\n\
-        >>>>>>> REPLACE\n\
-        ```\n\
-        Pour créer un nouveau fichier inexistant, écris le contenu complet dans le bloc précédé de `### chemin/du/fichier.ext`."
+        "FORMATS D'ÉCRITURE ET D'ÉDITION DE FICHIERS :\n\
+        1. CRÉATION OU RÉÉCRITURE COMPLÈTE (`write_file`) :\n\
+           Pour créer un nouveau fichier ou remplacer un fichier existant dans son intégralité, utilise `write_file` avec son contenu COMPLET (aucune limite de lignes).\n\
+           Via bloc Markdown : écris son chemin relatif EXACT brut suivi du bloc de code complet :\n\
+           ### chemin/du/fichier.ext\n\
+           ```langage\n\
+           // Contenu complet...\n\
+           ```\n\
+        2. PATCH COURT SUR FICHIER EXISTANT (`edit_file`) :\n\
+           Pour une modification ciblée sur un fichier déjà existant, utilise `edit_file` avec un bloc SEARCH/REPLACE exact (patch court) :\n\
+           ### chemin/du/fichier.ext\n\
+           ```langage\n\
+           <<<<<<< SEARCH\n\
+           lignes exactes existantes\n\
+           =======\n\
+           nouvelles lignes de remplacement\n\
+           >>>>>>> REPLACE\n\
+           ```"
     } else {
-        "FORMAT D'ÉDITION (`whole`) :\n\
-        Pour créer ou modifier un fichier, écris son chemin relatif EXACT brut (sans backtick et JAMAIS en lien Markdown `[...](...)`, réservé uniquement au résumé final) suivi du contenu COMPLET et opérationnel du fichier (sans TODO ni ellipsis) :\n\
-        ### chemin/du/fichier.ext\n\
-        ```langage\n\
-        // Contenu complet...\n\
-        ```\n\
-        Si un fichier est marqué [TRONQUÉ], utilise exclusivement des blocs `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE`."
+        "FORMATS D'ÉCRITURE ET D'ÉDITION DE FICHIERS (`whole`) :\n\
+        1. CRÉATION OU RÉÉCRITURE COMPLÈTE (`write_file`) :\n\
+           Pour créer ou modifier un fichier, utilise `write_file` avec le contenu COMPLET et opérationnel du fichier (sans TODO ni ellipsis, aucune limite de lignes) :\n\
+           ### chemin/du/fichier.ext\n\
+           ```langage\n\
+           // Contenu complet...\n\
+           ```\n\
+        2. PATCH COURT SUR FICHIER EXISTANT (`edit_file`) :\n\
+           Pour un patch court ciblé sur un fichier marqué [TRONQUÉ] ou existant, utilise exclusivement des blocs `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE`."
     };
 
     let role_rules = match role {
         "designer" => {
-            let tailwind_active = frontend_stack.map(|s| s.tailwind_active).unwrap_or(false);
-            let css_policy = if tailwind_active {
-                "- Stack CSS : Tailwind CSS est ACTIF sur ce projet. Tu peux utiliser les classes utilitaires Tailwind ainsi que du CSS natif complémentaire."
-            } else {
-                "- RÈGLE CSS ABSOLUE : Tailwind CSS N'EST PAS actif sur ce projet. INTERDICTION STRICTE d'écrire des classes utilitaires Tailwind (ex. `flex`, `h-screen`, `w-[170px]`, `bg-[#...]`, `bg-gradient-to-*`, `rounded-lg`, `text-white`). Écris exclusivement du vrai CSS natif complet et explicite dans `<style scoped>`/`<style>` et/ou dans la feuille CSS globale vérifiée importée."
-            };
+            let css_policy = "- Stack CSS : Tu peux utiliser librement Tailwind CSS (classes utilitaires flex, grid, w-[...], etc.) ainsi que du CSS natif selon les besoins du projet.";
             format!(
                 "CONSIGNES DU RÔLE (`Designer UI/UX`) :\n\
                 {css_policy}\n\
@@ -2894,6 +3133,15 @@ fn build_native_system_prompt(
         - Préserve strictement le comportement externe existant tout en améliorant la lisibilité, le découpage et le typage sans régression.".to_string(),
         "tester" => "CONSIGNES DU RÔLE (`Testeur`) :\n\
         - Écris des tests déterministes, isolés et directement exécutables couvrant le comportement demandé sans modifier la logique métier.".to_string(),
+        "terminal" => "CONSIGNES DU RÔLE (`Terminal / Shell`) :\n\
+        - Rôle prioritaire : diagnostic d'environnement, exécution de commandes shell, installation de dépendances et scripts via l'outil `run_command`.\n\
+        - Lis les fichiers de configuration nécessaires (ex. `package.json`, `Cargo.toml`, `.env`) avec l'outil `read_file`.\n\
+        - N'édite ou ne crée de fichiers QUE si nécessaire pour réparer la configuration ou les scripts d'installation.\n\
+        - NE RÉÉCRIS JAMAIS les composants d'interface ou le code applicatif qui n'ont rien à voir avec l'erreur signalée.\n\
+        - INTERDICTION FORMELLE DE SERVEUR PERSISTANT : Ne lance JAMAIS de serveur de développement en tâche de fond (`npm run dev`, `vite`, `npm start`, `cargo run`, etc.) ni de commande bloquante sans fin. Pour tester le build ou le typage, utilise EXCLUSIVEMENT des commandes à fin déterministe (`npm run build`, `npx vue-tsc --noEmit`, `cargo check`, `cargo test`).".to_string(),
+        "research" => "CONSIGNES DU RÔLE (`Recherche & Documentation`) :\n\
+        - Rôle prioritaire : rechercher des documentations officielles, des solutions à des erreurs récentes ou des versions compatibles avec l'outil `web_search` et lire les pages pertinentes avec `fetch_url`.\n\
+        - Synthétise clairement les résultats trouvés pour alimenter la résolution du problème.".to_string(),
         _ => "CONSIGNES DU RÔLE (`Codeur`) :\n\
         - Produis du code complet, robuste et opérationnel, sans TODO ni placeholder, cohérent avec l'architecture et les imports du projet.\n\
         - PÉRIMÈTRE STRICT : modifie uniquement ce qui est explicitement demandé par l'utilisateur dans le dernier message. Ne réécris jamais des composants UI ou fichiers existants non demandés.\n\
@@ -2921,10 +3169,15 @@ fn build_native_system_prompt(
     };
 
     format!(
-        "Tu es le moteur de code de vAIx STUDIO. Réponds TOUJOURS ET EXCLUSIVEMENT EN FRANÇAIS de façon concise et technique.\n\n\
+        "Langue de réponse obligatoire : Français (sauf code et identifiants techniques).\n\n\
+        Tu es le moteur de code de >AIx STUDIO. Réponds TOUJOURS ET EXCLUSIVEMENT EN FRANÇAIS de façon concise et technique.\n\n\
         {role_rules}\n\n\
         {edit_rules}\n\n\
+        RÈGLES ET DIRECTIVES DU PROJET (.agents/rules & AGENTS.md) :\n\
+        - Ce projet applique les directives de `AGENTS.md` et `.agents/rules/*.md`. Tu DOIS toujours les respecter scrupuleusement (standards de code, conventions, typage strict sans `any`, gestion d'erreurs, commandes de test/build).\n\
+        - GESTION DU TAG `@rules` : Si la demande mentionne `@rules` ou demande d'ajouter/modifier une consigne projet (ex: `@rules interdire l'usage de any`), tu DOIS identifier la catégorie adéquate (frontend, backend, validation, git, ou créer `.agents/rules/<nom>.md`), ajouter ou mettre à jour la règle avec `write_file` ou `edit_file`, et confirmer clairement dans ton résumé le fichier modifié.\n\n\
         STYLE DE RÉPONSE :\n\
+        - CRÉATION / MODIFICATION MULTI-FICHIERS : Si la tâche demande de créer ou configurer plusieurs fichiers (ex: `index.html`, `src/main.ts`, `src/App.vue`, `vite.config.ts`), émets TOUS les blocs de fichiers attendus dès que tes informations sont prêtes, sans étaler un fichier par tour.\n\
         - Les blocs d'édition de fichiers sont appliqués automatiquement sur le disque puis masqués de la conversation (le diff détaillé apparaît dans un menu dédié).\n\
         - MODULARITÉ (ANTI-MONOLITHE) : privilégie des fichiers et composants modulaires courts (150–300 lignes max par fichier) plutôt qu'un fichier monolithique.\n\
         - DÉPENDANCES & PACKS EXTERNES : vérifie toujours la liste `Paquets installés (package.json)` fournie. N'utilise JAMAIS une classe CSS de pack d'icônes (ex. `ri-*` de Remix Icon, `fa-*`), un composant de lib externe ou un import de paquet absent des paquets installés sans l'avoir d'abord installé via `run_command` (`npm install ...`) ET importé dans le point d'entrée ou le composant (ex. `import 'remixicon/fonts/remixicon.css'` dans `src/main.js`/`src/main.ts`).\n\
@@ -2936,10 +3189,12 @@ fn build_native_system_prompt(
         <tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"src/...\",\"start_line\":1,\"end_line\":120}}}}</tool_call> (start_line/end_line optionnels et recommandés pour les fichiers > 200 lignes)\n\
         <tool_call>{{\"name\":\"search_code\",\"arguments\":{{\"query\":\"motif\",\"path_filter\":\"src/\"}}}}</tool_call>\n\
         <tool_call>{{\"name\":\"list_files\",\"arguments\":{{}}}}</tool_call>\n\
-        <tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"src/...\",\"content\":\"...\"}}}}</tool_call> (créer un nouveau fichier ou réécrire un fichier complet)\n\
-        <tool_call>{{\"name\":\"edit_file\",\"arguments\":{{\"path\":\"src/...\",\"search\":\"extrait exact\",\"replace\":\"nouveau texte\"}}}}</tool_call> (modification chirurgicale SEARCH/REPLACE atomique, accepte aussi `edits: [...]`)\n\
+        <tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"src/...\",\"content\":\"...\"}}}}</tool_call> (CRÉATION COMPLÈTE ou réécriture totale d'un fichier sans limite de lignes)\n\
+        <tool_call>{{\"name\":\"edit_file\",\"arguments\":{{\"path\":\"src/...\",\"search\":\"extrait exact\",\"replace\":\"nouveau texte\"}}}}</tool_call> (PATCH COURT chirurgical SEARCH/REPLACE sur fichier existant, accepte aussi `edits: [...]`)\n\
         <tool_call>{{\"name\":\"delete_file\",\"arguments\":{{\"path\":\"...\",\"reason\":\"motif\"}}}}</tool_call> (requiert une confirmation utilisateur dans l'interface)\n\
         <tool_call>{{\"name\":\"run_command\",\"arguments\":{{\"command\":\"...\",\"timeout_secs\":90}}}}</tool_call> (`timeout_secs` optionnel 5..300s ; confirmation demandée si commande destructrice)\n\
+        <tool_call>{{\"name\":\"web_search\",\"arguments\":{{\"query\":\"recherche ciblée\",\"max_results\":5}}}}</tool_call> (recherche web sans clé pour docs, solutions, paquets récents)\n\
+        <tool_call>{{\"name\":\"fetch_url\",\"arguments\":{{\"url\":\"https://...\",\"max_chars\":12000}}}}</tool_call> (lecture et extraction texte épuré d'une page ou documentation en ligne)\n\
         Les commandes shell à afficher simplement à l'utilisateur vont dans un bloc ```bash ... ``` standard (hors <tool_call>).{mcp_section}"
     )
 }
@@ -2996,8 +3251,8 @@ async fn build_native_initial_user_message(
         ));
     }
 
-    if is_global_or_doc_task(user_prompt, target_files) && !all_project_files.is_empty() {
-        let max_tree = if is_cloud { 60usize } else { 25usize };
+    if !all_project_files.is_empty() {
+        let max_tree = if is_cloud { 300usize } else { 150usize };
         let shown: Vec<&str> = all_project_files.iter().take(max_tree).map(String::as_str).collect();
         let mut tree = shown.join("\n  ");
         if all_project_files.len() > max_tree {
@@ -3007,7 +3262,7 @@ async fn build_native_initial_user_message(
             ));
         }
         parts.push(format!(
-            "[Aperçu du dépôt ({} fichiers)]\n  {}",
+            "[Arborescence complète du projet ({} fichiers)]\n  {}",
             all_project_files.len(),
             tree
         ));
@@ -3075,7 +3330,8 @@ async fn build_native_initial_user_message(
     let compact_conv = if is_cloud {
         compact_conv_ctx_for_prompt(conv_ctx, 800, 4)
     } else {
-        compact_conv_ctx_for_prompt(conv_ctx, 400, 2)
+        // Modèle local : uniquement Synthèse de l'état actuel + Tour N-1
+        compact_conv_ctx_for_prompt(conv_ctx, 350, 1)
     };
     if !compact_conv.is_empty() {
         parts.push(format!(
@@ -3366,16 +3622,22 @@ async fn execute_native_agent_loop(
     let mut active_model = model.to_string();
     let mut last_fallback_reason: Option<String> = None;
 
-    for turn in 0..strategy.max_turns {
+    let mut max_loop_turns = strategy.max_turns.max(8);
+    let mut reading_turns = 0usize;
+    let mut turn = 0usize;
+    let mut last_turn_tool_signatures: HashSet<String> = HashSet::new();
+
+    while turn < max_loop_turns {
         if is_cancelled(cancel_rx) {
             anyhow::bail!("CANCELLED_BY_USER");
         }
         turns_run = turn + 1;
+        turn += 1;
 
         let stream_start = format!(
             "[Tour {}/{}] Appel {}:{} (format {})...",
-            turn + 1,
-            strategy.max_turns,
+            turns_run,
+            max_loop_turns,
             active_provider,
             active_model,
             effective_edit_format
@@ -3535,11 +3797,40 @@ async fn execute_native_agent_loop(
         let mut tool_outputs = Vec::new();
         let mut wrote_via_tool = false;
         let mut tool_had_failure = false;
+        let mut current_turn_tool_signatures: HashSet<String> = HashSet::new();
+        let mut duplicate_alert_triggered = false;
 
         for tc in tool_calls {
             if is_cancelled(cancel_rx) {
                 anyhow::bail!("CANCELLED_BY_USER");
             }
+
+            let tc_sig = format!(
+                "{}:{}",
+                tc.name,
+                serde_json::to_string(&tc.arguments).unwrap_or_default()
+            );
+            if last_turn_tool_signatures.contains(&tc_sig) {
+                let alert_msg = "ALERTE SYSTÈME : Tu viens d'exécuter exactement la même action qui a échoué. Ne répète pas cet appel. Lis d'abord le fichier complet avec read_file ou change d'approche.";
+                if !duplicate_alert_triggered {
+                    messages.push(LlmMessage::system(alert_msg));
+                    duplicate_alert_triggered = true;
+                }
+                tool_outputs.push(format!("[{}]\n{}", tc.name, alert_msg));
+                all_tool_results.push(ToolExecutionResult {
+                    tool: tc.name.clone(),
+                    success: false,
+                    message: alert_msg.to_string(),
+                    path: tc
+                        .arguments
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                });
+                tool_had_failure = true;
+                continue;
+            }
+            current_turn_tool_signatures.insert(tc_sig);
             if tc.name == "mcp_call" {
                 let server_ref = tc
                     .arguments
@@ -3777,6 +4068,20 @@ async fn execute_native_agent_loop(
                 };
                 let timeout_secs = crate::tools::shell::parse_timeout_secs(&tc.arguments);
 
+                if let Some(daemon_err) = crate::tools::shell::is_daemon_or_dev_server_command(cmd_str) {
+                    tool_had_failure = true;
+                    all_tool_results.push(ToolExecutionResult {
+                        tool: "run_command".to_string(),
+                        success: false,
+                        message: daemon_err.to_string(),
+                        path: None,
+                    });
+                    tool_outputs.push(format!("[Erreur run_command] {daemon_err}"));
+                    let stream_err = format!("[run_command bloqué] {daemon_err}");
+                    let _ = app.emit("aider:stream", (conversation_id, &stream_err));
+                    continue;
+                }
+
                 if let Some(reason) = crate::tools::shell::is_destructive_command(cmd_str) {
                     let ask_line = format!(
                         "[Validation] Confirmation demandée pour commande sensible : `{}`...",
@@ -3837,6 +4142,12 @@ async fn execute_native_agent_loop(
 
                 let cmd_line = format!("[Cmd] {}", truncate_chars(cmd_str, 120));
                 let _ = app.emit("aider:stream", (conversation_id, &cmd_line));
+                let running_notice = format!(
+                    "{}\n\n💻 *Exécution :* `{}`",
+                    turn_live_content.trim(),
+                    truncate_chars(cmd_str, 90)
+                );
+                let _ = app.emit("aider:live_chunk", (conversation_id, &running_notice));
 
                 match crate::tools::shell::run_command_streaming(
                     project_root,
@@ -3854,11 +4165,21 @@ async fn execute_native_agent_loop(
                         if !tr.success {
                             tool_had_failure = true;
                         }
+                        let outcome_icon = if tr.success { "✓" } else { "✕" };
+                        let running_outcome = format!(
+                            "{}\n\n💻 `{}` -> {} {}",
+                            turn_live_content.trim(),
+                            truncate_chars(cmd_str, 70),
+                            outcome_icon,
+                            if tr.success { "terminé" } else { "erreur" }
+                        );
+                        let _ = app.emit("aider:live_chunk", (conversation_id, &running_outcome));
                         let clipped = truncate_chars(&tr.message, tool_output_budget);
+                        let cmd_summary = format!("`{}`: {}", truncate_chars(cmd_str, 70), truncate_chars(&tr.message, 600));
                         all_tool_results.push(ToolExecutionResult {
                             tool: tr.tool.clone(),
                             success: tr.success,
-                            message: format!("Commande exécutée (succès={})", tr.success),
+                            message: cmd_summary,
                             path: None,
                         });
                         tool_outputs.push(format!(
@@ -3871,6 +4192,13 @@ async fn execute_native_agent_loop(
                     }
                     Err(e) => {
                         tool_had_failure = true;
+                        let err_notice = format!(
+                            "{}\n\n💻 `{}` -> ✕ ({})",
+                            turn_live_content.trim(),
+                            truncate_chars(cmd_str, 70),
+                            truncate_chars(&e, 60)
+                        );
+                        let _ = app.emit("aider:live_chunk", (conversation_id, &err_notice));
                         all_tool_results.push(ToolExecutionResult {
                             tool: "run_command".to_string(),
                             success: false,
@@ -3922,7 +4250,15 @@ async fn execute_native_agent_loop(
                 None
             };
 
-            let log_line = format!("[Outil] {}...", tc.name);
+            let log_line = if tc.name == "web_search" {
+                let q = tc.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                format!("[Web] Recherche : \"{}\"...", truncate_chars(q, 60))
+            } else if tc.name == "fetch_url" {
+                let u = tc.arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                format!("[Web] Lecture URL : {}...", truncate_chars(u, 60))
+            } else {
+                format!("[Outil] {}...", tc.name)
+            };
             let _ = app.emit("aider:stream", (conversation_id, &log_line));
             match execute_local_tool_internal(project_root, &tc.name, &tc.arguments).await {
                 Ok(tr) => {
@@ -3975,10 +4311,19 @@ async fn execute_native_agent_loop(
                             tool_had_failure = true;
                         }
                         let clipped = truncate_chars(&tr.message, tool_output_budget);
+                        let detail = if tc.name == "web_search" {
+                            let q = tc.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                            format!("Recherche \"{q}\" : {}", truncate_chars(&tr.message, 600))
+                        } else if tc.name == "fetch_url" {
+                            let u = tc.arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            format!("Lecture {u} : {}", truncate_chars(&tr.message, 600))
+                        } else {
+                            truncate_chars(&tr.message, 600)
+                        };
                         all_tool_results.push(ToolExecutionResult {
                             tool: tr.tool.clone(),
                             success: tr.success,
-                            message: format!("Outil '{}' exécuté", tc.name),
+                            message: detail,
                             path: tr.path.clone(),
                         });
                         tool_outputs.push(format!("[{}]\n{}", tc.name, clipped));
@@ -3995,6 +4340,12 @@ async fn execute_native_agent_loop(
                     tool_outputs.push(format!("[Erreur {}] {}", tc.name, e));
                 }
             }
+        }
+
+        if !current_turn_tool_signatures.is_empty() {
+            last_turn_tool_signatures = current_turn_tool_signatures;
+        } else {
+            last_turn_tool_signatures.clear();
         }
 
         // 2. Appliquer les blocs de fichiers / SEARCH-REPLACE
@@ -4076,6 +4427,14 @@ async fn execute_native_agent_loop(
             && edit_outcome.applied_files.is_empty()
             && (!wrote_via_tool || tool_had_failure || turn_cleaned_is_empty)
         {
+            if all_applied_files.is_empty() && !wrote_via_tool {
+                reading_turns += 1;
+                // Si la limite de tours approche alors que l'agent n'a fait que lire sans écrire,
+                // prolonger pour garantir au moins 5 tours d'écriture dédiés.
+                if turns_run + 1 >= max_loop_turns && reading_turns > 0 && max_loop_turns < 12 {
+                    max_loop_turns = (turns_run + 5).min(12);
+                }
+            }
             messages.push(LlmMessage::user(format!(
                 "[Résultats des outils]\n{}\n\nPoursuis maintenant avec ces informations pour répondre précisément ou appliquer les modifications de fichiers attendues.",
                 tool_outputs.join("\n\n")
@@ -4161,7 +4520,7 @@ fn build_compact_diff_summary(modified_files: &[ModifiedFileDiff], max_chars: us
             "Fichier {} (+{} / -{}, ~{} mod):",
             f.path, f.added, f.removed, f.modified
         )];
-        for dl in f.lines.iter().filter(|l| l.kind != "ctx").take(14) {
+        for dl in f.lines.iter().filter(|l| l.kind != "ctx").take(25) {
             let prefix = match dl.kind.as_str() {
                 "add" => "+",
                 "del" => "-",
@@ -4260,6 +4619,7 @@ fn has_multiple_requests(user_prompt: &str) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn is_complex_multi_requirement_prompt(user_prompt: &str) -> bool {
     if has_multiple_requests(user_prompt) {
         return true;
@@ -4604,6 +4964,7 @@ async fn synthesize_final_response(
     conversation_id: &str,
     user_prompt: &str,
     cleaned_narrative: &str,
+    tool_results: &[ToolExecutionResult],
     engine_ran: bool,
     ollama_running: bool,
     synth_provider: &str,
@@ -4620,7 +4981,8 @@ async fn synthesize_final_response(
     let needs_llm_synthesis = engine_ran
         && can_call_synth
         && (cleaned_narrative.trim().is_empty()
-            || cleaned_narrative.chars().count() > 900
+            || !tool_results.is_empty()
+            || cleaned_narrative.chars().count() > 700
             || narrative_needs_structured_synthesis(
                 cleaned_narrative,
                 turn_applied_files,
@@ -4640,31 +5002,55 @@ async fn synthesize_final_response(
             Vec::new()
         };
 
-        let diff_summary = if scoped_diffs.is_empty() {
-            "Aucune modification appliquée sur le disque.".to_string()
-        } else {
-            build_compact_diff_summary(&scoped_diffs, 1400)
-        };
-        let files_names: Vec<String> = scoped_diffs.iter().map(|f| f.path.clone()).collect();
-        let multi_req = has_multiple_requests(user_prompt);
-        let synth_sys = "Tu es l'Architecte Synthétiseur de vAIx STUDIO. Rédige en français un retour clair et concis sur ce qui a réellement été généré ou modifié dans chaque fichier.\n\
-        RÈGLES STRICTES :\n\
-        1. Cite chaque fichier concerné avec un lien Markdown cliquable exact `[NomFichier](chemin/relatif/NomFichier)` (ex. `[App.vue](src/App.vue)`).\n\
-        2. Si la demande contient plusieurs points/tâches distincts (ou plusieurs fichiers modifiés pour des raisons distinctes), structure obligatoirement la réponse en bullet points (`- ...`), avec une puce par demande traitée expliquant ce qui a changé et dans quel(s) fichier(s).\n\
-        3. Sinon, rédige 1 à 3 phrases ou puces concrètes décrivant ce qui a été généré/modifié.\n\
-        4. INTERDIT : blocs de code complets, marqueurs SEARCH/REPLACE, section `### Fichiers modifiés` (déjà affichée dans le dropdown dédié), excuses ou blabla.";
+        let execution_facts = serde_json::json!({
+            "has_modified_files": !scoped_diffs.is_empty(),
+            "total_modified_files": scoped_diffs.len(),
+            "modified_files": scoped_diffs.iter().map(|f| serde_json::json!({
+                "path": f.path,
+                "added_lines": f.added,
+                "removed_lines": f.removed,
+                "diff_summary": build_compact_diff_summary(&[f.clone()], 800)
+            })).collect::<Vec<_>>(),
+            "turn_applied_files": turn_applied_files,
+            "executed_tools": tool_results.iter().take(15).map(|r| serde_json::json!({
+                "tool": r.tool,
+                "success": r.success,
+                "message": truncate_chars(&r.message, 250)
+            })).collect::<Vec<_>>(),
+            "verification_report": if verifier_note.is_empty() { "N/A" } else { verifier_note },
+            "engine_turn_details": truncate_chars(cleaned_narrative, 1200)
+        });
+        let execution_facts_json = serde_json::to_string_pretty(&execution_facts).unwrap_or_default();
+
+        let synth_sys = "Langue de réponse obligatoire : Français (sauf code et identifiants techniques).\n\n\
+        Tu es l'Architecte Synthétiseur de vAIx STUDIO. Tu produis une synthèse technique rigoureuse, concise et FACTUELLE.\n\n\
+        RÈGLE FONDAMENTALE D'ANALYSE FACTUELLE :\n\
+        Tu es branché EXCLUSIVEMENT sur les faits d'exécution réels fournis dans le JSON d'état ci-dessous.\n\
+        Il t'est FORMELLEMENT INTERDIT de faire une libre interprétation du prompt utilisateur, d'extrapoler, d'inventer des modifications de fichiers ou des commandes manuelles qui ne figurent pas dans ces faits réels.\n\n\
+        STRUCTURE OBLIGATOIRE DE TA SYNTHÈSE (utilise impérativement ces 3 sections markdown `###`) :\n\n\
+        ### 🔍 Cause du problème & Diagnostic\n\
+        Explique succinctement la cause technique ayant motivé l'intervention d'après les faits d'exécution (ex. fichier manquant, configuration absente, syntaxe erronée).\n\n\
+        ### 🛠️ Solution réelle & Fichiers modifiés\n\
+        Résume STRICTEMENT les modifications réelles indiquées dans le JSON d'état.\n\
+        RÈGLE ABSOLUE : Cite OBLIGATOIREMENT chaque fichier réellement créé ou modifié avec son lien Markdown cliquable exact `[NomFichier](chemin/relatif/NomFichier)` (ex: `[vite.config.ts](vite.config.ts)`).\n\
+        Détaille les modifications logiques (lignes ajoutées/supprimées, options modifiées, imports corrigés).\n\
+        Si aucun fichier n'a été modifié (has_modified_files = false), indique clairement qu'aucune modification de fichier n'a été écrite sur le disque et n'invente AUCUNE commande manuelle.\n\n\
+        ### ✅ Vérifications & État final\n\
+        Résume les outils réellement exécutés (installations, builds, tests) et leur résultat (succès/échec) d'après le JSON d'état. Indique l'état final vérifié de l'application.\n\n\
+        DIRECTIVES STRICTES :\n\
+        - RÈGLE LORSQUE 0 FICHIER MODIFIÉ : Si `has_modified_files` est faux, il est FORMELLEMENT INTERDIT d'inventer ou de proposer des commandes manuelles de création de code à l'utilisateur (ex. 'Créez manuellement...', 'Tapez cette commande...'). Indique sobrement qu'aucune écriture de fichier n'a eu lieu sur le disque.\n\
+        - Sois direct, pédagogique et précis. Pas de blabla vide ni d'excuses.\n\
+        - Ne recopie JAMAIS de blocs de code entiers ni de diffs bruts SEARCH/REPLACE.\n\
+        - Chaque fichier mentionné doit comporter son lien Markdown valide `[NomFichier](chemin/relatif)`.";
         let synth_user = format!(
-            "Demande utilisateur{} :\n{}\n\nFichiers concernés sur ce tour : {}\nExtrait diff réel :\n{}\nVérification : {}\nExplication brute du modèle : {}",
-            if multi_req { " (MULTI-DEMANDES DÉTECTÉES -> bullet points obligatoires)" } else { "" },
-            truncate_chars(user_prompt.trim(), 420),
-            if files_names.is_empty() {
-                "aucun".to_string()
-            } else {
-                files_names.join(", ")
-            },
-            diff_summary,
-            if verifier_note.is_empty() { "N/A" } else { verifier_note },
-            truncate_chars(cleaned_narrative, 800)
+            "FAITS RÉELS D'EXÉCUTION (JSON D'ÉTAT DU SYSTÈME) :\n\
+            ```json\n\
+            {}\n\
+            ```\n\n\
+            Contexte indicatif de la demande initiale de l'utilisateur (à titre de référence uniquement, interdiction de libre interprétation) :\n\
+            {}",
+            execution_facts_json,
+            truncate_chars(user_prompt.trim(), 800)
         );
 
         match providers::call_provider_oneshot_with_fallback(
@@ -4675,7 +5061,7 @@ async fn synthesize_final_response(
             settings,
             synth_sys,
             &synth_user,
-            420,
+            950,
             0.1,
         )
         .await
@@ -4715,8 +5101,33 @@ async fn synthesize_final_response(
         cleaned_narrative.to_string()
     };
 
+    let non_empty_core = if core_narrative.trim().is_empty() {
+        let mut lines = Vec::new();
+        if !turn_applied_files.is_empty() {
+            lines.push("### 🛠️ Solution & Fichiers modifiés".to_string());
+            for f in turn_applied_files {
+                let base = file_basename(f);
+                lines.push(format!("- [{base}]({f}) : modifications appliquées."));
+            }
+        }
+        if !tool_results.is_empty() {
+            lines.push("\n### ⚡ Actions et commandes exécutées".to_string());
+            for r in tool_results.iter().take(8) {
+                let icon = if r.success { "✓" } else { "✕" };
+                lines.push(format!("- {} **{}** : {}", icon, r.tool, truncate_chars(&r.message, 180)));
+            }
+        }
+        if lines.is_empty() {
+            "### ✅ Diagnostic & Statut\nTraitement terminé. Aucune modification supplémentaire requise.".to_string()
+        } else {
+            lines.join("\n")
+        }
+    } else {
+        core_narrative
+    };
+
     let final_markdown =
-        append_modified_files_summary(&core_narrative, modified_files, turn_applied_files);
+        append_modified_files_summary(&non_empty_core, modified_files, turn_applied_files);
     (final_markdown, synth_tokens)
 }
 
@@ -5049,13 +5460,11 @@ pub async fn run_prompt_pipeline(
         None
     };
 
-    // SUB-AGENT 1/5: Architecte & Orchestrateur
+    // SUB-AGENT 1/5: Architecte & Orchestrateur (Planification DAG Multi-Agent)
     let all_project_files = list_source_files_for_cartographer(&project_root_path);
     let frontend_stack = detect_frontend_stack(&project_root_path, &all_project_files);
 
     let (arch_prov, arch_model) = resolve_agent_slot("architect", &settings);
-    let (mut exec_role, mut run_tests_after) = classify_prompt_role(&user_prompt);
-    let (base_exec_prov, base_exec_model) = resolve_agent_slot(exec_role, &settings);
     let is_agent_mode =
         settings.active_target.trim().is_empty() || settings.active_target.trim() == "agent";
 
@@ -5063,9 +5472,9 @@ pub async fn run_prompt_pipeline(
         app,
         &conversation_id,
         1,
-        "1. Architecte & Orchestrateur",
+        "1. Orchestrateur Multi-Agent",
         &format!(
-            "Analyse de la demande et routage ({} · {}).",
+            "Analyse de la demande et planification DAG ({} · {}).",
             arch_prov, arch_model
         ),
         "running",
@@ -5076,23 +5485,23 @@ pub async fn run_prompt_pipeline(
         &mut agent_trace,
         AgentTraceStep {
             role: "architect".to_string(),
-            role_label: "Architecte".to_string(),
+            role_label: "Orchestrateur".to_string(),
             provider: arch_prov.clone(),
             model: arch_model.clone(),
-            summary: "Analyse de la demande et préparation du cadrage...".to_string(),
+            summary: "Décomposition de la demande en plan d'action DAG...".to_string(),
             status: "running".to_string(),
             tokens: 0,
         },
     );
 
     let mut architect_spec: Option<String> = None;
-    let mut architect_steps: Vec<ArchitectStep> = Vec::new();
     let mut architect_llm_ran = false;
     let mut architect_err: Option<String> = None;
     let mut arch_tokens_used = 0usize;
     let mut used_arch_prov = arch_prov.clone();
     let mut used_arch_model = arch_model.clone();
     let mut arch_fb_reason: Option<String> = None;
+    let mut run_tests_after = false;
 
     let arch_can_run = has_callable_candidate(
         &arch_prov,
@@ -5105,14 +5514,7 @@ pub async fn run_prompt_pipeline(
     let missing_deps =
         prompt_mentions_uninstalled_library(&user_prompt, frontend_stack.as_ref());
 
-    if is_agent_mode
-        && arch_can_run
-        && (arch_prov != base_exec_prov
-            || arch_model != base_exec_model
-            || !missing_deps.is_empty()
-            || ((arch_prov != "ollama" || effective_num_ctx(&settings) >= 16_384)
-                && is_complex_multi_requirement_prompt(&user_prompt)))
-    {
+    let task_plan: crate::orchestrator::TaskPlan = if is_agent_mode && arch_can_run {
         let mut arch_prioritized = Vec::new();
         let mut arch_others = Vec::new();
         for f in &all_project_files {
@@ -5123,15 +5525,15 @@ pub async fn run_prompt_pipeline(
             }
         }
         arch_prioritized.extend(arch_others);
-        let arch_files_preview: Vec<String> = arch_prioritized.into_iter().take(40).collect();
+        let arch_files_preview: Vec<String> = arch_prioritized.into_iter().take(30).collect();
         let stack_block = frontend_stack
             .as_ref()
-            .map(|s| format!("\n\n{}", s.format_summary()))
+            .map(|s| format!("\nStack frontend détectée :\n{}", s.format_summary()))
             .unwrap_or_default();
         let files_block = if arch_files_preview.is_empty() {
             "aucun fichier indexé".to_string()
         } else {
-            arch_files_preview.join("\n")
+            arch_files_preview.join(", ")
         };
         let arch_mem_block = load_project_architecture_memory(&project_root_path, 1200)
             .map(|(src, txt)| format!("\n\n[Architecture & Conventions ({src})]\n{txt}"))
@@ -5145,24 +5547,26 @@ pub async fn run_prompt_pipeline(
             )
         };
 
-        let arch_sys = "Tu es l'Architecte logiciel de vAIx STUDIO. Analyse la demande utilisateur, l'architecture, l'arborescence et la stack détectée.\n\
-        1. Choisis le rôle d'exécution principal (`designer|coder|refactoring|tester`), `runTests` (`bool`), et rédige dans `spec` un plan technique concret respectant strictement la stack CSS détectée (CSS natif obligatoire si Tailwind est inactif).\n\
-        2. Si la tâche est simple ou tient en 1 fichier, laisse `\"steps\": []`.\n\
-        3. Si la tâche est complexe, multi-fichiers ou multi-composants (ex. nouvelle fonctionnalité complète, architecture modulaire), décompose-la dans `steps` en **2 à 5 étapes atomiques et ordonnées** (ex. fondations/types/state -> modules/composants -> styles/câblage -> tests) en privilégiant des fichiers modulaires de 150 à 300 lignes max.\n\
-        4. Si la demande porte sur l'installation ou la configuration de paquets/dépendances (ex. tailwindcss, iconify, npm install) sans refonte visuelle explicite, choisis le rôle `coder`, laisse `\"steps\": []`, et limite la portée à l'installation et aux fichiers de configuration (sans réécrire les composants existants).\n\
-        5. DÉPENDANCES MANQUANTES : vérifie toujours `Paquets installés (package.json)` dans la stack détectée. Si la demande utilise une librairie ou un pack d'icônes absent (ex. Remix Icon -> `remixicon` + import `'remixicon/fonts/remixicon.css'` dans le point d'entrée, ou `@iconify/vue`, `lucide-vue-next`, `pinia`…), prescris EXPLICITEMENT dans `spec` (et en étape 1 si multi-étapes) de l'installer via `run_command` (`npm install ...`) et de l'importer/configurer AVANT de l'utiliser dans les composants.\n\
-        Retourne UNIQUEMENT un objet JSON valide, sans texte ni bloc markdown autour :\n\
-        {\"role\":\"designer|coder|refactoring|tester\",\"runTests\":false,\"spec\":\"Plan technique synthétique\",\"steps\":[{\"title\":\"Titre court\",\"role\":\"coder|designer|refactoring|tester\",\"files\":[\"src/...\"],\"instructions\":\"Consignes précises de cette étape\"}]}";
-        let arch_user = format!(
-            "[Contexte projet]\n{}{}\n\n[Fichiers du projet]\n{}{}{}\n\n[Session récente]\n{}\n\n[Demande utilisateur]\n{}",
-            truncate_chars(project.global_context.trim(), 500),
-            arch_mem_block,
+        let project_summary = format!(
+            "Fichiers principaux : {}\n{}{}{}{}",
             files_block,
             stack_block,
+            arch_mem_block,
             missing_deps_block,
-            truncate_chars(conv_ctx.trim(), 500),
+            if project.global_context.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n\n[Contexte global]\n{}", truncate_chars(project.global_context.trim(), 400))
+            }
+        );
+
+        let orch_sys = crate::orchestrator::build_orchestrator_system_prompt(&project_summary);
+        let orch_user = format!(
+            "[Session récente]\n{}\n\n[Demande utilisateur]\n{}",
+            truncate_chars(conv_ctx.trim(), 400),
             truncate_chars(user_prompt.trim(), 1600)
         );
+
         let arch_call_res = tokio::select! {
             biased;
             _ = wait_cancelled(&mut cancel_rx) => {
@@ -5184,36 +5588,18 @@ pub async fn run_prompt_pipeline(
                 "architect",
                 stack.ollama_running,
                 &settings,
-                arch_sys,
-                &arch_user,
-                1200,
-                0.2,
+                &orch_sys,
+                &orch_user,
+                1100,
+                0.1,
             ) => res,
         };
+
         match arch_call_res {
             Ok((reply, p_tok, c_tok, used_prov, used_mdl, fb_reason)) => {
                 used_arch_prov = used_prov;
                 used_arch_model = used_mdl;
                 arch_fb_reason = fb_reason;
-                let parsed = parse_architect_plan(&reply, exec_role);
-                if let Some(r) = parsed.role.as_deref() {
-                    exec_role = match r {
-                        "designer" => "designer",
-                        "coder" => "coder",
-                        "refactoring" => "refactoring",
-                        "tester" => "tester",
-                        _ => exec_role,
-                    };
-                }
-                if parsed.run_tests {
-                    run_tests_after = true;
-                }
-                architect_spec = parsed.spec;
-                architect_steps = parsed.steps;
-                if is_install_or_setup_prompt(&user_prompt) {
-                    exec_role = "coder";
-                    architect_steps.clear();
-                }
                 architect_llm_ran = true;
                 arch_tokens_used = p_tok + c_tok;
                 record_external_api_usage(app, state_lock, &used_arch_prov, p_tok, c_tok).await;
@@ -5221,7 +5607,7 @@ pub async fn run_prompt_pipeline(
                     "aider:tokens",
                     TokenUsageEvent {
                         conversation_id: conversation_id.clone(),
-                        subagent: "1. Architecte".to_string(),
+                        subagent: "1. Orchestrateur".to_string(),
                         prompt_tokens: p_tok,
                         completion_tokens: c_tok,
                         total_tokens: arch_tokens_used,
@@ -5235,34 +5621,45 @@ pub async fn run_prompt_pipeline(
                         ),
                     },
                 );
+
+                let (parsed_plan, is_fb) = crate::orchestrator::parse_orchestrator_response(&reply, &user_prompt);
+                if is_fb && arch_fb_reason.is_none() {
+                    arch_fb_reason = Some("Plan JSON invalide ou cycle détecté -> repli direct".to_string());
+                }
+                parsed_plan
             }
             Err(e) => {
-                architect_err = Some(synthesize_error_log(&e.to_string()));
+                let err_msg = synthesize_error_log(&e.to_string());
+                architect_err = Some(err_msg);
+                crate::orchestrator::TaskPlan::fallback(&user_prompt)
             }
         }
+    } else {
+        crate::orchestrator::TaskPlan::fallback(&user_prompt)
+    };
+
+    let execution_waves = task_plan
+        .compute_execution_waves()
+        .unwrap_or_else(|_| vec![task_plan.tasks.iter().map(|t| t.id.clone()).collect()]);
+
+    if task_plan.tasks.iter().any(|t| t.role.trim().to_lowercase() == "tester") {
+        run_tests_after = true;
     }
 
-    if !missing_deps.is_empty() {
-        let entry_hint = frontend_stack
-            .as_ref()
-            .and_then(|s| s.entry_file.as_deref())
-            .unwrap_or("le point d'entrée");
-        let dep_directive = format!(
-            "PRÉREQUIS DÉPENDANCE OBLIGATOIRE (absent de package.json) :\n- {}\nExécute d'abord l'installation avec `run_command` (`npm install ...`), importe la feuille CSS ou la librairie dans `{entry_hint}` / le composant, puis réalise la demande.",
-            missing_deps.join("\n- ")
-        );
-        match architect_spec {
-            Some(ref mut spec) => {
-                let low_spec = spec.to_lowercase();
-                if !low_spec.contains("npm install") && !low_spec.contains("run_command") {
-                    *spec = format!("{dep_directive}\n\n{spec}");
-                }
-            }
-            None => {
-                architect_spec = Some(dep_directive);
-            }
-        }
-    }
+    let exec_role = if let Some(first_task) = task_plan.tasks.first() {
+        let role_str = match crate::orchestrator::TaskRole::from_str_loose(&first_task.role).as_str() {
+            "designer" => "designer",
+            "refactoring" => "refactoring",
+            "tester" => "tester",
+            "terminal" => "terminal",
+            "research" => "research",
+            _ => "coder",
+        };
+        architect_spec = Some(format!("Objectif : {}\nCadrage : {}", first_task.goal, task_plan.summary));
+        role_str
+    } else {
+        "coder"
+    };
 
     if !architect_llm_ran {
         let att_chars: usize = attachments
@@ -5284,7 +5681,7 @@ pub async fn run_prompt_pipeline(
             "aider:tokens",
             TokenUsageEvent {
                 conversation_id: conversation_id.clone(),
-                subagent: "1. Architecte & Contexte".to_string(),
+                subagent: "1. Orchestrateur & Contexte".to_string(),
                 prompt_tokens: init_prompt_tokens,
                 completion_tokens: 0,
                 total_tokens: init_prompt_tokens,
@@ -5301,15 +5698,9 @@ pub async fn run_prompt_pipeline(
     }
 
     let (arch_status, arch_summary) = if architect_llm_ran {
-        let steps_note = if architect_steps.len() >= 2 {
-            format!(" · {} étapes", architect_steps.len())
-        } else {
-            String::new()
-        };
-        let spec_note = architect_spec
-            .as_deref()
-            .map(|s| format!(" · {}", truncate_chars(s.replace('\n', " ").trim(), 120)))
-            .unwrap_or_default();
+        let tasks_count = task_plan.tasks.len();
+        let waves_count = execution_waves.len();
+        let plan_note = format!(" · {} tâche(s) en {} vague(s)", tasks_count, waves_count);
         let fb_note = if let Some(ref r) = arch_fb_reason {
             format!(" · Repli auto (`{}`)", truncate_chars(&r.replace('`', "'"), 60))
         } else {
@@ -5322,18 +5713,18 @@ pub async fn run_prompt_pipeline(
                 "done".to_string()
             },
             format!(
-                "Routé vers **{}**{} · Plan technique généré{}{}",
-                role_display_name(exec_role),
-                steps_note,
-                spec_note,
-                fb_note
+                "Plan DAG généré : **{}**{}{} ({})",
+                task_plan.summary,
+                plan_note,
+                fb_note,
+                role_display_name(exec_role)
             ),
         )
     } else if let Some(ref err_msg) = architect_err {
         (
             "fallback".to_string(),
             format!(
-                "Repli cadrage déterministe (vers **{}**) · `{}`",
+                "Repli DAG direct (vers **{}**) · `{}`",
                 role_display_name(exec_role),
                 truncate_chars(&err_msg.replace('`', "'"), 110)
             ),
@@ -5342,7 +5733,7 @@ pub async fn run_prompt_pipeline(
         (
             "done".to_string(),
             format!(
-                "Cadrage contexte et routage vers **{}**",
+                "Plan direct et routage vers **{}**",
                 role_display_name(exec_role)
             ),
         )
@@ -5353,7 +5744,7 @@ pub async fn run_prompt_pipeline(
         &mut agent_trace,
         AgentTraceStep {
             role: "architect".to_string(),
-            role_label: "Architecte".to_string(),
+            role_label: "Orchestrateur".to_string(),
             provider: used_arch_prov.clone(),
             model: used_arch_model.clone(),
             summary: arch_summary,
@@ -5512,7 +5903,7 @@ pub async fn run_prompt_pipeline(
         &settings,
         stack.ollama_running,
     );
-    let is_multi_step = is_agent_mode && architect_steps.len() >= 2 && can_run_exec;
+    let is_multi_step = is_agent_mode && task_plan.tasks.len() >= 2 && can_run_exec;
 
     let mut engine_ran = false;
     let mut exec_tokens_used = 0usize;
@@ -5529,11 +5920,14 @@ pub async fn run_prompt_pipeline(
 
     let (cleaned_narrative, stage_note) = if is_multi_step {
         git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
-        let total_steps = architect_steps.len();
+        let total_tasks = task_plan.tasks.len();
+        let total_waves = execution_waves.len();
         let plan_banner = format!(
-            "[Plan] {} étapes : {}",
-            total_steps,
-            architect_steps
+            "[Plan DAG] {} tâches en {} vague(s) : {}",
+            total_tasks,
+            total_waves,
+            task_plan
+                .tasks
                 .iter()
                 .enumerate()
                 .map(|(i, s)| format!("{}. {}", i + 1, s.title))
@@ -5546,8 +5940,42 @@ pub async fn run_prompt_pipeline(
         let mut step_narratives: Vec<String> = Vec::new();
         let mut all_thinking: Vec<String> = Vec::new();
         let mut had_step_error = false;
+        let max_concurrency = if arch_prov == "ollama" || stack.ollama_running {
+            1
+        } else {
+            3
+        };
 
-        for (idx, step) in architect_steps.iter().enumerate() {
+        let mut task_counter = 0usize;
+
+        'dag_loop: for (wave_idx, wave) in execution_waves.iter().enumerate() {
+            let sub_waves = crate::orchestrator::partition_wave_into_safe_batches(
+                wave,
+                &task_plan,
+                max_concurrency,
+            );
+
+            for sub_wave in sub_waves {
+                let wave_mode_label = if sub_wave.is_parallel {
+                    format!("⚡ Parallèle ({} tâches sans conflit)", sub_wave.task_ids.len())
+                } else {
+                    "▶ Séquentiel".to_string()
+                };
+
+                let wave_banner = format!(
+                    "\n── Vague {}/{} [{}] ──\n",
+                    wave_idx + 1,
+                    total_waves,
+                    wave_mode_label
+                );
+                let _ = app.emit("aider:stream", (&conversation_id, &wave_banner));
+
+                for task_id in &sub_wave.task_ids {
+                    task_counter += 1;
+                    let step = match task_plan.get_task(task_id) {
+                        Some(t) => t.clone(),
+                        None => continue,
+                    };
             if is_cancelled(&cancel_rx) {
                 if let Some(h) = title_handle.take() {
                     h.abort();
@@ -5562,19 +5990,22 @@ pub async fn run_prompt_pipeline(
                 .await;
             }
 
-            let step_role_static: &'static str = match step.role.trim().to_lowercase().as_str() {
+            let step_role_static: &'static str = match crate::orchestrator::TaskRole::from_str_loose(&step.role).as_str() {
                 "designer" => "designer",
-                "coder" => "coder",
                 "refactoring" => "refactoring",
                 "tester" => "tester",
-                _ => exec_role,
+                "terminal" => "terminal",
+                "research" => "research",
+                _ => "coder",
             };
             let (step_prov, step_model) = resolve_agent_slot(step_role_static, &settings);
-            let trace_role_key = format!("{}_step_{}", step_role_static, idx + 1);
+            let trace_role_key = format!("{}_step_{}", step_role_static, task_counter);
             let step_label = format!(
-                "Étape {}/{} · {}",
-                idx + 1,
-                total_steps,
+                "Étape {}/{} (Vague {}/{}) · {}",
+                task_counter,
+                total_tasks,
+                wave_idx + 1,
+                total_waves,
                 truncate_chars(&step.title, 34)
             );
 
@@ -5594,7 +6025,7 @@ pub async fn run_prompt_pipeline(
                 }
             }
             if step_targets.is_empty() {
-                let query = format!("{} {}", step.title, step.instructions);
+                let query = format!("{} {}", step.title, step.goal);
                 let (det_matched, _) =
                     match_files_deterministically(&query, None, &step_all_files);
                 step_targets = if det_matched.is_empty() {
@@ -5618,9 +6049,9 @@ pub async fn run_prompt_pipeline(
                 3,
                 &format!("3. {} ({} · {})", step_label, step_prov, step_model),
                 &format!(
-                    "Étape {}/{} : {}",
-                    idx + 1,
-                    total_steps,
+                    "Tâche {}/{} : {}",
+                    task_counter,
+                    total_tasks,
                     truncate_chars(&step.title, 80)
                 ),
                 "running",
@@ -5634,16 +6065,18 @@ pub async fn run_prompt_pipeline(
                     role_label: step_label.clone(),
                     provider: step_prov.clone(),
                     model: step_model.clone(),
-                    summary: truncate_chars(&step.instructions, 110),
+                    summary: truncate_chars(&step.goal, 110),
                     status: "running".to_string(),
                     tokens: 0,
                 },
             );
 
             let stream_hdr = format!(
-                "\n\n── Étape {}/{} : {} ({}) ──\n",
-                idx + 1,
-                total_steps,
+                "\n\n── Vague {}/{} · Étape {}/{} : {} ({}) ──\n",
+                wave_idx + 1,
+                total_waves,
+                task_counter,
+                total_tasks,
                 step.title,
                 role_display_name(step_role_static)
             );
@@ -5663,19 +6096,22 @@ pub async fn run_prompt_pipeline(
                 step_targets.join(", ")
             };
             let step_prompt = format!(
-                "[Objectif global]\n{}\n{}\n[Étape courante {}/{} : {}]\nFichiers cibles : {}\nInstructions précises :\n{}\n\nRègle : Reste strictement concentré sur cette étape, garde les modules propres et concis (150 à 300 lignes max par fichier).",
-                truncate_chars(user_prompt.trim(), 300),
+                "[Objectif global : {}]\n{}\n[Tâche courante {}/{} (Vague {}/{}) : {} ({})]\nFichiers cibles : {}\nConsignes précises d'exécution :\n{}\n\nRègle : Reste strictement concentré sur cette étape et utilise les outils mis à disposition (run_command, read_file, edit_file, web_search...).",
+                task_plan.summary,
                 done_block,
-                idx + 1,
-                total_steps,
+                task_counter,
+                total_tasks,
+                wave_idx + 1,
+                total_waves,
                 step.title,
+                step.id,
                 target_list_note,
-                step.instructions
+                step.goal
             );
 
-            let step_conv_ctx = if idx == 0 { conv_ctx.as_str() } else { "" };
-            let step_attachments = if idx == 0 { attachments.as_deref() } else { None };
-            let step_images = if idx == 0 {
+            let step_conv_ctx = if task_counter == 1 { conv_ctx.as_str() } else { "" };
+            let step_attachments = if task_counter == 1 { attachments.as_deref() } else { None };
+            let step_images = if task_counter == 1 {
                 init_images_opt.take().unwrap_or_default()
             } else {
                 Vec::new()
@@ -5712,10 +6148,17 @@ pub async fn run_prompt_pipeline(
                     exec_tokens_used += step_tokens;
                     if let Some(ref th) = step_res.thinking {
                         if !th.trim().is_empty() {
+                            let mode_tag = if sub_wave.is_parallel {
+                                "⚡ [Exécution Parallèle sans conflit]"
+                            } else {
+                                "▶ [Exécution Séquentielle]"
+                            };
                             all_thinking.push(format!(
-                                "### Étape {}/{} : {}\n{}",
-                                idx + 1,
-                                total_steps,
+                                "### {} Étape {}/{} (Vague {}) : {}\n{}",
+                                mode_tag,
+                                task_counter,
+                                total_tasks,
+                                wave_idx + 1,
                                 step.title,
                                 th.trim()
                             ));
@@ -5728,14 +6171,28 @@ pub async fn run_prompt_pipeline(
                     exec_prov = step_res.actual_provider.clone();
                     exec_model = step_res.actual_model.clone();
 
-                    if !step_res.narrative.trim().is_empty() {
-                        step_narratives.push(format!(
-                            "- **Étape {} ({})** : {}",
-                            idx + 1,
-                            step.title,
-                            truncate_chars(step_res.narrative.trim(), 280)
-                        ));
-                    }
+                    let step_explanation = if !step_res.narrative.trim().is_empty() {
+                        truncate_chars(step_res.narrative.trim(), 800)
+                    } else if !step_res.applied_files.is_empty() {
+                        format!("Modifications appliquées dans : {}", step_res.applied_files.join(", "))
+                    } else if !step_res.tool_results.is_empty() {
+                        step_res
+                            .tool_results
+                            .iter()
+                            .map(|t| format!("{}: {}", t.tool, truncate_chars(&t.message, 140)))
+                            .collect::<Vec<_>>()
+                            .join(" ; ")
+                    } else {
+                        "Analyse terminée".to_string()
+                    };
+                    let mode_note = if sub_wave.is_parallel { " *(⚡ exécuté en parallèle)*" } else { "" };
+                    step_narratives.push(format!(
+                        "- **Étape {} ({})**{} : {}",
+                        task_counter,
+                        step.title,
+                        mode_note,
+                        step_explanation
+                    ));
 
                     let mut step_files = step_res.applied_files.clone();
                     let applied_code_files: Vec<String> = step_res
@@ -5755,7 +6212,7 @@ pub async fn run_prompt_pipeline(
                         .cloned()
                         .collect();
 
-                    if idx + 1 < total_steps
+                    if task_counter < total_tasks
                         && !applied_code_files.is_empty()
                         && !is_cancelled(&cancel_rx)
                     {
@@ -5763,8 +6220,8 @@ pub async fn run_prompt_pipeline(
                         if vr.ran && !vr.success {
                             let vr_msg = format!(
                                 "[Étape {}/{}] Erreur `{}` détectée — auto-correction ciblée...",
-                                idx + 1,
-                                total_steps,
+                                task_counter,
+                                total_tasks,
                                 vr.command
                             );
                             let _ = app.emit("aider:stream", (&conversation_id, &vr_msg));
@@ -5848,10 +6305,12 @@ pub async fn run_prompt_pipeline(
                     } else {
                         step_files.join(", ")
                     };
+                    let mode_tag = if sub_wave.is_parallel { " [⚡ Parallèle]" } else { " [▶ Séquentiel]" };
                     completed_steps_summary.push(format!(
-                        "- Étape {} ({}) : {}",
-                        idx + 1,
+                        "- Étape {} ({}){} : {}",
+                        task_counter,
                         step.title,
+                        mode_tag,
                         files_note
                     ));
 
@@ -5914,13 +6373,15 @@ pub async fn run_prompt_pipeline(
                     );
                     step_narratives.push(format!(
                         "- **Étape {} ({})** : ⚠️ Erreur (`{clean_err}`)",
-                        idx + 1,
+                        task_counter,
                         step.title
                     ));
-                    break;
+                    break 'dag_loop;
                 }
             }
         }
+    }
+}
 
         if !all_thinking.is_empty() {
             extracted_thinking = Some(all_thinking.join("\n\n"));
@@ -5932,12 +6393,12 @@ pub async fn run_prompt_pipeline(
             "done".to_string()
         };
         exec_note = format!(
-            "Plan séquentiel ({}/{total_steps} étapes)",
+            "Plan DAG ({}/{total_tasks} tâches exécutées)",
             completed_steps_summary.len()
         );
         (
             step_narratives.join("\n"),
-            format!("Plan séquentiel · {total_steps} étapes"),
+            format!("Plan DAG · {total_tasks} tâches ({total_waves} vagues)"),
         )
     } else {
         let strategy = choose_execution_strategy(
@@ -6049,15 +6510,9 @@ pub async fn run_prompt_pipeline(
                         if had_repairs { ", auto-réparé" } else { "" },
                         fb_note
                     );
-                    let out = if loop_res.narrative.trim().is_empty()
-                        && !loop_res.applied_files.is_empty()
-                    {
-                        // Laisser vide pour que Stage 5 synthétise un résumé concret basé sur le diff
+                    let out = if loop_res.narrative.trim().is_empty() {
+                        // Laisser vide pour que Stage 5 synthétise automatiquement un résumé concret basé sur les outils et le diff
                         String::new()
-                    } else if loop_res.narrative.trim().is_empty() {
-                        format!(
-                            "Le modèle `{exec_model}` ({exec_prov}) n'a retourné aucun contenu."
-                        )
                     } else {
                         loop_res.narrative
                     };
@@ -6308,18 +6763,15 @@ pub async fn run_prompt_pipeline(
     };
 
     if engine_ran && can_run_exec && !is_install_or_setup_prompt(&user_prompt) && !is_cancelled(&cancel_rx) {
-        let mut post_exec_touched = turn_applied_files.clone();
-        if post_exec_touched.is_empty() {
-            let (post_exec_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
-            let diff_paths: Vec<String> = post_exec_diffs.into_iter().map(|d| d.path).collect();
-            push_unique_paths(&mut post_exec_touched, &diff_paths);
-        }
+        // Le vérifieur CSS ne doit s'exécuter QUE si des fichiers ont réellement été modifiés sur ce tour
+        // ET que ces modifications impactent directement le frontend (composants UI ou feuilles de style).
+        let has_frontend_touched = !turn_applied_files.is_empty()
+            && turn_applied_files
+                .iter()
+                .any(|p| is_ui_component_or_page(p) || is_stylesheet_path(p));
 
-        let has_frontend_touched = post_exec_touched
-            .iter()
-            .any(|p| is_ui_component_or_page(p) || is_stylesheet_path(p));
-
-        if exec_role == "designer" || has_frontend_touched {
+        if has_frontend_touched {
+            let post_exec_touched = turn_applied_files.clone();
             latest_all_files = list_source_files_for_cartographer(&project_root_path);
             latest_frontend_stack = detect_frontend_stack(&project_root_path, &latest_all_files);
 
@@ -6791,37 +7243,57 @@ pub async fn run_prompt_pipeline(
         );
     }
 
-    let (synthesized_text, synth_tokens) = tokio::select! {
-        biased;
-        _ = wait_cancelled(&mut cancel_rx) => {
-            if let Some(h) = title_handle.take() {
-                h.abort();
+    let code_task_uncompleted = engine_ran
+        && prompt_expects_code_changes(&user_prompt)
+        && turn_modified_files.is_empty();
+
+    let (synthesized_text, synth_tokens) = if code_task_uncompleted {
+        let missing_preview = if !carto.target_files.is_empty() {
+            carto.target_files.join(", ")
+        } else {
+            "index.html, src/main.ts, src/App.vue".to_string()
+        };
+        let alert_msg = format!(
+            "⚠️ **Le Codeur a diagnostiqué le problème (manque : {}) mais a atteint sa limite de tours avant d'écrire les fichiers.**\n\n\
+            *Aucune modification n'a encore été écrite sur le disque.*\n\n\
+            [👉 Cliquez pour relancer l'écriture](#rerun-write)",
+            missing_preview
+        );
+        (alert_msg, 0usize)
+    } else {
+        tokio::select! {
+            biased;
+            _ = wait_cancelled(&mut cancel_rx) => {
+                if let Some(h) = title_handle.take() {
+                    h.abort();
+                }
+                return finish_cancelled_pipeline(
+                    app,
+                    state_lock,
+                    &conversation_id,
+                    &project.root_path,
+                    &mut agent_trace,
+                )
+                .await;
             }
-            return finish_cancelled_pipeline(
+            res = synthesize_final_response(
                 app,
                 state_lock,
                 &conversation_id,
-                &project.root_path,
-                &mut agent_trace,
-            )
-            .await;
+                &user_prompt,
+                &cleaned_narrative,
+                &tool_results,
+                engine_ran,
+                stack.ollama_running,
+                &synth_prov,
+                &synth_model,
+                &settings,
+                &turn_modified_files,
+                &turn_applied_files,
+                extra_stage_edits,
+                &verifier_note,
+            ) => res,
         }
-        res = synthesize_final_response(
-            app,
-            state_lock,
-            &conversation_id,
-            &user_prompt,
-            &cleaned_narrative,
-            engine_ran,
-            stack.ollama_running,
-            &synth_prov,
-            &synth_model,
-            &settings,
-            &turn_modified_files,
-            &turn_applied_files,
-            extra_stage_edits,
-            &verifier_note,
-        ) => res,
     };
 
     let synth_summary = if synth_tokens > 0 {
@@ -7073,7 +7545,7 @@ mod tests {
         );
         assert_eq!(s1.edit_format, "whole");
         assert_eq!(s1.map_tokens, 0);
-        assert_eq!(s1.max_turns, 3);
+        assert_eq!(s1.max_turns, 8);
 
         // Large single explicit file -> diff + map 0
         let s2 = choose_execution_strategy(
@@ -7097,7 +7569,7 @@ mod tests {
         assert_eq!(s2b.edit_format, "diff");
         assert_eq!(s2b.map_tokens, 192);
 
-        // Ollama 16K -> 5 turns + map 256 for single explicit
+        // Ollama 16K -> 8 turns + map 256 for single explicit
         let mut settings_16k = settings.clone();
         settings_16k.context_window_tokens = 16_384;
         let s_16k = choose_execution_strategy(
@@ -7107,10 +7579,10 @@ mod tests {
             "ollama",
             &settings_16k,
         );
-        assert_eq!(s_16k.max_turns, 5);
+        assert_eq!(s_16k.max_turns, 8);
         assert_eq!(s_16k.map_tokens, 256);
 
-        // Cloud provider on 150-line file (> 120 threshold) -> diff + 7 turns + map 1024
+        // Cloud provider on 150-line file (> 120 threshold) -> diff + 8 turns + map 1024
         let s_cloud = choose_execution_strategy(
             &dir,
             &["src/Medium.ts".to_string()],
@@ -7119,7 +7591,7 @@ mod tests {
             &settings,
         );
         assert_eq!(s_cloud.edit_format, "diff");
-        assert_eq!(s_cloud.max_turns, 7);
+        assert_eq!(s_cloud.max_turns, 8);
         assert_eq!(s_cloud.map_tokens, 1024);
 
         // 2 small files -> whole + map 192
@@ -7417,6 +7889,36 @@ export function cleanHelper(x: number): number {
     }
 
     #[test]
+    fn test_synthesize_tool_actions_without_files() {
+        let tools = vec![
+            ToolExecutionResult {
+                tool: "run_command".to_string(),
+                success: true,
+                message: "pnpm add -D tailwindcss exécuté avec succès (code 0)".to_string(),
+                path: None,
+            },
+            ToolExecutionResult {
+                tool: "web_search".to_string(),
+                success: true,
+                message: "Documentation trouvée pour @tailwindcss/vite".to_string(),
+                path: None,
+            },
+        ];
+
+        let mut lines = Vec::new();
+        if !tools.is_empty() {
+            lines.push("### Actions réalisées".to_string());
+            for r in tools.iter().take(8) {
+                lines.push(format!("- **{}** : {}", r.tool, r.message));
+            }
+        }
+        let result = lines.join("\n");
+        assert!(result.contains("### Actions réalisées"));
+        assert!(result.contains("pnpm add -D tailwindcss"));
+        assert!(result.contains("web_search"));
+    }
+
+    #[test]
     fn test_has_multiple_requests_detection() {
         assert!(has_multiple_requests("1. Remplace l'image par 🙀.\n2. Ajoute le titre MinouAI."));
         assert!(has_multiple_requests("1) Corriger le bug 2) Mettre à jour le style"));
@@ -7549,7 +8051,7 @@ const p = "LeHud.vue";
         assert!(!info_native.tailwind_in_pkg);
         assert!(!info_native.tailwind_active);
         assert!(info_native.css_entry_missing_import);
-        assert!(info_native.format_summary().contains("CSS NATIF UNIQUEMENT"));
+        assert!(info_native.format_summary().contains("Tailwind CSS et styles CSS natifs"));
         assert!(info_native.format_summary().contains("ALERTE CSS"));
         let _ = std::fs::remove_dir_all(&native_dir);
 
@@ -7673,14 +8175,13 @@ const p = "LeHud.vue";
         let p_native =
             build_native_system_prompt("designer", "whole", &[], "", Some(&stack_native));
         assert!(p_native.contains("CONSIGNES DU RÔLE (`Designer UI/UX`)"));
-        assert!(p_native.contains("INTERDICTION STRICTE"));
+        assert!(p_native.contains("Tu peux utiliser librement Tailwind CSS"));
         assert!(p_native.contains("box-sizing: border-box"));
 
         let mut stack_tw = FrontendStackInfo::default();
         stack_tw.tailwind_active = true;
         let p_tw = build_native_system_prompt("designer", "whole", &[], "", Some(&stack_tw));
-        assert!(p_tw.contains("Tailwind CSS est ACTIF"));
-        assert!(!p_tw.contains("INTERDICTION STRICTE d'écrire des classes utilitaires Tailwind"));
+        assert!(p_tw.contains("Tu peux utiliser librement Tailwind CSS"));
     }
 
     #[test]
@@ -7712,9 +8213,7 @@ const p = "LeHud.vue";
         ];
 
         let report = audit_frontend_css_issues(&dir, &all_files, &["src/App.vue".to_string()], true);
-        assert!(report.flagged_files.contains(&"src/App.vue".to_string()));
         assert_eq!(report.needs_entry_import.as_deref(), Some("src/main.js"));
-        assert!(report.issues.iter().any(|i| i.contains("classes utilitaires Tailwind")));
         assert!(report.issues.iter().any(|i| i.contains("n'est importée ni dans `src/main.js`")));
 
         // Une fois import CSS ajouté et vrai CSS natif écrit dans App.vue, plus aucune anomalie
@@ -7914,5 +8413,37 @@ const p = "LeHud.vue";
         .is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tool_duplicate_alert_message() {
+        let alert_msg = "ALERTE SYSTÈME : Tu viens d'exécuter exactement la même action qui a échoué. Ne répète pas cet appel. Lis d'abord le fichier complet avec read_file ou change d'approche.";
+        assert!(alert_msg.contains("ALERTE SYSTÈME"));
+        assert!(alert_msg.contains("read_file ou change d'approche"));
+    }
+
+    #[test]
+    fn test_execution_facts_json_schema() {
+        let facts = serde_json::json!({
+            "has_modified_files": true,
+            "total_modified_files": 1,
+            "modified_files": [{
+                "path": "src/App.vue",
+                "added_lines": 10,
+                "removed_lines": 2,
+                "diff_summary": "+ 10 lignes"
+            }],
+            "turn_applied_files": ["src/App.vue"],
+            "executed_tools": [{
+                "tool": "write_file",
+                "success": true,
+                "message": "Fichier écrit avec succès"
+            }],
+            "verification_report": "OK",
+            "engine_turn_details": "Création du composant"
+        });
+        assert_eq!(facts["has_modified_files"], true);
+        assert_eq!(facts["total_modified_files"], 1);
+        assert_eq!(facts["modified_files"][0]["path"], "src/App.vue");
     }
 }

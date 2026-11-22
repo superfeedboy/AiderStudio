@@ -115,7 +115,7 @@ impl IgnoreRules {
         ) {
             return true;
         }
-        if name.starts_with('.') && name != ".github" {
+        if name.starts_with('.') && name != ".github" && name != ".agents" && name != ".agent" {
             return true;
         }
         false
