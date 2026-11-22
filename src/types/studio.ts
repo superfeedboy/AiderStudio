@@ -8,6 +8,8 @@ export type ProviderId =
   | "anthropic"
   | "deepseek"
   | "openrouter"
+  | "groq"
+  | "cerebras"
   | "mistral";
 export type ExternalProviderId = Exclude<ProviderId, "ollama">;
 export type AgentRoleKey =
@@ -60,7 +62,6 @@ export interface AppSettings {
   theme: ThemePreference;
   ollamaUrl: string;
   ollamaModel: string;
-  aiderPath: string;
   autoStartOllama: boolean;
   contextWindowTokens?: number;
   aiderEditFormat?: AiderEditFormat;
@@ -99,7 +100,16 @@ export interface ModifiedFileDiff {
   added: number;
   removed: number;
   modified: number;
+  status?: "created" | "modified" | "deleted" | string | null;
   lines: DiffLine[];
+}
+
+export interface FileChangeSummary {
+  path: string;
+  added: number;
+  removed: number;
+  modified: number;
+  status?: "created" | "modified" | "deleted" | string | null;
 }
 
 export interface AttachedFile {
@@ -145,7 +155,12 @@ export interface ChatMessage {
   filesChanged?: number;
   linesAdded?: number;
   linesRemoved?: number;
+  filesSummary?: FileChangeSummary[];
+  turnDiffs?: ModifiedFileDiff[];
+  preTurnTree?: string | null;
   agentTrace?: AgentTraceStep[];
+  commitId?: string;
+  commitSummary?: string;
 }
 
 export interface Conversation {
@@ -222,9 +237,17 @@ export interface PromptStageEvent {
   status: "running" | "done" | "error";
 }
 
+export interface ToolApprovalRequest {
+  requestId: string;
+  conversationId: string;
+  tool: string;
+  title: string;
+  target: string;
+  reason?: string | null;
+}
+
 export interface StackStatus {
-  aiderInstalled: boolean;
-  aiderBin: string | null;
+  nativeEngineReady: boolean;
   ollamaInstalled: boolean;
   ollamaRunning: boolean;
   modelAvailable: boolean;
@@ -234,4 +257,12 @@ export interface StackStatus {
 export interface SendPromptResult {
   conversation: Conversation;
   project: Project;
+}
+
+export interface ProjectRuleItem {
+  name: string;
+  relativePath: string;
+  category: "root" | "frontend" | "backend" | "git" | "validation" | "custom" | string;
+  description: string;
+  content: string;
 }

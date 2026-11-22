@@ -10,12 +10,18 @@ import ProjectSettingsModal from "./components/ProjectSettingsModal.vue";
 import NewProjectModal from "./components/NewProjectModal.vue";
 import McpModal from "./components/McpModal.vue";
 import DeleteConvModal from "./components/DeleteConvModal.vue";
+import AppSplashLoader from "./components/AppSplashLoader.vue";
 
 const store = useStudioStore();
 const isResizingCode = ref(false);
+const isInitializing = ref(true);
 
-onMounted(() => {
-  void store.init();
+onMounted(async () => {
+  try {
+    await store.init();
+  } finally {
+    isInitializing.value = false;
+  }
 });
 
 onBeforeUnmount(() => {
@@ -95,6 +101,9 @@ function startResizeCode(ev: MouseEvent) {
     <NewProjectModal />
     <McpModal />
     <DeleteConvModal />
+
+    <!-- Splash Loader initial -->
+    <AppSplashLoader :loading="isInitializing" />
   </div>
 </template>
 

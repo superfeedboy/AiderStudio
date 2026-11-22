@@ -2,9 +2,14 @@ mod engine;
 mod git_diff;
 mod mcp;
 mod models;
+pub mod orchestrator;
+mod patcher;
 mod providers;
+mod repo_map;
 mod storage;
 mod telemetry;
+pub mod tools;
+pub mod workspace;
 
 use chrono::Utc;
 use models::{
@@ -93,6 +98,7 @@ async fn validate_provider_key(
             .filter(|b| !b.is_empty());
         slot.validated = true;
         slot.available_models = models;
+        providers::clear_provider_cooldown(&provider_id);
         slot.clone()
     } else {
         return Err(format!("Fournisseur inconnu : {provider_id}"));
@@ -121,17 +127,25 @@ async fn create_project(
     name: String,
     root_path: String,
     global_context: String,
+    init_rules: Option<bool>,
+    initial_prompt: Option<String>,
 ) -> Result<AppStateData, String> {
     let mut guard = state.0.lock().await;
     let now = Utc::now().to_rfc3339();
     let project_id = Uuid::new_v4().to_string();
     let conv_id = Uuid::new_v4().to_string();
 
+    let final_global_context = if global_context.trim().is_empty() {
+        initial_prompt.clone().unwrap_or_default()
+    } else {
+        global_context
+    };
+
     let project = Project {
         id: project_id.clone(),
         name: name.trim().to_string(),
         root_path: root_path.trim().to_string(),
-        global_context,
+        global_context: final_global_context,
         shared_directories: Vec::new(),
         updated_at: now.clone(),
     };
@@ -142,7 +156,7 @@ async fn create_project(
         title: "Nouvelle session".to_string(),
         conversation_context: String::new(),
         messages: Vec::new(),
-        artifacts: Vec::new(),
+        artifacts: vec![models::create_default_evolution_artifact(&now)],
         modified_files: Vec::new(),
         lines_added: 0,
         lines_removed: 0,
@@ -154,6 +168,16 @@ async fn create_project(
     guard.conversations.insert(0, conv);
     guard.active_project_id = Some(project_id);
     guard.active_conversation_id = Some(conv_id);
+
+    // Initialiser AGENTS.md et .agents/rules/ si demandé
+    if init_rules.unwrap_or(true) {
+        let _ = engine::init_project_agent_rules(
+            std::path::Path::new(&root_path),
+            &name,
+            initial_prompt.as_deref(),
+        )
+        .await;
+    }
 
     // Create recommended .aiderignore automatically to protect 8K context
     let _ = engine::ensure_aiderignore(std::path::Path::new(&root_path)).await;
@@ -232,7 +256,7 @@ async fn create_conversation(
             .unwrap_or_else(|| "Nouvelle session".to_string()),
         conversation_context: String::new(),
         messages: Vec::new(),
-        artifacts: Vec::new(),
+        artifacts: vec![models::create_default_evolution_artifact(&now)],
         modified_files: Vec::new(),
         lines_added: 0,
         lines_removed: 0,
@@ -460,6 +484,16 @@ async fn execute_local_tool(
 }
 
 #[tauri::command]
+async fn resolve_tool_approval(
+    app: AppHandle,
+    approvals: State<'_, tools::approval::PendingToolApprovals>,
+    request_id: String,
+    approved: bool,
+) -> Result<bool, String> {
+    Ok(tools::approval::resolve_and_emit(&approvals, &app, &request_id, approved).await)
+}
+
+#[tauri::command]
 async fn refresh_project_diff(
     state: State<'_, ManagedState>,
     conversation_id: String,
@@ -503,8 +537,9 @@ async fn undo_file_modification(
     state: State<'_, ManagedState>,
     conversation_id: String,
     file_path: String,
+    message_id: Option<String>,
 ) -> Result<Conversation, String> {
-    let project_root = {
+    let (project_root, step_tree) = {
         let guard = state.0.lock().await;
         let conv = guard
             .conversations
@@ -516,19 +551,47 @@ async fn undo_file_modification(
             .iter()
             .find(|p| p.id == conv.project_id)
             .ok_or_else(|| "Projet introuvable".to_string())?;
-        proj.root_path.clone()
+        let tree = message_id.as_deref().and_then(|mid| {
+            conv.messages
+                .iter()
+                .find(|m| m.id == mid)
+                .and_then(|m| m.pre_turn_tree.clone())
+        });
+        (proj.root_path.clone(), tree)
     };
 
-    git_diff::undo_file_modification(&project_root, &file_path).await?;
+    if let Some(ref tree_sha) = step_tree {
+        git_diff::undo_file_to_tree(&project_root, tree_sha, &file_path).await?;
+    } else {
+        git_diff::undo_file_modification(&project_root, &file_path).await?;
+    }
     let (modified_files, lines_added, lines_removed) =
         git_diff::collect_project_diffs(&project_root).await;
 
+    let norm_target = file_path.trim().trim_start_matches("./").replace('\\', "/");
     let mut guard = state.0.lock().await;
     let idx = guard
         .conversations
         .iter()
         .position(|c| c.id == conversation_id)
         .ok_or_else(|| "Conversation introuvable".to_string())?;
+    if let (Some(mid), Some(_)) = (message_id.as_deref(), step_tree.as_ref()) {
+        if let Some(msg) = guard.conversations[idx]
+            .messages
+            .iter_mut()
+            .find(|m| m.id == mid)
+        {
+            msg.turn_diffs.retain(|f| {
+                f.path.trim().trim_start_matches("./").replace('\\', "/") != norm_target
+            });
+            msg.files_summary.retain(|f| {
+                f.path.trim().trim_start_matches("./").replace('\\', "/") != norm_target
+            });
+            msg.files_changed = msg.files_summary.len().max(msg.turn_diffs.len());
+            msg.lines_added = msg.files_summary.iter().map(|f| f.added + f.modified).sum();
+            msg.lines_removed = msg.files_summary.iter().map(|f| f.removed + f.modified).sum();
+        }
+    }
     guard.conversations[idx].modified_files = modified_files;
     guard.conversations[idx].lines_added = lines_added;
     guard.conversations[idx].lines_removed = lines_removed;
@@ -543,8 +606,9 @@ async fn undo_file_modification(
 async fn undo_all_modifications(
     state: State<'_, ManagedState>,
     conversation_id: String,
+    message_id: Option<String>,
 ) -> Result<Conversation, String> {
-    let project_root = {
+    let (project_root, step_tree, step_paths) = {
         let guard = state.0.lock().await;
         let conv = guard
             .conversations
@@ -556,10 +620,29 @@ async fn undo_all_modifications(
             .iter()
             .find(|p| p.id == conv.project_id)
             .ok_or_else(|| "Projet introuvable".to_string())?;
-        proj.root_path.clone()
+        let step_info = message_id.as_deref().and_then(|mid| {
+            conv.messages.iter().find(|m| m.id == mid).and_then(|m| {
+                m.pre_turn_tree.as_ref().map(|tree| {
+                    let paths: Vec<String> = if !m.turn_diffs.is_empty() {
+                        m.turn_diffs.iter().map(|f| f.path.clone()).collect()
+                    } else {
+                        m.files_summary.iter().map(|f| f.path.clone()).collect()
+                    };
+                    (tree.clone(), paths)
+                })
+            })
+        });
+        match step_info {
+            Some((tree, paths)) => (proj.root_path.clone(), Some(tree), paths),
+            None => (proj.root_path.clone(), None, Vec::new()),
+        }
     };
 
-    git_diff::undo_all_modifications(&project_root).await?;
+    if let Some(ref tree_sha) = step_tree {
+        git_diff::undo_files_to_tree(&project_root, tree_sha, &step_paths).await?;
+    } else {
+        git_diff::undo_all_modifications(&project_root).await?;
+    }
     let (modified_files, lines_added, lines_removed) =
         git_diff::collect_project_diffs(&project_root).await;
 
@@ -569,6 +652,19 @@ async fn undo_all_modifications(
         .iter()
         .position(|c| c.id == conversation_id)
         .ok_or_else(|| "Conversation introuvable".to_string())?;
+    if let (Some(mid), Some(_)) = (message_id.as_deref(), step_tree.as_ref()) {
+        if let Some(msg) = guard.conversations[idx]
+            .messages
+            .iter_mut()
+            .find(|m| m.id == mid)
+        {
+            msg.turn_diffs.clear();
+            msg.files_summary.clear();
+            msg.files_changed = 0;
+            msg.lines_added = 0;
+            msg.lines_removed = 0;
+        }
+    }
     guard.conversations[idx].modified_files = modified_files;
     guard.conversations[idx].lines_added = lines_added;
     guard.conversations[idx].lines_removed = lines_removed;
@@ -787,6 +883,46 @@ async fn ensure_project_aiderignore(
     engine::ensure_aiderignore(std::path::Path::new(&proj.root_path)).await
 }
 
+#[tauri::command]
+async fn list_project_rules(
+    state: State<'_, ManagedState>,
+    project_id: Option<String>,
+) -> Result<Vec<engine::ProjectRuleItem>, String> {
+    let guard = state.0.lock().await;
+    let pid = project_id
+        .or_else(|| guard.active_project_id.clone())
+        .ok_or_else(|| "Aucun projet actif".to_string())?;
+    let proj = guard
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| "Projet introuvable".to_string())?;
+    Ok(engine::list_project_rules(std::path::Path::new(&proj.root_path)))
+}
+
+#[tauri::command]
+async fn init_project_agent_rules(
+    state: State<'_, ManagedState>,
+    project_id: Option<String>,
+    initial_prompt: Option<String>,
+) -> Result<Vec<String>, String> {
+    let guard = state.0.lock().await;
+    let pid = project_id
+        .or_else(|| guard.active_project_id.clone())
+        .ok_or_else(|| "Aucun projet actif".to_string())?;
+    let proj = guard
+        .projects
+        .iter()
+        .find(|p| p.id == pid)
+        .ok_or_else(|| "Projet introuvable".to_string())?;
+    engine::init_project_agent_rules(
+        std::path::Path::new(&proj.root_path),
+        &proj.name,
+        initial_prompt.as_deref(),
+    )
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -798,6 +934,7 @@ pub fn run() {
             app.manage(ActivePipelines(Arc::new(Mutex::new(
                 std::collections::HashMap::new(),
             ))));
+            app.manage(tools::approval::PendingToolApprovals::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -826,13 +963,16 @@ pub fn run() {
             pick_project_directory,
             list_project_files,
             execute_local_tool,
+            resolve_tool_approval,
             get_mcp_servers,
             save_mcp_server,
             delete_mcp_server,
             test_mcp_server,
             execute_mcp_tool,
             check_project_aiderignore,
-            ensure_project_aiderignore
+            ensure_project_aiderignore,
+            list_project_rules,
+            init_project_agent_rules
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

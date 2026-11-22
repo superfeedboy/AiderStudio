@@ -6,6 +6,8 @@ const store = useStudioStore();
 const name = ref("");
 const rootPath = ref("");
 const globalContext = ref("");
+const initRules = ref(true);
+const initialPrompt = ref("");
 const isPicking = ref(false);
 
 async function browseFolder() {
@@ -36,11 +38,15 @@ async function submit() {
   await store.createProject(
     name.value,
     rootPath.value,
-    globalContext.value
+    globalContext.value,
+    initRules.value,
+    initialPrompt.value
   );
   name.value = "";
   rootPath.value = "";
   globalContext.value = "";
+  initialPrompt.value = "";
+  initRules.value = true;
 }
 </script>
 
@@ -93,12 +99,32 @@ async function submit() {
           <label>Nom du projet</label>
           <input v-model="name" type="text" placeholder="Ex: MonAppVue" />
         </div>
+        <div class="field-checkbox">
+          <label class="checkbox-label">
+            <input v-model="initRules" type="checkbox" />
+            <span class="checkbox-text">
+              <strong>Initialiser AGENTS.md & structure .agents/rules/</strong>
+              <small>Génère les standards de code et directives IA adaptés à votre stack</small>
+            </span>
+          </label>
+        </div>
+        <div v-if="initRules" class="field">
+          <label>Prompt initial / Idée du projet (optionnel)</label>
+          <textarea
+            v-model="initialPrompt"
+            rows="2"
+            placeholder="Ex: Application desktop de streaming audio en Vue 3 et Tauri v2 avec SQLite..."
+          />
+          <span class="field-help">
+            L'IA utilisera ce prompt pour pré-remplir les règles et le fichier AGENTS.md.
+          </span>
+        </div>
         <div class="field">
-          <label>Contexte global initial</label>
+          <label>Contexte global additionnel (optionnel)</label>
           <textarea
             v-model="globalContext"
-            rows="3"
-            placeholder="Stack technique, conventions, architecture..."
+            rows="2"
+            placeholder="Directives spécifiques supplémentaires..."
           />
         </div>
       </div>
@@ -229,6 +255,43 @@ async function submit() {
 .field input:focus,
 .field textarea:focus {
   border-color: var(--accent);
+}
+
+.field-checkbox {
+  padding: 8px 10px;
+  background: var(--hover-bg);
+  border-radius: 9px;
+  border: 1px solid var(--border-subtle);
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.checkbox-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.checkbox-text small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.field-help {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
 }
 
 .modal-footer {

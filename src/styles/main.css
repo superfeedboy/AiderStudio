@@ -37,6 +37,17 @@
   --diff-add-bar: #10b981;
   --diff-del-bg: rgba(239, 68, 68, 0.22);
   --diff-del-bar: #ef4444;
+
+  /* Brand logo gradients (dark theme: white -> metallic grey) */
+  --vaix-chevron-1: #ffffff;
+  --vaix-chevron-2: #d1d5db;
+  --vaix-chevron-3: #8a94a3;
+  --vaix-studio-1: #ffffff;
+  --vaix-studio-2: #d1d5db;
+  --vaix-studio-3: #8a94a3;
+  --vaix-hex-1: #6ee7ff;
+  --vaix-hex-2: #538bf6;
+  --vaix-hex-3: #7c3aed;
 }
 
 /* Light theme */
@@ -65,6 +76,17 @@
   --diff-add-bar: #059669;
   --diff-del-bg: rgba(239, 68, 68, 0.16);
   --diff-del-bar: #dc2626;
+
+  /* Brand logo gradients (light theme: grey -> anthracite) */
+  --vaix-chevron-1: #b0b7c3;
+  --vaix-chevron-2: #5a6573;
+  --vaix-chevron-3: #1c252f;
+  --vaix-studio-1: #a6aeba;
+  --vaix-studio-2: #525d6b;
+  --vaix-studio-3: #18212b;
+  --vaix-hex-1: #38bdf8;
+  --vaix-hex-2: #4f7df3;
+  --vaix-hex-3: #7c3aed;
 }
 
 * {

@@ -1,8 +1,8 @@
 [package]
 name = "aider-studio"
 version = "0.1.0"
-description = "IDE desktop pair-programming avec Aider et Ollama (Vue 3 + Tauri v2 + Rust)"
-authors = ["AiderStudio"]
+description = "IDE desktop pair-programming IA & Multi-Agents (Vue 3 + Tauri v2 + Rust)"
+authors = ["vAIx STUDIO"]
 edition = "2021"
 
 [lib]

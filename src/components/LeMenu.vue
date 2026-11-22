@@ -1,9 +1,40 @@
 <script setup lang="ts">
+import { onBeforeUnmount, ref } from "vue";
 import { useStudioStore } from "../stores/studio";
 import type { Project } from "../types/studio";
 import AppLogo from "./AppLogo.vue";
+import VaixBrandLogo from "./VaixBrandLogo.vue";
 
 const store = useStudioStore();
+
+const isBrandShining = ref(false);
+let shineFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearShineFallbackTimer() {
+  if (shineFallbackTimer !== null) {
+    clearTimeout(shineFallbackTimer);
+    shineFallbackTimer = null;
+  }
+}
+
+function triggerBrandShine() {
+  if (isBrandShining.value) return;
+  isBrandShining.value = true;
+  clearShineFallbackTimer();
+  shineFallbackTimer = setTimeout(() => {
+    isBrandShining.value = false;
+    shineFallbackTimer = null;
+  }, 950);
+}
+
+function onBrandShineEnd() {
+  isBrandShining.value = false;
+  clearShineFallbackTimer();
+}
+
+onBeforeUnmount(() => {
+  clearShineFallbackTimer();
+});
 
 function handleDeleteProject(proj: Project) {
   const confirmMsg = `Voulez-vous vraiment supprimer le projet « ${proj.name} » ?\n(Les fichiers sur votre disque ne seront pas touchés, seules les sessions associées seront supprimées).`;
@@ -20,11 +51,19 @@ function handleDeleteProject(proj: Project) {
   >
     <div class="le-menu-top">
       <div class="brand-row">
-        <div class="brand-identity">
-          <div class="brand-icon-box">
-            <AppLogo :size="18" />
-          </div>
-          <span class="brand-name">AiderStudio</span>
+        <div
+          class="brand-identity"
+          title=">AIx STUDIO"
+          @mouseenter="triggerBrandShine"
+        >
+          <AppLogo :size="30" :shining="isBrandShining" class="brand-hex-icon" />
+          <VaixBrandLogo
+            layout="horizontal"
+            :height="13"
+            :shining="isBrandShining"
+            class="brand-vaix-logo"
+            @shine-end="onBrandShineEnd"
+          />
         </div>
         <button
           class="icon-btn"
@@ -136,12 +175,12 @@ function handleDeleteProject(proj: Project) {
           </span>
         </div>
         <div class="stack-row">
-          <span class="stack-label">Aider CLI</span>
+          <span class="stack-label">Moteur Natif</span>
           <span
             class="stack-status"
-            :class="store.stackStatus.aiderInstalled ? 'ok' : 'muted'"
+            :class="store.stackStatus.nativeEngineReady ? 'ok' : 'muted'"
           >
-            {{ store.stackStatus.aiderInstalled ? "Prêt" : "Non détecté" }}
+            {{ store.stackStatus.nativeEngineReady ? "Prêt" : "Indisponible" }}
           </span>
         </div>
         <button
@@ -216,27 +255,21 @@ function handleDeleteProject(proj: Project) {
 .brand-identity {
   display: flex;
   align-items: center;
+  flex: 1;
   gap: 8px;
   min-width: 0;
+  cursor: default;
 }
 
-.brand-icon-box {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: var(--active-bg);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.brand-hex-icon {
   flex-shrink: 0;
+  display: block;
 }
 
-.brand-name {
-  font-weight: 600;
-  font-size: 13.5px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.brand-vaix-logo {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .icon-btn {
@@ -247,6 +280,7 @@ function handleDeleteProject(proj: Project) {
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .icon-btn:hover {

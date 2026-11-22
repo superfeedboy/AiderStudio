@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { useStudioStore } from "../stores/studio";
+import type { DiffLine } from "../types/studio";
+import MarkdownInline from "./MarkdownInline.vue";
+import { tokenizeInline, type ResolvedFileTarget } from "../utils/markdownInline";
 
 const props = defineProps<{
   isResizing: boolean;
@@ -8,10 +11,50 @@ const props = defineProps<{
 
 const store = useStudioStore();
 const copied = ref(false);
+const diffViewerRef = ref<HTMLElement | null>(null);
 
 const conv = computed(() => store.activeConversation);
-const modifiedFiles = computed(() => conv.value?.modifiedFiles ?? []);
-const artifacts = computed(() => conv.value?.artifacts ?? []);
+const globalModifiedFiles = computed(() => conv.value?.modifiedFiles ?? []);
+const scopedMessage = computed(() =>
+  store.activeDiffMessageId
+    ? (conv.value?.messages.find((m) => m.id === store.activeDiffMessageId) ?? null)
+    : null
+);
+const isStepScope = computed(() =>
+  Boolean(scopedMessage.value && (scopedMessage.value.turnDiffs?.length ?? 0) > 0)
+);
+const modifiedFiles = computed(() =>
+  isStepScope.value
+    ? (scopedMessage.value?.turnDiffs ?? [])
+    : globalModifiedFiles.value
+);
+
+function switchToGlobalDiffScope() {
+  const currentPath = store.activeDiffFilePath;
+  store.activeDiffMessageId = null;
+  if (
+    currentPath &&
+    globalModifiedFiles.value.some((f) => f.path === currentPath)
+  ) {
+    store.activeDiffFilePath = currentPath;
+  } else {
+    store.activeDiffFilePath = globalModifiedFiles.value[0]?.path ?? null;
+  }
+}
+
+function isRealArtifact(art: { filePath?: string | null; title?: string; language?: string }): boolean {
+  const p = (art.filePath || art.title || "").toLowerCase();
+  if (/\.(vue|ts|tsx|js|jsx|rs|css|scss|html|json|py|toml|yaml|yml|sh|bash|sql)$/.test(p)) {
+    return false;
+  }
+  const lang = (art.language || "").toLowerCase();
+  if (["rust", "rs", "typescript", "ts", "javascript", "js", "vue", "python", "py", "css", "scss", "html", "json", "sh", "bash"].includes(lang)) {
+    return false;
+  }
+  return true;
+}
+
+const artifacts = computed(() => (conv.value?.artifacts ?? []).filter(isRealArtifact));
 
 const selectedFile = computed(() => {
   if (!modifiedFiles.value.length) return null;
@@ -35,8 +78,26 @@ const selectedArtifact = computed(() => {
   );
 });
 
+const diffAvailablePaths = computed(() => modifiedFiles.value.map((f) => f.path));
+
+const isMarkdownArtifact = computed(() => {
+  if (!selectedArtifact.value) return false;
+  const t = selectedArtifact.value.title.toLowerCase();
+  const l = selectedArtifact.value.language.toLowerCase();
+  const f = (selectedArtifact.value.filePath || "").toLowerCase();
+  return (
+    t.endsWith(".md") ||
+    t.endsWith(".markdown") ||
+    f.endsWith(".md") ||
+    f.endsWith(".markdown") ||
+    l === "markdown" ||
+    l === "md"
+  );
+});
+
 const isPreviewRenderable = computed(() => {
   if (!selectedArtifact.value) return false;
+  if (isMarkdownArtifact.value) return true;
   const t = selectedArtifact.value.title.toLowerCase();
   const l = selectedArtifact.value.language.toLowerCase();
   const c = selectedArtifact.value.content.trim().toLowerCase();
@@ -51,6 +112,128 @@ const isPreviewRenderable = computed(() => {
     c.startsWith("<svg")
   );
 });
+
+interface MarkdownBlock {
+  type: "h1" | "h2" | "h3" | "h4" | "p" | "ul" | "code" | "hr";
+  content?: string;
+  items?: string[];
+  lang?: string;
+}
+
+const parsedMarkdownBlocks = computed<MarkdownBlock[]>(() => {
+  if (!selectedArtifact.value) return [];
+  const lines = selectedArtifact.value.content.split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let inCodeBlock = false;
+  let codeBuffer: string[] = [];
+  let codeLang = "";
+  let listBuffer: string[] = [];
+  let pBuffer: string[] = [];
+
+  function flushList() {
+    if (listBuffer.length > 0) {
+      blocks.push({ type: "ul", items: [...listBuffer] });
+      listBuffer = [];
+    }
+  }
+
+  function flushParagraph() {
+    if (pBuffer.length > 0) {
+      blocks.push({ type: "p", content: pBuffer.join(" ") });
+      pBuffer = [];
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i];
+    const line = rawLine.trim();
+
+    if (line.startsWith("```")) {
+      flushParagraph();
+      flushList();
+      if (!inCodeBlock) {
+        inCodeBlock = true;
+        codeLang = line.slice(3).trim();
+        codeBuffer = [];
+      } else {
+        inCodeBlock = false;
+        blocks.push({ type: "code", content: codeBuffer.join("\n"), lang: codeLang });
+        codeBuffer = [];
+        codeLang = "";
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeBuffer.push(rawLine);
+      continue;
+    }
+
+    if (!line) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    if (line === "---" || line === "***") {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "hr" });
+      continue;
+    }
+
+    if (line.startsWith("# ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h1", content: line.slice(2).trim() });
+      continue;
+    }
+
+    if (line.startsWith("## ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h2", content: line.slice(3).trim() });
+      continue;
+    }
+
+    if (line.startsWith("### ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h3", content: line.slice(4).trim() });
+      continue;
+    }
+
+    if (line.startsWith("#### ")) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "h4", content: line.slice(5).trim() });
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      flushParagraph();
+      listBuffer.push(line.replace(/^[-*]\s+/, ""));
+      continue;
+    }
+
+    flushList();
+    pBuffer.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+  if (inCodeBlock && codeBuffer.length > 0) {
+    blocks.push({ type: "code", content: codeBuffer.join("\n"), lang: codeLang });
+  }
+
+  return blocks;
+});
+
+function handleOpenFileFromArtifact(target: ResolvedFileTarget) {
+  store.codeMode = "review";
+  store.activeDiffFilePath = target.path;
+  store.codeOpen = true;
+}
 
 const isSvg = computed(() => {
   if (!selectedArtifact.value) return false;
@@ -104,21 +287,83 @@ async function copyArtifact() {
 }
 
 async function confirmUndoFile(filePath: string) {
+  const stepMsgId = isStepScope.value ? (scopedMessage.value?.id ?? null) : null;
+  const stepLabel = scopedMessage.value?.commitId || "cette étape";
   const ok = window.confirm(
-    `Voulez-vous annuler toutes les modifications apportées au fichier "${filePath}" et le restaurer dans son état d'origine ?`
+    stepMsgId
+      ? `Voulez-vous restaurer "${filePath}" tel qu'il était avant ${stepLabel} ?`
+      : `Voulez-vous annuler toutes les modifications apportées au fichier "${filePath}" et le restaurer dans son état d'origine ?`
   );
   if (!ok) return;
-  await store.undoFile(filePath);
+  await store.undoFile(filePath, undefined, stepMsgId);
 }
 
 async function confirmUndoAll() {
+  const stepMsgId = isStepScope.value ? (scopedMessage.value?.id ?? null) : null;
+  const stepLabel = scopedMessage.value?.commitId || "cette étape";
   const count = modifiedFiles.value.length;
   const ok = window.confirm(
-    `Voulez-vous annuler TOUTES les modifications (${count} fichier${count > 1 ? "s" : ""}) et restaurer le projet dans son état d'origine ?\nCette action est irréversible.`
+    stepMsgId
+      ? `Voulez-vous annuler TOUTES les modifications de ${stepLabel} (${count} fichier${count > 1 ? "s" : ""}) et restaurer ces fichiers à leur état précédant cette étape ?\nCette action est irréversible.`
+      : `Voulez-vous annuler TOUTES les modifications (${count} fichier${count > 1 ? "s" : ""}) et restaurer le projet dans son état d'origine ?\nCette action est irréversible.`
   );
   if (!ok) return;
-  await store.undoAll();
+  await store.undoAll(undefined, stepMsgId);
 }
+
+function selectDiffFile(filePath: string) {
+  store.activeDiffTargetLine = null;
+  store.activeDiffFilePath = filePath;
+}
+
+function isTargetDiffLine(line: DiffLine): boolean {
+  if (!store.activeDiffTargetLine) return false;
+  return (line.newLine ?? line.oldLine ?? null) === store.activeDiffTargetLine;
+}
+
+watch(
+  [
+    () => selectedFile.value?.path,
+    () => store.activeDiffTargetLine,
+    () => store.codeOpen,
+    () => store.codeMode,
+  ],
+  async ([nextPath, targetLine, isOpen, mode], [prevPath]) => {
+    if (!isOpen || mode !== "review" || !nextPath) return;
+    await nextTick();
+    const viewer = diffViewerRef.value;
+    if (!viewer) return;
+
+    if (targetLine && targetLine > 0) {
+      const lineNodes = Array.from(
+        viewer.querySelectorAll<HTMLElement>(".diff-line[data-line]")
+      );
+      let bestEl: HTMLElement | null = null;
+      let bestDelta = Number.POSITIVE_INFINITY;
+      for (const el of lineNodes) {
+        const ln = Number(el.dataset.line);
+        if (!Number.isFinite(ln)) continue;
+        const delta = Math.abs(ln - targetLine);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          bestEl = el;
+          if (delta === 0) break;
+        }
+      }
+      if (bestEl) {
+        const viewerRect = viewer.getBoundingClientRect();
+        const lineRect = bestEl.getBoundingClientRect();
+        const relTop = lineRect.top - viewerRect.top + viewer.scrollTop;
+        viewer.scrollTop = Math.max(0, relTop - viewer.clientHeight / 3);
+        return;
+      }
+    }
+
+    if (nextPath !== prevPath) {
+      viewer.scrollTop = 0;
+    }
+  }
+);
 </script>
 
 <template>
@@ -149,7 +394,7 @@ async function confirmUndoAll() {
         <button
           v-if="store.codeMode === 'review' && modifiedFiles.length > 0"
           class="undo-all-header-btn"
-          title="Tout défaire : annuler toutes les modifications apportées aux fichiers"
+          :title="isStepScope ? 'Annuler uniquement les modifications de cette étape' : 'Tout défaire : annuler toutes les modifications apportées aux fichiers'"
           @click="confirmUndoAll"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
@@ -177,6 +422,19 @@ async function confirmUndoAll() {
 
     <!-- MODE 1: MODIFIED FILES REVIEW (Blue = modified, Green = added, Red = deleted) -->
     <div v-if="store.codeMode === 'review'" class="code-body">
+      <div v-if="isStepScope" class="review-scope-bar">
+        <span class="scope-pill active">
+          Étape {{ scopedMessage?.commitId || "courante" }} ({{ modifiedFiles.length }})
+        </span>
+        <button
+          type="button"
+          class="scope-switch-btn"
+          title="Afficher le diff complet par rapport au dernier commit Git (HEAD)"
+          @click="switchToGlobalDiffScope"
+        >
+          Voir diff global HEAD ({{ globalModifiedFiles.length }})
+        </button>
+      </div>
       <div v-if="modifiedFiles.length === 0" class="empty-code">
         <p>Aucun fichier modifié détecté dans le dépôt Git pour le moment.</p>
         <button class="refresh-pill" @click="store.refreshDiff()">
@@ -192,7 +450,7 @@ async function confirmUndoAll() {
             class="file-row has-tooltip"
             :class="{ selected: selectedFile?.path === file.path }"
             :title="fullPathFor(file.path)"
-            @click="store.activeDiffFilePath = file.path"
+            @click="selectDiffFile(file.path)"
           >
             <span class="file-path">{{ file.path }}</span>
             <div class="file-row-actions">
@@ -239,12 +497,16 @@ async function confirmUndoAll() {
           </button>
         </div>
 
-        <div v-if="selectedFile" class="diff-viewer custom-scroll">
+        <div v-if="selectedFile" ref="diffViewerRef" class="diff-viewer custom-scroll">
           <div
             v-for="(line, idx) in selectedFile.lines"
             :key="idx"
             class="diff-line"
-            :class="`diff-line--${line.kind}`"
+            :data-line="line.newLine ?? line.oldLine ?? undefined"
+            :class="[
+              `diff-line--${line.kind}`,
+              { 'diff-line--target': isTargetDiffLine(line) },
+            ]"
           >
             <span class="ln-num">{{ line.newLine ?? line.oldLine ?? "" }}</span>
             <span class="ln-prefix">
@@ -314,12 +576,71 @@ async function confirmUndoAll() {
             </div>
           </div>
 
-          <!-- Rendu interprété (ex: HTML, SVG) -->
+          <!-- Rendu interprété (ex: HTML, SVG, Markdown) -->
           <div
             v-if="isPreviewRenderable && artifactRenderMode === 'preview'"
             class="artifact-preview-container"
           >
             <div v-if="isSvg" class="rendered-svg-wrap" v-html="selectedArtifact.content" />
+            <div
+              v-else-if="isMarkdownArtifact"
+              class="artifact-markdown-view custom-scroll"
+            >
+              <template v-for="(block, bIdx) in parsedMarkdownBlocks" :key="bIdx">
+                <h1 v-if="block.type === 'h1'" class="art-h1">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h1>
+                <h2 v-else-if="block.type === 'h2'" class="art-h2">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h2>
+                <h3 v-else-if="block.type === 'h3'" class="art-h3">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h3>
+                <h4 v-else-if="block.type === 'h4'" class="art-h4">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </h4>
+                <ul v-else-if="block.type === 'ul'" class="art-ul">
+                  <li v-for="(item, iIdx) in block.items" :key="iIdx" class="art-li">
+                    <MarkdownInline
+                      :tokens="tokenizeInline(item)"
+                      :available-paths="diffAvailablePaths"
+                      :project-root="store.activeProject?.rootPath"
+                      @open-file="handleOpenFileFromArtifact"
+                    />
+                  </li>
+                </ul>
+                <pre v-else-if="block.type === 'code'" class="art-code-block"><code>{{ block.content }}</code></pre>
+                <hr v-else-if="block.type === 'hr'" class="art-hr" />
+                <p v-else-if="block.type === 'p'" class="art-p">
+                  <MarkdownInline
+                    :tokens="tokenizeInline(block.content || '')"
+                    :available-paths="diffAvailablePaths"
+                    :project-root="store.activeProject?.rootPath"
+                    @open-file="handleOpenFileFromArtifact"
+                  />
+                </p>
+              </template>
+            </div>
             <iframe
               v-else
               class="rendered-html-iframe"
@@ -689,6 +1010,11 @@ async function confirmUndoAll() {
   border-left-color: var(--diff-del-bar);
 }
 
+.diff-line--target {
+  box-shadow: inset 0 0 0 1px rgba(129, 140, 248, 0.65);
+  background: rgba(129, 140, 248, 0.16);
+}
+
 .ln-num {
   width: 34px;
   flex-shrink: 0;
@@ -767,7 +1093,7 @@ async function confirmUndoAll() {
   min-height: 0;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: #ffffff;
+  background: var(--surface-base, #0f172a);
   overflow: hidden;
   display: flex;
 }
@@ -820,5 +1146,131 @@ async function confirmUndoAll() {
   font-family: var(--font-code), ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12.5px;
   line-height: 1.5;
+}
+
+/* Vue interprétée Markdown pour les artefacts (Journal d'évolution, etc.) */
+.artifact-markdown-view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  background: var(--surface-base, #0f172a);
+  color: #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.art-h1 {
+  font-size: 18px;
+  font-weight: 700;
+  color: #ffffff;
+  margin: 0 0 4px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.art-h2 {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: #f1f5f9;
+  margin: 12px 0 2px 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.art-h3 {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #cbd5e1;
+  margin: 6px 0 2px 0;
+}
+
+.art-h4 {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #94a3b8;
+  margin: 4px 0 2px 0;
+}
+
+.art-p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #cbd5e1;
+}
+
+.art-ul {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.art-li {
+  font-size: 13px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+
+.art-code-block {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: var(--font-code);
+  font-size: 12px;
+  color: #e2e8f0;
+  overflow-x: auto;
+  margin: 4px 0;
+}
+
+.art-hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  margin: 10px 0;
+}
+
+.review-scope-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.scope-pill {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.scope-switch-btn {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.scope-switch-btn:hover {
+  color: var(--text-main);
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.05);
 }
 </style>

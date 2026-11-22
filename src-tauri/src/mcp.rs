@@ -39,7 +39,7 @@ pub async fn list_tools_for_server(
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {
-                "name": "AiderStudio",
+                "name": "vAIx STUDIO",
                 "version": "0.1.0"
             }
         }
@@ -152,7 +152,7 @@ pub async fn call_tool_for_server(
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {
-                "name": "AiderStudio",
+                "name": "vAIx STUDIO",
                 "version": "0.1.0"
             }
         }

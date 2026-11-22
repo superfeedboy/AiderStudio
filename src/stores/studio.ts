@@ -10,18 +10,21 @@ import type {
   AppSettings,
   AppStateData,
   AttachedFile,
+  ChatMessage,
   CodeDrawerMode,
   Conversation,
   HardwareTelemetry,
   McpServerConfig,
   McpToolInfo,
   Project,
+  ProjectRuleItem,
   PromptStageEvent,
   ProviderConfig,
   SendPromptResult,
   StackStatus,
   ThemePreference,
   TokenUsageEvent,
+  ToolApprovalRequest,
   ToolExecutionResult,
 } from "../types/studio";
 
@@ -37,8 +40,8 @@ export function defaultProvidersList(): ProviderConfig[] {
       baseUrl: null,
       validated: false,
       availableModels: [
-        "gemini-2.5-pro",
         "gemini-2.5-flash",
+        "gemini-2.5-pro",
         "gemini-2.0-flash",
       ],
       dailyTokenLimit: 500000,
@@ -81,10 +84,41 @@ export function defaultProvidersList(): ProviderConfig[] {
       baseUrl: null,
       validated: false,
       availableModels: [
+        "deepseek/deepseek-r1:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "qwen/qwen3-coder:free",
+        "google/gemini-2.0-flash-exp:free",
         "anthropic/claude-sonnet-4",
         "google/gemini-2.5-flash",
         "deepseek/deepseek-chat-v3-0324",
         "qwen/qwen-2.5-coder-32b-instruct",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "groq",
+      name: "Groq",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+        "moonshotai/kimi-k2-instruct",
+        "llama-3.1-8b-instant",
+      ],
+      dailyTokenLimit: 500000,
+    },
+    {
+      id: "cerebras",
+      name: "Cerebras",
+      apiKey: "",
+      baseUrl: null,
+      validated: false,
+      availableModels: [
+        "qwen-3-235b-a22b",
+        "llama-3.3-70b",
+        "qwen-3-32b",
       ],
       dailyTokenLimit: 500000,
     },
@@ -120,7 +154,6 @@ const defaultSettings: AppSettings = {
   theme: "system",
   ollamaUrl: "http://127.0.0.1:11434",
   ollamaModel: "qwen2.5-coder:3b",
-  aiderPath: "aider",
   autoStartOllama: true,
   aiderEditFormat: "auto",
   activeTarget: "agent",
@@ -146,8 +179,7 @@ export const useStudioStore = defineStore("studio", () => {
   });
 
   const stackStatus = ref<StackStatus>({
-    aiderInstalled: false,
-    aiderBin: null,
+    nativeEngineReady: true,
     ollamaInstalled: false,
     ollamaRunning: false,
     modelAvailable: false,
@@ -161,7 +193,10 @@ export const useStudioStore = defineStore("studio", () => {
   const codeMode = ref<CodeDrawerMode>("review");
   const codeWidth = ref<number>(420);
   const activeDiffFilePath = ref<string | null>(null);
+  const activeDiffMessageId = ref<string | null>(null);
+  const activeDiffTargetLine = ref<number | null>(null);
   const activeArtifactId = ref<string | null>(null);
+  const targetScrollMsgId = ref<string>("");
 
   // Screen aspect ratio & ultra-wide 50/50 detection (ratio > standard 16:9, e.g. ratio >= 2.05 & width >= 1550)
   const isWideScreen = ref<boolean>(false);
@@ -201,6 +236,7 @@ export const useStudioStore = defineStore("studio", () => {
   const liveThinking = ref<string>("");
   const liveContent = ref<string>("");
   const liveAgentTrace = ref<AgentTraceStep[]>([]);
+  const pendingToolApprovals = ref<ToolApprovalRequest[]>([]);
 
   // System dark/light tracking
   const systemPrefersLight = ref<boolean>(
@@ -404,6 +440,8 @@ export const useStudioStore = defineStore("studio", () => {
       anthropic: "Claude",
       deepseek: "DeepSeek",
       openrouter: "OpenRouter",
+      groq: "Groq",
+      cerebras: "Cerebras",
       mistral: "Mistral",
     };
     return {
@@ -572,6 +610,22 @@ export const useStudioStore = defineStore("studio", () => {
         }
       });
 
+      await listen<ToolApprovalRequest>("aider:tool_approval_request", (event) => {
+        const req = event.payload;
+        if (!req || !req.requestId) return;
+        if (!pendingToolApprovals.value.some((item) => item.requestId === req.requestId)) {
+          pendingToolApprovals.value = [...pendingToolApprovals.value, req];
+        }
+      });
+
+      await listen<[string, boolean]>("aider:tool_approval_resolved", (event) => {
+        const [requestId] = event.payload || [];
+        if (!requestId) return;
+        pendingToolApprovals.value = pendingToolApprovals.value.filter(
+          (item) => item.requestId !== requestId
+        );
+      });
+
       await Promise.all([refreshTelemetry(), refreshStackStatus()]);
 
       telemetryTimer = window.setInterval(() => {
@@ -587,10 +641,10 @@ export const useStudioStore = defineStore("studio", () => {
         projects: [
           {
             id: pid,
-            name: "AiderStudio",
+            name: "vAIx STUDIO",
             rootPath: "/Users/gilles/Documents/Dev/AiderStudio",
             globalContext:
-              "Application Tauri v2 + Vue 3 + Rust orchestrant Aider & Ollama.",
+              "Application Tauri v2 + Vue 3 + Rust avec moteur natif multi-agents (Ollama & fournisseurs cloud).",
             updatedAt: now,
           },
         ],
@@ -767,17 +821,49 @@ export const useStudioStore = defineStore("studio", () => {
   async function createProject(
     name: string,
     rootPath: string,
-    globalContext: string
+    globalContext: string,
+    initRules: boolean = true,
+    initialPrompt: string = ""
   ) {
     if (isTauri()) {
       const next = await invoke<AppStateData>("create_project", {
         name,
         rootPath,
         globalContext,
+        initRules,
+        initialPrompt,
       });
       applyStateData(next);
     }
     newProjectModalOpen.value = false;
+  }
+
+  async function listProjectRules(projectId?: string): Promise<ProjectRuleItem[]> {
+    if (!isTauri()) return [];
+    try {
+      return await invoke<ProjectRuleItem[]>("list_project_rules", {
+        projectId: projectId ?? activeProjectId.value,
+      });
+    } catch (e) {
+      console.warn("Impossible de lister les règles projet:", e);
+      return [];
+    }
+  }
+
+  async function initProjectRules(
+    projectId?: string,
+    initialPrompt?: string
+  ): Promise<string[]> {
+    if (!isTauri()) return [];
+    try {
+      return await invoke<string[]>("init_project_agent_rules", {
+        projectId: projectId ?? activeProjectId.value,
+        initialPrompt,
+      });
+    } catch (e) {
+      console.warn("Impossible d'initialiser les règles projet:", e);
+      return [];
+    }
   }
 
   function openProjectSettings(project?: Project | null) {
@@ -832,6 +918,7 @@ export const useStudioStore = defineStore("studio", () => {
         projectId,
         title: title ?? null,
       });
+      activeDiffMessageId.value = null;
       applyStateData(next);
     }
   }
@@ -840,6 +927,7 @@ export const useStudioStore = defineStore("studio", () => {
     activeProjectId.value = projectId;
     activeConversationId.value = conversationId;
     activeDiffFilePath.value = null;
+    activeDiffMessageId.value = null;
     activeArtifactId.value = null;
     if (isTauri()) {
       await invoke("select_conversation", { projectId, conversationId });
@@ -1028,40 +1116,89 @@ export const useStudioStore = defineStore("studio", () => {
     if (convIdx === -1) return;
 
     const targetConv = conversations.value[convIdx];
-    if (targetConv.messages.length <= 1) return;
 
-    const olderMessages = targetConv.messages.slice(0, Math.max(1, targetConv.messages.length - 2));
-    const recentMessages = targetConv.messages.slice(Math.max(1, targetConv.messages.length - 2));
-
-    const summaryBulletPoints = olderMessages
+    const userPrompts = targetConv.messages
       .filter((m) => m.role === "user")
-      .map((m) => `• ${m.content.slice(0, 100).replace(/\n/g, " ")}`)
-      .join("\n");
+      .map((m) => `• ${m.content.slice(0, 100).replace(/\n/g, " ")}`);
 
-    const compactNotice = `[Session compactée - Mémoire libérée]\nHistorique résumé:\n${summaryBulletPoints}`;
+    const summaryText =
+      userPrompts.length > 0
+        ? `[Session compactée (${userPrompts.length} échanges)]\n${userPrompts.slice(-5).join("\n")}`
+        : "[Mémoire de session réinitialisée]";
 
-    targetConv.conversationContext = targetConv.conversationContext
-      ? `${targetConv.conversationContext}\n\n${compactNotice}`
-      : compactNotice;
+    targetConv.conversationContext = summaryText;
+
+    // Réinitialiser les compteurs de tokens pour le HUD
+    delete conversationTokenSteps.value[cid];
+    delete conversationTokenUsage.value[cid];
+    delete conversationPeakTokens.value[cid];
 
     const now = new Date().toISOString();
-    targetConv.messages = [
-      {
-        id: "compact-" + Date.now(),
-        role: "assistant",
-        content: `🧹 **Contexte compacté (/compact)** : La mémoire de conversation a été résumée et compactée. L'espace de la fenêtre de contexte a été libéré avec succès tout en conservant les acquis du projet.`,
-        stageSummary: "Nettoyage contexte (/compact)",
-        createdAt: now,
-        filesChanged: 0,
-        linesAdded: 0,
-        linesRemoved: 0,
-      },
-      ...recentMessages,
-    ];
+    targetConv.messages.push({
+      id: "compact-" + Date.now(),
+      role: "assistant",
+      content: `🧹 **Contexte compacté (/compact)** : La mémoire de travail LLM a été allégée avec succès. L'historique et les directives du projet restent intacts.`,
+      stageSummary: "Nettoyage contexte (/compact)",
+      createdAt: now,
+      filesChanged: 0,
+      linesAdded: 0,
+      linesRemoved: 0,
+    });
     targetConv.updatedAt = now;
 
     if (isTauri()) {
-      await invoke("save_settings", { settings: settings.value });
+      try {
+        await invoke("update_conversation_context", {
+          conversationId: targetConv.id,
+          conversationContext: targetConv.conversationContext,
+        });
+      } catch (e) {
+        console.warn("Erreur sauvegarde compactage:", e);
+      }
+    }
+  }
+
+  async function clearConversation(conversationId?: string) {
+    const cid = conversationId || activeConversationId.value;
+    if (!cid) return;
+    const convIdx = conversations.value.findIndex((c) => c.id === cid);
+    if (convIdx === -1) return;
+
+    const targetConv = conversations.value[convIdx];
+    const now = new Date().toISOString();
+    targetConv.messages = [];
+    targetConv.conversationContext = "";
+    delete conversationTokenSteps.value[cid];
+    delete conversationTokenUsage.value[cid];
+    delete conversationPeakTokens.value[cid];
+    if (activeConversationId.value === cid) {
+      activeDiffFilePath.value = null;
+      activeDiffMessageId.value = null;
+    }
+    targetConv.updatedAt = now;
+
+    if (isTauri()) {
+      try {
+        await invoke("update_conversation_context", {
+          conversationId: targetConv.id,
+          conversationContext: "",
+        });
+      } catch (e) {
+        console.warn("Erreur réinitialisation conversation:", e);
+      }
+    }
+  }
+
+  async function resolveToolApproval(requestId: string, approved: boolean) {
+    pendingToolApprovals.value = pendingToolApprovals.value.filter(
+      (item) => item.requestId !== requestId
+    );
+    if (isTauri()) {
+      try {
+        await invoke("resolve_tool_approval", { requestId, approved });
+      } catch {
+        // Ignore if request already expired or pipeline cancelled
+      }
     }
   }
 
@@ -1084,6 +1221,9 @@ export const useStudioStore = defineStore("studio", () => {
     isProcessing.value = true;
     isCancelling.value = false;
     processingConversationId.value = conv.id;
+    pendingToolApprovals.value = pendingToolApprovals.value.filter(
+      (item) => item.conversationId !== conv.id
+    );
     const nextPeak = { ...conversationPeakTokens.value };
     delete nextPeak[conv.id];
     conversationPeakTokens.value = nextPeak;
@@ -1103,6 +1243,19 @@ export const useStudioStore = defineStore("studio", () => {
       detail: "Initialisation du pipeline multi-agents...",
       status: "running",
     };
+
+    // Affichage optimiste immédiat du prompt utilisateur pour qu'il reste visible pendant la réflexion
+    const tempUserMsgId = `optimistic-user-${Date.now()}`;
+    const optimisticMsg: ChatMessage = {
+      id: tempUserMsgId,
+      role: "user",
+      content: prompt.trim(),
+      thinking: null,
+      attachments: hasAttachments ? attachments : undefined,
+      createdAt: new Date().toISOString(),
+      stageSummary: null,
+    };
+    conv.messages = [...conv.messages, optimisticMsg];
 
     try {
       if (isTauri()) {
@@ -1142,6 +1295,9 @@ export const useStudioStore = defineStore("studio", () => {
       isCancelling.value = false;
       processingConversationId.value = null;
       liveAgentTrace.value = [];
+      pendingToolApprovals.value = pendingToolApprovals.value.filter(
+        (item) => item.conversationId !== conv.id
+      );
       void refreshStackStatus();
     }
   }
@@ -1159,27 +1315,50 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  async function undoFile(filePath: string, conversationId?: string): Promise<boolean> {
+  async function undoFile(
+    filePath: string,
+    conversationId?: string,
+    messageId?: string | null
+  ): Promise<boolean> {
     const cid = conversationId || activeConversationId.value;
     if (!cid) return false;
     if (!isTauri()) {
       // Mock for browser dev mode
       const idx = conversations.value.findIndex((c) => c.id === cid);
       if (idx !== -1) {
-        conversations.value[idx].modifiedFiles = conversations.value[idx].modifiedFiles.filter(
-          (f) => f.path !== filePath
-        );
-        conversations.value[idx].linesAdded = conversations.value[idx].modifiedFiles.reduce(
-          (sum, f) => sum + f.added + f.modified,
-          0
-        );
-        conversations.value[idx].linesRemoved = conversations.value[idx].modifiedFiles.reduce(
-          (sum, f) => sum + f.removed + f.modified,
-          0
-        );
+        if (messageId) {
+          const msg = conversations.value[idx].messages.find((m) => m.id === messageId);
+          if (msg) {
+            msg.turnDiffs = (msg.turnDiffs ?? []).filter((f) => f.path !== filePath);
+            msg.filesSummary = (msg.filesSummary ?? []).filter((f) => f.path !== filePath);
+            msg.filesChanged = msg.turnDiffs.length;
+            msg.linesAdded = msg.turnDiffs.reduce((sum, f) => sum + f.added + f.modified, 0);
+            msg.linesRemoved = msg.turnDiffs.reduce((sum, f) => sum + f.removed + f.modified, 0);
+          }
+        } else {
+          conversations.value[idx].modifiedFiles = conversations.value[idx].modifiedFiles.filter(
+            (f) => f.path !== filePath
+          );
+          conversations.value[idx].linesAdded = conversations.value[idx].modifiedFiles.reduce(
+            (sum, f) => sum + f.added + f.modified,
+            0
+          );
+          conversations.value[idx].linesRemoved = conversations.value[idx].modifiedFiles.reduce(
+            (sum, f) => sum + f.removed + f.modified,
+            0
+          );
+        }
       }
       if (activeDiffFilePath.value === filePath) {
-        activeDiffFilePath.value = activeConversation.value?.modifiedFiles[0]?.path ?? null;
+        const scopedMsg = activeDiffMessageId.value
+          ? activeConversation.value?.messages.find((m) => m.id === activeDiffMessageId.value)
+          : undefined;
+        if (scopedMsg?.turnDiffs && scopedMsg.turnDiffs.length > 0) {
+          activeDiffFilePath.value = scopedMsg.turnDiffs[0].path;
+        } else {
+          activeDiffMessageId.value = null;
+          activeDiffFilePath.value = activeConversation.value?.modifiedFiles[0]?.path ?? null;
+        }
       }
       return true;
     }
@@ -1188,11 +1367,20 @@ export const useStudioStore = defineStore("studio", () => {
       const updated = await invoke<Conversation>("undo_file_modification", {
         conversationId: cid,
         filePath,
+        messageId: messageId ?? null,
       });
       const idx = conversations.value.findIndex((c) => c.id === updated.id);
       if (idx !== -1) conversations.value[idx] = updated;
       if (activeDiffFilePath.value === filePath) {
-        activeDiffFilePath.value = updated.modifiedFiles[0]?.path ?? null;
+        const scopedMsg = activeDiffMessageId.value
+          ? updated.messages.find((m) => m.id === activeDiffMessageId.value)
+          : undefined;
+        if (scopedMsg?.turnDiffs && scopedMsg.turnDiffs.length > 0) {
+          activeDiffFilePath.value = scopedMsg.turnDiffs[0].path;
+        } else {
+          activeDiffMessageId.value = null;
+          activeDiffFilePath.value = updated.modifiedFiles[0]?.path ?? null;
+        }
       }
       return true;
     } catch (err) {
@@ -1201,28 +1389,49 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  async function undoAll(conversationId?: string): Promise<boolean> {
+  async function undoAll(
+    conversationId?: string,
+    messageId?: string | null
+  ): Promise<boolean> {
     const cid = conversationId || activeConversationId.value;
     if (!cid) return false;
     if (!isTauri()) {
       // Mock for browser dev mode
       const idx = conversations.value.findIndex((c) => c.id === cid);
       if (idx !== -1) {
-        conversations.value[idx].modifiedFiles = [];
-        conversations.value[idx].linesAdded = 0;
-        conversations.value[idx].linesRemoved = 0;
+        if (messageId) {
+          const msg = conversations.value[idx].messages.find((m) => m.id === messageId);
+          if (msg) {
+            msg.turnDiffs = [];
+            msg.filesSummary = [];
+            msg.filesChanged = 0;
+            msg.linesAdded = 0;
+            msg.linesRemoved = 0;
+          }
+        } else {
+          conversations.value[idx].modifiedFiles = [];
+          conversations.value[idx].linesAdded = 0;
+          conversations.value[idx].linesRemoved = 0;
+        }
       }
       activeDiffFilePath.value = null;
+      if (!messageId || messageId === activeDiffMessageId.value) {
+        activeDiffMessageId.value = null;
+      }
       return true;
     }
 
     try {
       const updated = await invoke<Conversation>("undo_all_modifications", {
         conversationId: cid,
+        messageId: messageId ?? null,
       });
       const idx = conversations.value.findIndex((c) => c.id === updated.id);
       if (idx !== -1) conversations.value[idx] = updated;
       activeDiffFilePath.value = null;
+      if (!messageId || messageId === activeDiffMessageId.value) {
+        activeDiffMessageId.value = null;
+      }
       return true;
     } catch (err) {
       console.error("Erreur lors de l'annulation complète:", err);
@@ -1230,15 +1439,44 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  function openReview(filePath?: string) {
+  function openReview(
+    filePath?: string,
+    targetLine?: number | null,
+    messageId?: string | null
+  ) {
     codeMode.value = "review";
+    activeDiffTargetLine.value =
+      typeof targetLine === "number" && Number.isFinite(targetLine) && targetLine > 0
+        ? targetLine
+        : null;
+
+    const scopedMsg = messageId
+      ? activeConversation.value?.messages.find((m) => m.id === messageId)
+      : undefined;
+    const hasStepDiffs = Boolean(scopedMsg?.turnDiffs && scopedMsg.turnDiffs.length > 0);
+    activeDiffMessageId.value = hasStepDiffs && messageId ? messageId : null;
+
+    const sourceFiles = hasStepDiffs
+      ? (scopedMsg?.turnDiffs ?? [])
+      : (activeConversation.value?.modifiedFiles ?? []);
+
     if (filePath) {
       activeDiffFilePath.value = filePath;
-    } else if (
-      !activeDiffFilePath.value &&
-      activeConversation.value?.modifiedFiles.length
-    ) {
-      activeDiffFilePath.value = activeConversation.value.modifiedFiles[0].path;
+      if (!hasStepDiffs) {
+        const alreadyLoaded = sourceFiles.some((f) => f.path === filePath);
+        if (!alreadyLoaded) {
+          void refreshDiff();
+        }
+      }
+    } else if (sourceFiles.length > 0) {
+      const currentValid =
+        activeDiffFilePath.value &&
+        sourceFiles.some((f) => f.path === activeDiffFilePath.value);
+      if (!currentValid) {
+        activeDiffFilePath.value = sourceFiles[0].path;
+      }
+    } else {
+      activeDiffFilePath.value = null;
     }
     codeOpen.value = true;
   }
@@ -1254,6 +1492,13 @@ export const useStudioStore = defineStore("studio", () => {
       activeArtifactId.value = activeConversation.value.artifacts[0].id;
     }
     codeOpen.value = true;
+  }
+
+  function scrollToMessage(msgId: string) {
+    targetScrollMsgId.value = msgId;
+    if (!isWideScreen.value) {
+      codeOpen.value = false;
+    }
   }
 
   async function clearGlobalContext(projectId: string) {
@@ -1374,6 +1619,8 @@ export const useStudioStore = defineStore("studio", () => {
     isWideScreen,
     autoToolsEnabled,
     activeDiffFilePath,
+    activeDiffMessageId,
+    activeDiffTargetLine,
     activeArtifactId,
     settingsOpen,
     settingsActiveTab,
@@ -1395,6 +1642,8 @@ export const useStudioStore = defineStore("studio", () => {
     liveThinking,
     liveContent,
     liveAgentTrace,
+    pendingToolApprovals,
+    resolveToolApproval,
     listProjectFiles,
     executeTool,
     effectiveTheme,
@@ -1410,6 +1659,8 @@ export const useStudioStore = defineStore("studio", () => {
     setTheme,
     pickProjectDirectory,
     createProject,
+    listProjectRules,
+    initProjectRules,
     deleteProject,
     updateProjectContext,
     createConversation,
@@ -1430,6 +1681,8 @@ export const useStudioStore = defineStore("studio", () => {
     undoAll,
     openReview,
     openArtifact,
+    scrollToMessage,
+    targetScrollMsgId,
     closeCode,
     saveMcpServer,
     deleteMcpServer,
@@ -1457,5 +1710,6 @@ export const useStudioStore = defineStore("studio", () => {
     contextPercent,
     activeContextPercent,
     compactConversation,
+    clearConversation,
   };
 });
