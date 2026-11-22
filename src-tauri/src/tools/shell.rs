@@ -219,7 +219,7 @@ pub fn is_daemon_or_dev_server_command(cmd: &str) -> Option<&'static str> {
         || norm.starts_with("npm run tauri dev")
         || norm.starts_with("pnpm tauri dev")
     {
-        return Some("Les serveurs de développement (ex: `npm run dev`, `vite`, `cargo run`) tournent en continu et bloquent le moteur. Pour tester ou diagnostiquer, utilise une commande de validation déterministe qui se termine automatiquement (ex: `npm run build`, `npx vue-tsc --noEmit`, `cargo check`).");
+        return Some("Cette commande démarre un processus serveur ou d'écoute continu bloquant le moteur. Utilise uniquement une commande de compilation, d'analyse statique ou de test non-interactive qui se termine d'elle-même selon les manifestes du projet.");
     }
 
     None

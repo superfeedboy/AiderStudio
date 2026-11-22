@@ -141,6 +141,7 @@ pub async fn edit_file(
     let original = tokio::fs::read_to_string(&target_path)
         .await
         .map_err(|e| e.to_string())?;
+    let orig_line_count = original.lines().count();
     let mut working = original;
 
     for (idx, (search, replace)) in edits.iter().enumerate() {
@@ -160,6 +161,11 @@ pub async fn edit_file(
                 }
                 if let Some(closest) = fail.closest_match {
                     msg.push_str(&format!("\nExtrait réel du fichier :\n```\n{}\n```", closest));
+                }
+                if orig_line_count <= 120 {
+                    msg.push_str(&format!(
+                        "\nAstuce : ce fichier est court ({orig_line_count} lignes). Lis-le avec read_file ou utilise write_file pour le réécrire intégralement."
+                    ));
                 }
                 return Err(msg);
             }

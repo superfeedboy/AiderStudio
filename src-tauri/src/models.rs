@@ -179,6 +179,8 @@ pub struct ModifiedFileDiff {
     pub added: usize,
     pub removed: usize,
     pub modified: usize,
+    #[serde(default)]
+    pub status: Option<String>,
     pub lines: Vec<DiffLine>,
 }
 
@@ -189,6 +191,8 @@ pub struct FileChangeSummary {
     pub added: usize,
     pub removed: usize,
     pub modified: usize,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +264,10 @@ pub struct ChatMessage {
     pub commit_id: Option<String>,
     #[serde(default)]
     pub commit_summary: Option<String>,
+    #[serde(default)]
+    pub turn_diffs: Vec<ModifiedFileDiff>,
+    #[serde(default)]
+    pub pre_turn_tree: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,10 +645,13 @@ mod tests {
                         added: 12,
                         removed: 0,
                         modified: 0,
+                        status: Some("created".to_string()),
                     }],
                     agent_trace: vec![],
                     commit_id: None,
                     commit_summary: None,
+                    turn_diffs: vec![],
+                    pre_turn_tree: None,
                 },
                 ChatMessage {
                     id: "a1".to_string(),
@@ -658,10 +669,13 @@ mod tests {
                         added: 12,
                         removed: 0,
                         modified: 0,
+                        status: Some("created".to_string()),
                     }],
                     agent_trace: vec![],
                     commit_id: Some("vAIx #1".to_string()),
                     commit_summary: Some("Ajout composant Logo".to_string()),
+                    turn_diffs: vec![],
+                    pre_turn_tree: None,
                 },
             ],
             artifacts: vec![],

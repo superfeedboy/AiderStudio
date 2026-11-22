@@ -236,6 +236,7 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
                             added,
                             removed: 0,
                             modified: 0,
+                            status: Some("created".to_string()),
                             lines,
                         });
                     }
@@ -249,10 +250,106 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
     (files, total_added, total_removed)
 }
 
+/// Capture un arbre Git instantané (tree SHA) du workspace courant dans un index temporaire isolé,
+/// sans jamais modifier `.git/index` ni `HEAD`.
+pub async fn capture_workspace_tree(project_root: &str) -> Option<String> {
+    let root = Path::new(project_root);
+    if !root.exists() {
+        return None;
+    }
+
+    if !root.join(".git").exists() {
+        let _ = Command::new("git")
+            .args(["-C", project_root, "init"])
+            .output()
+            .await;
+    }
+
+    let tmp_idx = std::env::temp_dir().join(format!("vaix-idx-{}.idx", uuid::Uuid::new_v4()));
+    let add_res = Command::new("git")
+        .args(["-C", project_root, "add", "-A"])
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output()
+        .await;
+
+    let tree_sha = match add_res {
+        Ok(out) if out.status.success() => {
+            let write_res = Command::new("git")
+                .args(["-C", project_root, "write-tree"])
+                .env("GIT_INDEX_FILE", &tmp_idx)
+                .output()
+                .await;
+            match write_res {
+                Ok(w) if w.status.success() => {
+                    let sha = String::from_utf8_lossy(&w.stdout).trim().to_string();
+                    if sha.is_empty() {
+                        None
+                    } else {
+                        Some(sha)
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    let _ = tokio::fs::remove_file(&tmp_idx).await;
+    tree_sha
+}
+
+/// Calcule le diff exact d'un tour entre l'arbre capturé avant exécution (`pre_tree`) et l'état actuel sur disque.
+pub async fn collect_turn_diffs(
+    project_root: &str,
+    pre_tree: &str,
+) -> (Vec<ModifiedFileDiff>, usize, usize) {
+    sanitize_backtick_paths(project_root).await;
+    sanitize_corrupted_diff_files(project_root).await;
+
+    let Some(post_tree) = capture_workspace_tree(project_root).await else {
+        return (Vec::new(), 0, 0);
+    };
+    if post_tree == pre_tree {
+        return (Vec::new(), 0, 0);
+    }
+
+    let diff_out = Command::new("git")
+        .args([
+            "-C",
+            project_root,
+            "diff",
+            pre_tree,
+            &post_tree,
+            "--unified=3",
+            "--no-color",
+            "--",
+            ".",
+        ])
+        .output()
+        .await;
+
+    let Ok(out) = diff_out else {
+        return (Vec::new(), 0, 0);
+    };
+    if !out.status.success() {
+        return (Vec::new(), 0, 0);
+    }
+
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let mut files = parse_unified_diff(&raw);
+    let total_added: usize = files.iter().map(|f| f.added + f.modified).sum();
+    let total_removed: usize = files.iter().map(|f| f.removed + f.modified).sum();
+    for f in &mut files {
+        f.lines.truncate(500);
+    }
+    (files, total_added, total_removed)
+}
+
 pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
     let hunk_re = Regex::new(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@").expect("valid hunk regex");
     let mut files: Vec<ModifiedFileDiff> = Vec::new();
     let mut current_path: Option<String> = None;
+    let mut current_status: Option<String> = None;
     let mut current_lines: Vec<DiffLine> = Vec::new();
     let mut pending_del: Vec<(Option<usize>, String)> = Vec::new();
     let mut pending_add: Vec<(Option<usize>, String)> = Vec::new();
@@ -292,24 +389,34 @@ pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
     };
 
     let finalize_file = |path: &mut Option<String>,
+                         status: &mut Option<String>,
                          lines: &mut Vec<DiffLine>,
                          del: &mut Vec<(Option<usize>, String)>,
                          add: &mut Vec<(Option<usize>, String)>,
                          out: &mut Vec<ModifiedFileDiff>| {
         flush_pending(del, add, lines);
+        let st = status.take();
         if let Some(p) = path.take() {
             let added = lines.iter().filter(|l| l.kind == "add").count();
             let removed = lines.iter().filter(|l| l.kind == "del").count();
             let modified = lines.iter().filter(|l| l.kind == "mod").count();
-            if !lines.is_empty() {
+            let resolved_status = st.or_else(|| Some("modified".to_string()));
+            if !lines.is_empty()
+                || matches!(resolved_status.as_deref(), Some("created" | "deleted"))
+            {
                 out.push(ModifiedFileDiff {
                     path: p,
                     added,
                     removed,
                     modified,
+                    status: resolved_status,
                     lines: std::mem::take(lines),
                 });
+            } else {
+                lines.clear();
             }
+        } else {
+            lines.clear();
         }
     };
 
@@ -317,6 +424,7 @@ pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             finalize_file(
                 &mut current_path,
+                &mut current_status,
                 &mut current_lines,
                 &mut pending_del,
                 &mut pending_add,
@@ -327,11 +435,30 @@ pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
                 .nth(1)
                 .unwrap_or(rest)
                 .trim()
+                .trim_matches('"')
                 .to_string();
             current_path = Some(parsed_path);
+            current_status = Some("modified".to_string());
             continue;
         }
-        if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ") {
+        if line.starts_with("new file mode ") {
+            current_status = Some("created".to_string());
+            continue;
+        }
+        if line.starts_with("deleted file mode ") {
+            current_status = Some("deleted".to_string());
+            continue;
+        }
+        if line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("index ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("Binary files ")
+        {
             continue;
         }
         if let Some(cap) = hunk_re.captures(line) {
@@ -364,6 +491,7 @@ pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
 
     finalize_file(
         &mut current_path,
+        &mut current_status,
         &mut current_lines,
         &mut pending_del,
         &mut pending_add,
@@ -371,6 +499,70 @@ pub fn parse_unified_diff(raw: &str) -> Vec<ModifiedFileDiff> {
     );
 
     files
+}
+
+/// Restaure un fichier exactement à son état dans `tree_sha` (ou le supprime s'il n'existait pas dans cet arbre).
+pub async fn undo_file_to_tree(
+    project_root: &str,
+    tree_sha: &str,
+    file_path: &str,
+) -> Result<(), String> {
+    let clean_path = crate::tools::fs::sanitize_tool_path(file_path)?;
+    let root = Path::new(project_root);
+    let target = root.join(&clean_path);
+    let spec = format!("{tree_sha}:{clean_path}");
+
+    let exists_in_tree = Command::new("git")
+        .args(["-C", project_root, "cat-file", "-e", &spec])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if exists_in_tree {
+        let out = Command::new("git")
+            .args(["-C", project_root, "show", &spec])
+            .output()
+            .await
+            .map_err(|e| format!("Impossible de lire `{spec}` dans Git : {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "Échec restauration `{clean_path}` depuis `{tree_sha}`"
+            ));
+        }
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tokio::fs::write(&target, &out.stdout)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else if target.exists() {
+        if target.is_file() {
+            tokio::fs::remove_file(&target)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else if target.is_dir() {
+            tokio::fs::remove_dir_all(&target)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Restaure plusieurs fichiers exactement à leur état dans `tree_sha`.
+pub async fn undo_files_to_tree(
+    project_root: &str,
+    tree_sha: &str,
+    file_paths: &[String],
+) -> Result<(), String> {
+    for p in file_paths {
+        undo_file_to_tree(project_root, tree_sha, p).await?;
+    }
+    Ok(())
 }
 
 /// Undoes modifications to a single file:
@@ -438,4 +630,77 @@ pub async fn undo_all_modifications(project_root: &str) -> Result<(), String> {
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_turn_diff_and_undo_on_previously_created_untracked_file() {
+        let dir = std::env::temp_dir().join(format!("vaix_gitdiff_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root_str = dir.to_string_lossy().to_string();
+
+        let _ = Command::new("git")
+            .args(["-C", &root_str, "init"])
+            .output()
+            .await
+            .unwrap();
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                &root_str,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        // Tour 1 : création d'un fichier untracked de 10 lignes
+        let initial_lines: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+        let initial_content = format!("{}\n", initial_lines.join("\n"));
+        std::fs::write(dir.join("foo.ts"), &initial_content).unwrap();
+
+        // Snapshot avant Tour 2
+        let tree1 = capture_workspace_tree(&root_str)
+            .await
+            .expect("tree1 captured");
+
+        // Tour 2 : ajout de 2 lignes seulement dans foo.ts (toujours untracked par rapport à HEAD)
+        let mut updated_content = initial_content.clone();
+        updated_content.push_str("line 11\nline 12\n");
+        std::fs::write(dir.join("foo.ts"), &updated_content).unwrap();
+
+        let (turn_files, turn_added, turn_removed) = collect_turn_diffs(&root_str, &tree1).await;
+        assert_eq!(turn_files.len(), 1);
+        assert_eq!(turn_files[0].path, "foo.ts");
+        assert_eq!(turn_files[0].status.as_deref(), Some("modified"));
+        assert_eq!(turn_files[0].added, 2);
+        assert_eq!(turn_files[0].removed, 0);
+        assert_eq!(turn_files[0].modified, 0);
+        assert_eq!(turn_added, 2);
+        assert_eq!(turn_removed, 0);
+        assert_eq!(
+            turn_files[0].lines.iter().filter(|l| l.kind == "add").count(),
+            2
+        );
+
+        // Undo au niveau de l'étape -> restaure foo.ts à ses 10 lignes sans le supprimer
+        undo_file_to_tree(&root_str, &tree1, "foo.ts")
+            .await
+            .unwrap();
+        assert!(dir.join("foo.ts").exists());
+        let restored = std::fs::read_to_string(dir.join("foo.ts")).unwrap();
+        assert_eq!(restored, initial_content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

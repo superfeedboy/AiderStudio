@@ -267,13 +267,13 @@ function applyNoCostPreset() {
     draft.agentRouting = defaultAgentRouting();
   }
   draft.agentRouting.architect = assignFirstAvailableFreeSlot([
-    { prov: "gemini", prefs: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.0-flash", "gemini-2.5-flash"] },
+    { prov: "gemini", prefs: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"] },
     { prov: "openrouter", prefs: ["deepseek-r1:free", ":free"] },
     { prov: "cerebras", prefs: ["qwen-3-235b", "llama-3.3-70b"] },
     { prov: "groq", prefs: ["qwen3-32b", "llama-3.3-70b"] },
   ]);
   draft.agentRouting.designer = assignFirstAvailableFreeSlot([
-    { prov: "gemini", prefs: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.0-flash", "gemini-2.5-flash"] },
+    { prov: "gemini", prefs: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"] },
     { prov: "openrouter", prefs: ["deepseek-chat", "qwen3-coder", ":free"] },
     { prov: "cerebras", prefs: ["qwen-3-235b", "qwen-3-32b"] },
     { prov: "groq", prefs: ["llama-3.3-70b", "qwen3-32b"] },
@@ -282,7 +282,7 @@ function applyNoCostPreset() {
     { prov: "openrouter", prefs: ["qwen3-coder:free", "deepseek-chat", ":free"] },
     { prov: "cerebras", prefs: ["qwen-3-235b", "qwen-3-32b"] },
     { prov: "groq", prefs: ["qwen3-32b", "llama-3.3-70b"] },
-    { prov: "gemini", prefs: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.0-flash", "gemini-2.5-flash"] },
+    { prov: "gemini", prefs: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"] },
   ]);
   draft.agentRouting.refactoring = { ...draft.agentRouting.coder };
 

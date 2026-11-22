@@ -406,7 +406,7 @@ function selectArtifact(id: string) {
     <button
       class="hud-row hud-row-btn"
       title="Cliquer pour inspecter les fichiers modifiés dans le code"
-      @click="store.openReview()"
+      @click="store.openReview(undefined, null, null)"
     >
       <span class="hud-entity">
         <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">

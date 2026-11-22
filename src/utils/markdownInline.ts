@@ -11,9 +11,15 @@ export interface ResolvedFileTarget {
   line: number | null;
 }
 
+const inlineTokensCache = new Map<string, InlineToken[]>();
+const MAX_INLINE_CACHE_ENTRIES = 1200;
+
 export function tokenizeInline(input: string): InlineToken[] {
+  if (!input) return [];
+  const cached = inlineTokensCache.get(input);
+  if (cached) return cached;
+
   const tokens: InlineToken[] = [];
-  if (!input) return tokens;
 
   const regex =
     /(\[Appel d'outils?(?:\s+natifs?)?\s*:[^\]]+\]|\[[^\]]+\]\([^)\s]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/gi;
@@ -66,6 +72,12 @@ export function tokenizeInline(input: string): InlineToken[] {
   if (lastIdx < input.length) {
     tokens.push({ kind: "text", text: input.slice(lastIdx) });
   }
+
+  if (inlineTokensCache.size >= MAX_INLINE_CACHE_ENTRIES) {
+    const firstKey = inlineTokensCache.keys().next().value;
+    if (firstKey !== undefined) inlineTokensCache.delete(firstKey);
+  }
+  inlineTokensCache.set(input, tokens);
 
   return tokens;
 }

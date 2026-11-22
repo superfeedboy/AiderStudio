@@ -111,7 +111,21 @@ impl IgnoreRules {
         let low = name.to_lowercase();
         if matches!(
             low.as_str(),
-            ".git" | ".svn" | ".hg" | "node_modules" | "target" | "dist" | "build" | "coverage"
+            ".git"
+                | ".svn"
+                | ".hg"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | "coverage"
+                | "vendor"
+                | ".venv"
+                | "venv"
+                | "__pycache__"
+                | ".next"
+                | ".nuxt"
+                | ".cache"
         ) {
             return true;
         }
@@ -119,6 +133,10 @@ impl IgnoreRules {
             return true;
         }
         false
+    }
+
+    pub fn is_hard_excluded_dir_component(name: &str) -> bool {
+        Self::is_hard_excluded_component(name)
     }
 
     pub fn is_hard_excluded_file(rel_path: &str) -> bool {
@@ -152,8 +170,10 @@ impl IgnoreRules {
         if norm.is_empty() {
             return false;
         }
-        for comp in norm.split('/') {
-            if Self::is_hard_excluded_component(comp) {
+        let parts: Vec<&str> = norm.split('/').collect();
+        let dir_count = if is_dir { parts.len() } else { parts.len().saturating_sub(1) };
+        for comp in parts.iter().take(dir_count) {
+            if Self::is_hard_excluded_dir_component(comp) {
                 return true;
             }
         }
@@ -211,16 +231,15 @@ pub fn list_project_files(project_root: &Path, max_files: usize) -> Vec<String> 
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            if IgnoreRules::is_hard_excluded_component(&name_str) {
-                continue;
-            }
-
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
             let rel_str = rel.to_string_lossy().replace('\\', "/");
 
             if path.is_dir() {
+                if IgnoreRules::is_hard_excluded_dir_component(&name_str) {
+                    continue;
+                }
                 if !rules.has_negations && rules.is_ignored(&rel_str, true) {
                     continue;
                 }

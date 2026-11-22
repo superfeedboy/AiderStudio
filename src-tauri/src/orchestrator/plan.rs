@@ -76,10 +76,20 @@ pub struct TaskPlan {
     #[serde(default)]
     pub intent: String,
     pub summary: String,
+    #[serde(
+        default,
+        alias = "validationCommand",
+        alias = "validation_command",
+        alias = "verifyCommand"
+    )]
+    pub verify_command: Option<String>,
     pub tasks: Vec<TaskStep>,
 }
 
 impl TaskPlan {
+    pub fn validation_command(&self) -> Option<&str> {
+        self.verify_command.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
     /// Crée un plan de repli sûr (Safe Fallback) avec une seule tâche complète.
     pub fn fallback(user_prompt: &str) -> Self {
         let clean_prompt = user_prompt.trim();
@@ -95,6 +105,7 @@ impl TaskPlan {
         Self {
             intent: "general_execution".to_string(),
             summary: format!("Exécution directe : {summary}"),
+            verify_command: None,
             tasks: vec![TaskStep {
                 id: "task_1".to_string(),
                 title: "Traitement complet de la demande".to_string(),
@@ -252,6 +263,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "fix".to_string(),
             summary: "Diagnostic then fix".to_string(),
+            verify_command: None,
             tasks: vec![
                 TaskStep {
                     id: "step_1".to_string(),
@@ -296,6 +308,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "feature".to_string(),
             summary: "Diamond DAG".to_string(),
+            verify_command: None,
             tasks: vec![
                 TaskStep {
                     id: "init".to_string(),
@@ -348,6 +361,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "cycle".to_string(),
             summary: "Circular dependency".to_string(),
+            verify_command: None,
             tasks: vec![
                 TaskStep {
                     id: "A".to_string(),
@@ -378,6 +392,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "self".to_string(),
             summary: "Self dependency".to_string(),
+            verify_command: None,
             tasks: vec![TaskStep {
                 id: "A".to_string(),
                 title: "A".to_string(),
@@ -397,6 +412,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "unknown".to_string(),
             summary: "Unknown dependency".to_string(),
+            verify_command: None,
             tasks: vec![TaskStep {
                 id: "A".to_string(),
                 title: "A".to_string(),
@@ -409,5 +425,17 @@ mod tests {
         };
 
         assert!(plan.compute_execution_waves().is_err());
+    }
+
+    #[test]
+    fn test_plan_deserializes_validation_command_alias() {
+        let json = r#"{
+            "intent": "bugfix",
+            "summary": "Fix issue",
+            "validationCommand": "make test",
+            "tasks": []
+        }"#;
+        let plan: TaskPlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.validation_command(), Some("make test"));
     }
 }

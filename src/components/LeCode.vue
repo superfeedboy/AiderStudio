@@ -14,7 +14,33 @@ const copied = ref(false);
 const diffViewerRef = ref<HTMLElement | null>(null);
 
 const conv = computed(() => store.activeConversation);
-const modifiedFiles = computed(() => conv.value?.modifiedFiles ?? []);
+const globalModifiedFiles = computed(() => conv.value?.modifiedFiles ?? []);
+const scopedMessage = computed(() =>
+  store.activeDiffMessageId
+    ? (conv.value?.messages.find((m) => m.id === store.activeDiffMessageId) ?? null)
+    : null
+);
+const isStepScope = computed(() =>
+  Boolean(scopedMessage.value && (scopedMessage.value.turnDiffs?.length ?? 0) > 0)
+);
+const modifiedFiles = computed(() =>
+  isStepScope.value
+    ? (scopedMessage.value?.turnDiffs ?? [])
+    : globalModifiedFiles.value
+);
+
+function switchToGlobalDiffScope() {
+  const currentPath = store.activeDiffFilePath;
+  store.activeDiffMessageId = null;
+  if (
+    currentPath &&
+    globalModifiedFiles.value.some((f) => f.path === currentPath)
+  ) {
+    store.activeDiffFilePath = currentPath;
+  } else {
+    store.activeDiffFilePath = globalModifiedFiles.value[0]?.path ?? null;
+  }
+}
 
 function isRealArtifact(art: { filePath?: string | null; title?: string; language?: string }): boolean {
   const p = (art.filePath || art.title || "").toLowerCase();
@@ -261,20 +287,28 @@ async function copyArtifact() {
 }
 
 async function confirmUndoFile(filePath: string) {
+  const stepMsgId = isStepScope.value ? (scopedMessage.value?.id ?? null) : null;
+  const stepLabel = scopedMessage.value?.commitId || "cette étape";
   const ok = window.confirm(
-    `Voulez-vous annuler toutes les modifications apportées au fichier "${filePath}" et le restaurer dans son état d'origine ?`
+    stepMsgId
+      ? `Voulez-vous restaurer "${filePath}" tel qu'il était avant ${stepLabel} ?`
+      : `Voulez-vous annuler toutes les modifications apportées au fichier "${filePath}" et le restaurer dans son état d'origine ?`
   );
   if (!ok) return;
-  await store.undoFile(filePath);
+  await store.undoFile(filePath, undefined, stepMsgId);
 }
 
 async function confirmUndoAll() {
+  const stepMsgId = isStepScope.value ? (scopedMessage.value?.id ?? null) : null;
+  const stepLabel = scopedMessage.value?.commitId || "cette étape";
   const count = modifiedFiles.value.length;
   const ok = window.confirm(
-    `Voulez-vous annuler TOUTES les modifications (${count} fichier${count > 1 ? "s" : ""}) et restaurer le projet dans son état d'origine ?\nCette action est irréversible.`
+    stepMsgId
+      ? `Voulez-vous annuler TOUTES les modifications de ${stepLabel} (${count} fichier${count > 1 ? "s" : ""}) et restaurer ces fichiers à leur état précédant cette étape ?\nCette action est irréversible.`
+      : `Voulez-vous annuler TOUTES les modifications (${count} fichier${count > 1 ? "s" : ""}) et restaurer le projet dans son état d'origine ?\nCette action est irréversible.`
   );
   if (!ok) return;
-  await store.undoAll();
+  await store.undoAll(undefined, stepMsgId);
 }
 
 function selectDiffFile(filePath: string) {
@@ -360,7 +394,7 @@ watch(
         <button
           v-if="store.codeMode === 'review' && modifiedFiles.length > 0"
           class="undo-all-header-btn"
-          title="Tout défaire : annuler toutes les modifications apportées aux fichiers"
+          :title="isStepScope ? 'Annuler uniquement les modifications de cette étape' : 'Tout défaire : annuler toutes les modifications apportées aux fichiers'"
           @click="confirmUndoAll"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
@@ -388,6 +422,19 @@ watch(
 
     <!-- MODE 1: MODIFIED FILES REVIEW (Blue = modified, Green = added, Red = deleted) -->
     <div v-if="store.codeMode === 'review'" class="code-body">
+      <div v-if="isStepScope" class="review-scope-bar">
+        <span class="scope-pill active">
+          Étape {{ scopedMessage?.commitId || "courante" }} ({{ modifiedFiles.length }})
+        </span>
+        <button
+          type="button"
+          class="scope-switch-btn"
+          title="Afficher le diff complet par rapport au dernier commit Git (HEAD)"
+          @click="switchToGlobalDiffScope"
+        >
+          Voir diff global HEAD ({{ globalModifiedFiles.length }})
+        </button>
+      </div>
       <div v-if="modifiedFiles.length === 0" class="empty-code">
         <p>Aucun fichier modifié détecté dans le dépôt Git pour le moment.</p>
         <button class="refresh-pill" @click="store.refreshDiff()">
@@ -1185,5 +1232,45 @@ watch(
   border: none;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   margin: 10px 0;
+}
+
+.review-scope-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.scope-pill {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.scope-switch-btn {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.scope-switch-btn:hover {
+  color: var(--text-main);
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.05);
 }
 </style>

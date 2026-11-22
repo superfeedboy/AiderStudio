@@ -103,6 +103,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "test".to_string(),
             summary: "test".to_string(),
+            verify_command: None,
             tasks: vec![
                 TaskStep {
                     id: "t1".to_string(),
@@ -140,6 +141,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "test".to_string(),
             summary: "test".to_string(),
+            verify_command: None,
             tasks: vec![
                 TaskStep {
                     id: "t1".to_string(),
@@ -175,6 +177,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "test".to_string(),
             summary: "test".to_string(),
+            verify_command: None,
             tasks: vec![
                 TaskStep {
                     id: "t1".to_string(),
@@ -222,6 +225,7 @@ mod tests {
         let plan = TaskPlan {
             intent: "test".to_string(),
             summary: "test".to_string(),
+            verify_command: None,
             tasks: (1..=5)
                 .map(|i| TaskStep {
                     id: format!("t{i}"),

@@ -40,11 +40,9 @@ export function defaultProvidersList(): ProviderConfig[] {
       baseUrl: null,
       validated: false,
       availableModels: [
-        "gemini-3.8-flash",
-        "gemini-3.8-pro",
-        "gemini-2.0-flash",
         "gemini-2.5-flash",
         "gemini-2.5-pro",
+        "gemini-2.0-flash",
       ],
       dailyTokenLimit: 500000,
     },
@@ -195,6 +193,7 @@ export const useStudioStore = defineStore("studio", () => {
   const codeMode = ref<CodeDrawerMode>("review");
   const codeWidth = ref<number>(420);
   const activeDiffFilePath = ref<string | null>(null);
+  const activeDiffMessageId = ref<string | null>(null);
   const activeDiffTargetLine = ref<number | null>(null);
   const activeArtifactId = ref<string | null>(null);
   const targetScrollMsgId = ref<string>("");
@@ -919,6 +918,7 @@ export const useStudioStore = defineStore("studio", () => {
         projectId,
         title: title ?? null,
       });
+      activeDiffMessageId.value = null;
       applyStateData(next);
     }
   }
@@ -927,6 +927,7 @@ export const useStudioStore = defineStore("studio", () => {
     activeProjectId.value = projectId;
     activeConversationId.value = conversationId;
     activeDiffFilePath.value = null;
+    activeDiffMessageId.value = null;
     activeArtifactId.value = null;
     if (isTauri()) {
       await invoke("select_conversation", { projectId, conversationId });
@@ -1170,6 +1171,10 @@ export const useStudioStore = defineStore("studio", () => {
     delete conversationTokenSteps.value[cid];
     delete conversationTokenUsage.value[cid];
     delete conversationPeakTokens.value[cid];
+    if (activeConversationId.value === cid) {
+      activeDiffFilePath.value = null;
+      activeDiffMessageId.value = null;
+    }
     targetConv.updatedAt = now;
 
     if (isTauri()) {
@@ -1310,27 +1315,50 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  async function undoFile(filePath: string, conversationId?: string): Promise<boolean> {
+  async function undoFile(
+    filePath: string,
+    conversationId?: string,
+    messageId?: string | null
+  ): Promise<boolean> {
     const cid = conversationId || activeConversationId.value;
     if (!cid) return false;
     if (!isTauri()) {
       // Mock for browser dev mode
       const idx = conversations.value.findIndex((c) => c.id === cid);
       if (idx !== -1) {
-        conversations.value[idx].modifiedFiles = conversations.value[idx].modifiedFiles.filter(
-          (f) => f.path !== filePath
-        );
-        conversations.value[idx].linesAdded = conversations.value[idx].modifiedFiles.reduce(
-          (sum, f) => sum + f.added + f.modified,
-          0
-        );
-        conversations.value[idx].linesRemoved = conversations.value[idx].modifiedFiles.reduce(
-          (sum, f) => sum + f.removed + f.modified,
-          0
-        );
+        if (messageId) {
+          const msg = conversations.value[idx].messages.find((m) => m.id === messageId);
+          if (msg) {
+            msg.turnDiffs = (msg.turnDiffs ?? []).filter((f) => f.path !== filePath);
+            msg.filesSummary = (msg.filesSummary ?? []).filter((f) => f.path !== filePath);
+            msg.filesChanged = msg.turnDiffs.length;
+            msg.linesAdded = msg.turnDiffs.reduce((sum, f) => sum + f.added + f.modified, 0);
+            msg.linesRemoved = msg.turnDiffs.reduce((sum, f) => sum + f.removed + f.modified, 0);
+          }
+        } else {
+          conversations.value[idx].modifiedFiles = conversations.value[idx].modifiedFiles.filter(
+            (f) => f.path !== filePath
+          );
+          conversations.value[idx].linesAdded = conversations.value[idx].modifiedFiles.reduce(
+            (sum, f) => sum + f.added + f.modified,
+            0
+          );
+          conversations.value[idx].linesRemoved = conversations.value[idx].modifiedFiles.reduce(
+            (sum, f) => sum + f.removed + f.modified,
+            0
+          );
+        }
       }
       if (activeDiffFilePath.value === filePath) {
-        activeDiffFilePath.value = activeConversation.value?.modifiedFiles[0]?.path ?? null;
+        const scopedMsg = activeDiffMessageId.value
+          ? activeConversation.value?.messages.find((m) => m.id === activeDiffMessageId.value)
+          : undefined;
+        if (scopedMsg?.turnDiffs && scopedMsg.turnDiffs.length > 0) {
+          activeDiffFilePath.value = scopedMsg.turnDiffs[0].path;
+        } else {
+          activeDiffMessageId.value = null;
+          activeDiffFilePath.value = activeConversation.value?.modifiedFiles[0]?.path ?? null;
+        }
       }
       return true;
     }
@@ -1339,11 +1367,20 @@ export const useStudioStore = defineStore("studio", () => {
       const updated = await invoke<Conversation>("undo_file_modification", {
         conversationId: cid,
         filePath,
+        messageId: messageId ?? null,
       });
       const idx = conversations.value.findIndex((c) => c.id === updated.id);
       if (idx !== -1) conversations.value[idx] = updated;
       if (activeDiffFilePath.value === filePath) {
-        activeDiffFilePath.value = updated.modifiedFiles[0]?.path ?? null;
+        const scopedMsg = activeDiffMessageId.value
+          ? updated.messages.find((m) => m.id === activeDiffMessageId.value)
+          : undefined;
+        if (scopedMsg?.turnDiffs && scopedMsg.turnDiffs.length > 0) {
+          activeDiffFilePath.value = scopedMsg.turnDiffs[0].path;
+        } else {
+          activeDiffMessageId.value = null;
+          activeDiffFilePath.value = updated.modifiedFiles[0]?.path ?? null;
+        }
       }
       return true;
     } catch (err) {
@@ -1352,28 +1389,49 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  async function undoAll(conversationId?: string): Promise<boolean> {
+  async function undoAll(
+    conversationId?: string,
+    messageId?: string | null
+  ): Promise<boolean> {
     const cid = conversationId || activeConversationId.value;
     if (!cid) return false;
     if (!isTauri()) {
       // Mock for browser dev mode
       const idx = conversations.value.findIndex((c) => c.id === cid);
       if (idx !== -1) {
-        conversations.value[idx].modifiedFiles = [];
-        conversations.value[idx].linesAdded = 0;
-        conversations.value[idx].linesRemoved = 0;
+        if (messageId) {
+          const msg = conversations.value[idx].messages.find((m) => m.id === messageId);
+          if (msg) {
+            msg.turnDiffs = [];
+            msg.filesSummary = [];
+            msg.filesChanged = 0;
+            msg.linesAdded = 0;
+            msg.linesRemoved = 0;
+          }
+        } else {
+          conversations.value[idx].modifiedFiles = [];
+          conversations.value[idx].linesAdded = 0;
+          conversations.value[idx].linesRemoved = 0;
+        }
       }
       activeDiffFilePath.value = null;
+      if (!messageId || messageId === activeDiffMessageId.value) {
+        activeDiffMessageId.value = null;
+      }
       return true;
     }
 
     try {
       const updated = await invoke<Conversation>("undo_all_modifications", {
         conversationId: cid,
+        messageId: messageId ?? null,
       });
       const idx = conversations.value.findIndex((c) => c.id === updated.id);
       if (idx !== -1) conversations.value[idx] = updated;
       activeDiffFilePath.value = null;
+      if (!messageId || messageId === activeDiffMessageId.value) {
+        activeDiffMessageId.value = null;
+      }
       return true;
     } catch (err) {
       console.error("Erreur lors de l'annulation complète:", err);
@@ -1381,25 +1439,44 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
-  function openReview(filePath?: string, targetLine?: number | null) {
+  function openReview(
+    filePath?: string,
+    targetLine?: number | null,
+    messageId?: string | null
+  ) {
     codeMode.value = "review";
     activeDiffTargetLine.value =
       typeof targetLine === "number" && Number.isFinite(targetLine) && targetLine > 0
         ? targetLine
         : null;
+
+    const scopedMsg = messageId
+      ? activeConversation.value?.messages.find((m) => m.id === messageId)
+      : undefined;
+    const hasStepDiffs = Boolean(scopedMsg?.turnDiffs && scopedMsg.turnDiffs.length > 0);
+    activeDiffMessageId.value = hasStepDiffs && messageId ? messageId : null;
+
+    const sourceFiles = hasStepDiffs
+      ? (scopedMsg?.turnDiffs ?? [])
+      : (activeConversation.value?.modifiedFiles ?? []);
+
     if (filePath) {
       activeDiffFilePath.value = filePath;
-      const alreadyLoaded = activeConversation.value?.modifiedFiles.some(
-        (f) => f.path === filePath
-      );
-      if (!alreadyLoaded) {
-        void refreshDiff();
+      if (!hasStepDiffs) {
+        const alreadyLoaded = sourceFiles.some((f) => f.path === filePath);
+        if (!alreadyLoaded) {
+          void refreshDiff();
+        }
       }
-    } else if (
-      !activeDiffFilePath.value &&
-      activeConversation.value?.modifiedFiles.length
-    ) {
-      activeDiffFilePath.value = activeConversation.value.modifiedFiles[0].path;
+    } else if (sourceFiles.length > 0) {
+      const currentValid =
+        activeDiffFilePath.value &&
+        sourceFiles.some((f) => f.path === activeDiffFilePath.value);
+      if (!currentValid) {
+        activeDiffFilePath.value = sourceFiles[0].path;
+      }
+    } else {
+      activeDiffFilePath.value = null;
     }
     codeOpen.value = true;
   }
@@ -1542,6 +1619,7 @@ export const useStudioStore = defineStore("studio", () => {
     isWideScreen,
     autoToolsEnabled,
     activeDiffFilePath,
+    activeDiffMessageId,
     activeDiffTargetLine,
     activeArtifactId,
     settingsOpen,

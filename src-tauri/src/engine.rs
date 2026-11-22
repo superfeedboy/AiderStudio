@@ -9,10 +9,11 @@ use crate::patcher;
 use crate::providers::{self, LlmMessage, LlmRequestOptions, StreamDelta};
 use crate::repo_map;
 use crate::storage;
+use crate::workspace::{self, WorkspaceSnapshot};
 use chrono::Utc;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -157,104 +158,89 @@ fn record_trace_step(
     );
 }
 
-pub async fn run_test_verifier(project_root: &Path) -> TestVerificationResult {
-    // 1. Cargo.toml -> cargo check
-    if project_root.join("Cargo.toml").exists() {
-        let res = tokio::process::Command::new("cargo")
-            .arg("check")
-            .current_dir(project_root)
-            .output()
-            .await;
-        if let Ok(out) = res {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let summary = if out.status.success() {
-                "Compilation Cargo check validée avec succès (0 erreur).".to_string()
-            } else {
-                let err_lines: Vec<&str> = stderr
-                    .lines()
-                    .filter(|l| l.contains("error:") || l.contains("error["))
-                    .take(6)
-                    .collect();
-                if err_lines.is_empty() {
-                    truncate_chars(&stderr, 320)
-                } else {
-                    err_lines.join("\n")
-                }
-            };
+fn is_verification_like_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() || !crate::workspace::is_safe_verification_command(trimmed) {
+        return false;
+    }
+    let low = trimmed.to_lowercase();
+    [
+        "test",
+        "check",
+        "build",
+        "lint",
+        "typecheck",
+        "type-check",
+        "compile",
+        "verify",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw))
+}
+
+async fn execute_verification_command(
+    project_root: &Path,
+    command_str: &str,
+) -> TestVerificationResult {
+    match crate::tools::shell::run_command_simple(
+        project_root,
+        &serde_json::json!({ "command": command_str, "timeout_secs": 90 }),
+    )
+    .await
+    {
+        Ok(tr) => TestVerificationResult {
+            ran: true,
+            command: command_str.to_string(),
+            success: tr.success,
+            output_summary: truncate_chars(&tr.message, 450),
+        },
+        Err(err) => TestVerificationResult {
+            ran: true,
+            command: command_str.to_string(),
+            success: false,
+            output_summary: truncate_chars(&err, 450),
+        },
+    }
+}
+
+pub async fn run_project_verifier(
+    project_root: &Path,
+    validation_command: Option<&str>,
+    already_verified: Option<&(String, bool, String)>,
+) -> TestVerificationResult {
+    let Some(cmd_raw) = validation_command.map(str::trim).filter(|c| !c.is_empty()) else {
+        return TestVerificationResult {
+            ran: false,
+            command: String::new(),
+            success: true,
+            output_summary: "Aucune commande de validation (validationCommand est null).".to_string(),
+        };
+    };
+
+    if !crate::workspace::is_safe_verification_command(cmd_raw) {
+        return TestVerificationResult {
+            ran: true,
+            command: cmd_raw.to_string(),
+            success: false,
+            output_summary: format!(
+                "La commande `{cmd_raw}` démarre un processus continu ou non sécurisé (interdit en validation automatisée)."
+            ),
+        };
+    }
+
+    // Si la même commande exacte a déjà été exécutée après la dernière écriture, réutiliser son résultat
+    if let Some((cmd, success, summary)) = already_verified {
+        if cmd.trim() == cmd_raw {
             return TestVerificationResult {
                 ran: true,
-                command: "cargo check".to_string(),
-                success: out.status.success(),
-                output_summary: summary,
+                command: cmd.clone(),
+                success: *success,
+                output_summary: summary.clone(),
             };
         }
     }
 
-    // 2. package.json -> check vue-tsc / type-check
-    let pkg_json = project_root.join("package.json");
-    if pkg_json.exists() {
-        if let Ok(content) = tokio::fs::read_to_string(&pkg_json).await {
-            let has_vue_tsc = content.contains("vue-tsc");
-            let has_type_check = content.contains("type-check");
-
-            let cmd_name = if has_vue_tsc {
-                "npx vue-tsc --noEmit"
-            } else if has_type_check {
-                "npm run type-check"
-            } else {
-                ""
-            };
-
-            if !cmd_name.is_empty() {
-                let parts: Vec<&str> = cmd_name.split_whitespace().collect();
-                #[cfg(not(target_os = "windows"))]
-                let mut cmd = tokio::process::Command::new(parts[0]);
-                #[cfg(target_os = "windows")]
-                let mut cmd = {
-                    let mut c = tokio::process::Command::new(format!("{}.cmd", parts[0]));
-                    c.creation_flags(0x08000000);
-                    c
-                };
-                cmd.args(&parts[1..]).current_dir(project_root);
-
-                if let Ok(out) = cmd.output().await {
-                    let combined = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&out.stdout),
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                    let summary = if out.status.success() {
-                        format!("Vérification TypeScript ({cmd_name}) validée sans erreur.")
-                    } else {
-                        let err_lines: Vec<&str> = combined
-                            .lines()
-                            .filter(|l| l.contains("error TS") || l.contains("error:"))
-                            .take(6)
-                            .collect();
-                        if err_lines.is_empty() {
-                            truncate_chars(&combined, 320)
-                        } else {
-                            err_lines.join("\n")
-                        }
-                    };
-                    return TestVerificationResult {
-                        ran: true,
-                        command: cmd_name.to_string(),
-                        success: out.status.success(),
-                        output_summary: summary,
-                    };
-                }
-            }
-        }
-    }
-
-    TestVerificationResult {
-        ran: false,
-        command: String::new(),
-        success: true,
-        output_summary: "Aucun runner de test ou compilateur strict à exécuter (étape validée)."
-            .to_string(),
-    }
+    execute_verification_command(project_root, cmd_raw).await
 }
 
 pub fn strip_code_blocks(text: &str) -> String {
@@ -644,6 +630,7 @@ pub fn resolve_agent_slot(role: &str, settings: &AppSettings) -> (String, String
     ("ollama".to_string(), settings.ollama_model.trim().to_string())
 }
 
+#[allow(dead_code)]
 fn is_doc_focused_prompt(lower: &str) -> bool {
     let doc_markers = [
         "readme",
@@ -702,20 +689,14 @@ pub fn is_global_or_doc_task(user_prompt: &str, target_files: &[String]) -> bool
     global_or_doc_kw.iter().any(|k| lower.contains(k))
 }
 
+#[allow(dead_code)]
 pub fn is_install_or_setup_prompt(prompt: &str) -> bool {
     let low = prompt.to_lowercase();
     let install_markers = [
         "installe",
         "installer",
         "install ",
-        "npm i ",
-        "npm install",
-        "pnpm add",
-        "pnpm install",
-        "yarn add",
-        "bun add",
-        "cargo add",
-        "pip install",
+        "setup ",
         "ajoute le package",
         "ajouter le package",
         "ajoute la dépendance",
@@ -724,11 +705,8 @@ pub fn is_install_or_setup_prompt(prompt: &str) -> bool {
         "ajouter la dependance",
         "ajoute la lib",
         "ajouter la lib",
-        "configure tailwind",
-        "configurer tailwind",
-        "active tailwind",
-        "activer tailwind",
-        "mettre en place tailwind",
+        "add package",
+        "add dependency",
     ];
     if !install_markers.iter().any(|k| low.contains(k)) {
         return false;
@@ -770,9 +748,8 @@ pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
 
     let test_kw = [
         "test",
-        "vitest",
-        "jest",
-        "cargo test",
+        "tests",
+        "testing",
         "unitaire",
         "intégration",
         "integration",
@@ -879,872 +856,6 @@ pub fn classify_prompt_role(user_prompt: &str) -> (&'static str, bool) {
         return ("tester", true);
     }
     ("coder", wants_tests)
-}
-
-pub fn augment_design_target_files(all_files: &[String], matched: &mut Vec<String>) {
-    let has_css = matched
-        .iter()
-        .any(|f| f.ends_with(".css") || f.ends_with(".scss"));
-    if !has_css && matched.len() < 3 {
-        let css_candidates = [
-            "src/style.css",
-            "src/styles.css",
-            "src/styles/main.css",
-            "src/assets/main.css",
-            "src/assets/base.css",
-            "src/index.css",
-            "src/main.css",
-            "src/app.css",
-            "src/App.css",
-            "app/globals.css",
-            "style.css",
-            "styles.css",
-        ];
-        let mut added_css = false;
-        for cand in css_candidates {
-            if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
-                if !matched.contains(found) {
-                    matched.push(found.clone());
-                }
-                added_css = true;
-                break;
-            }
-        }
-        if !added_css {
-            if let Some(fallback_css) = all_files
-                .iter()
-                .filter(|f| {
-                    let low = f.to_lowercase();
-                    low.ends_with(".css") || low.ends_with(".scss")
-                })
-                .min_by_key(|f| (f.matches('/').count(), f.len()))
-            {
-                if !matched.contains(fallback_css) {
-                    matched.push(fallback_css.clone());
-                }
-            }
-        }
-    }
-
-    if matched.len() < 3 {
-        for app_cand in [
-            "src/App.vue",
-            "src/App.tsx",
-            "src/App.jsx",
-            "src/App.svelte",
-            "app/page.tsx",
-            "src/pages/index.vue",
-            "index.html",
-        ] {
-            if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(app_cand)) {
-                if !matched.contains(found) {
-                    matched.push(found.clone());
-                    break;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct FrontendStackInfo {
-    pub framework: Option<String>,
-    pub bundler: Option<String>,
-    pub tailwind_in_pkg: bool,
-    pub tailwind_active: bool,
-    pub tailwind_broken_reason: Option<String>,
-    pub entry_file: Option<String>,
-    pub global_css_files: Vec<String>,
-    pub imported_css_in_entry: Vec<String>,
-    pub css_entry_missing_import: bool,
-    pub installed_packages: Vec<String>,
-}
-
-impl FrontendStackInfo {
-    pub fn format_summary(&self) -> String {
-        let mut lines = Vec::new();
-        let stack_label = match (&self.framework, &self.bundler) {
-            (Some(fw), Some(bd)) => format!("{fw} + {bd}"),
-            (Some(fw), None) => fw.clone(),
-            (None, Some(bd)) => bd.clone(),
-            (None, None) => "Frontend Web".to_string(),
-        };
-        lines.push(format!("[Stack Frontend détectée : {stack_label}]"));
-
-        if self.tailwind_active {
-            lines.push(
-                "- CSS : Tailwind CSS actif (classes utilitaires Tailwind + CSS natif utilisables)."
-                    .to_string(),
-            );
-        } else {
-            lines.push(
-                "- CSS : Tailwind CSS et styles CSS natifs utilisables selon les besoins du projet."
-                    .to_string(),
-            );
-        }
-
-        let entry_desc = self.entry_file.as_deref().unwrap_or("aucun détecté");
-        let css_desc = if self.imported_css_in_entry.is_empty() {
-            if self.global_css_files.is_empty() {
-                "aucun".to_string()
-            } else {
-                format!(
-                    "aucun import détecté (disponible : {})",
-                    self.global_css_files.join(", ")
-                )
-            }
-        } else {
-            self.imported_css_in_entry.join(", ")
-        };
-        lines.push(format!(
-            "- Point d'entrée : {entry_desc} | CSS importés : {css_desc}"
-        ));
-        if !self.installed_packages.is_empty() {
-            lines.push(format!(
-                "- Paquets installés (package.json) : {}",
-                self.installed_packages.join(", ")
-            ));
-        }
-
-        if self.css_entry_missing_import && !self.global_css_files.is_empty() {
-            lines.push(format!(
-                "- ⚠️ ALERTE CSS : {} n'est pas importé dans {entry_desc} — ajoute l'import ou écris les styles dans <style>.",
-                self.global_css_files[0]
-            ));
-        }
-
-        lines.join("\n")
-    }
-}
-
-pub fn prompt_mentions_uninstalled_library(
-    user_prompt: &str,
-    stack: Option<&FrontendStackInfo>,
-) -> Vec<String> {
-    let Some(st) = stack else {
-        return Vec::new();
-    };
-    let low = user_prompt.to_lowercase();
-    let table: &[(&[&str], &[&str], &str)] = &[
-        (
-            &["remix-icon", "remixicon", "remix icon"],
-            &["remixicon", "@iconify/vue", "@iconify-json/ri"],
-            "remixicon (ou @iconify/vue) — installer via `npm install remixicon` et importer `import 'remixicon/fonts/remixicon.css'` dans le point d'entrée",
-        ),
-        (
-            &["iconify"],
-            &["@iconify/vue", "@iconify/react", "@iconify/svelte", "iconify-icon"],
-            "@iconify/vue (ou @iconify/react selon le framework) — installer via `npm install`",
-        ),
-        (
-            &["lucide"],
-            &["lucide-vue-next", "lucide-react", "lucide-svelte", "lucide"],
-            "lucide-vue-next (ou lucide-react selon le framework) — installer via `npm install`",
-        ),
-        (
-            &["heroicons", "heroicon"],
-            &["@heroicons/vue", "@heroicons/react"],
-            "@heroicons/vue (ou @heroicons/react) — installer via `npm install`",
-        ),
-        (
-            &["fontawesome", "font-awesome", "font awesome"],
-            &[
-                "@fortawesome/fontawesome-free",
-                "@fortawesome/vue-fontawesome",
-                "@fortawesome/react-fontawesome",
-            ],
-            "@fortawesome/fontawesome-free — installer via `npm install`",
-        ),
-        (
-            &["bootstrap-icons", "bootstrap icons"],
-            &["bootstrap-icons"],
-            "bootstrap-icons — installer via `npm install`",
-        ),
-        (
-            &["tabler icon", "tabler-icons"],
-            &["@tabler/icons-vue", "@tabler/icons-react", "@tabler/icons-webfont"],
-            "@tabler/icons-vue (ou @tabler/icons-react) — installer via `npm install`",
-        ),
-        (
-            &["phosphor"],
-            &["@phosphor-icons/vue", "@phosphor-icons/react", "phosphor-icons"],
-            "@phosphor-icons/vue (ou @phosphor-icons/react) — installer via `npm install`",
-        ),
-        (&["pinia"], &["pinia"], "pinia — installer via `npm install pinia`"),
-        (
-            &["vue-router", "vue router"],
-            &["vue-router"],
-            "vue-router — installer via `npm install vue-router`",
-        ),
-        (&["axios"], &["axios"], "axios — installer via `npm install axios`"),
-        (&["marked"], &["marked"], "marked — installer via `npm install marked`"),
-        (
-            &["highlight.js", "highlightjs"],
-            &["highlight.js"],
-            "highlight.js — installer via `npm install highlight.js`",
-        ),
-        (
-            &["chart.js", "chartjs"],
-            &["chart.js"],
-            "chart.js — installer via `npm install chart.js`",
-        ),
-        (
-            &["echarts"],
-            &["echarts"],
-            "echarts — installer via `npm install echarts`",
-        ),
-        (&["gsap"], &["gsap"], "gsap — installer via `npm install gsap`"),
-        (&["dayjs"], &["dayjs"], "dayjs — installer via `npm install dayjs`"),
-        (&["zod"], &["zod"], "zod — installer via `npm install zod`"),
-    ];
-
-    let mut missing = Vec::new();
-    for &(prompt_markers, aliases, advice) in table {
-        if !prompt_markers.iter().any(|m| low.contains(m)) {
-            continue;
-        }
-        let already_installed = aliases.iter().any(|alias| {
-            st.installed_packages
-                .iter()
-                .any(|pkg| pkg.eq_ignore_ascii_case(alias))
-        });
-        if !already_installed {
-            missing.push(advice.to_string());
-        }
-    }
-    missing
-}
-
-fn resolve_import_spec_to_project_file(
-    from_rel_path: &str,
-    raw_spec: &str,
-    all_files: &[String],
-) -> Option<String> {
-    let spec = raw_spec
-        .trim()
-        .split('?')
-        .next()
-        .unwrap_or("")
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .replace('\\', "/");
-
-    if spec.is_empty() || spec.starts_with("http://") || spec.starts_with("https://") {
-        return None;
-    }
-
-    let candidate_base = if let Some(rest) = spec.strip_prefix("@/") {
-        format!("src/{rest}")
-    } else if spec.starts_with('/') {
-        spec.trim_start_matches('/').to_string()
-    } else if spec.starts_with("./") || spec.starts_with("../") {
-        let mut stack: Vec<&str> = match from_rel_path.rsplit_once('/') {
-            Some((dir, _)) if !dir.is_empty() => dir.split('/').filter(|s| !s.is_empty()).collect(),
-            _ => Vec::new(),
-        };
-        for seg in spec.split('/') {
-            match seg {
-                "" | "." => {}
-                ".." => {
-                    stack.pop();
-                }
-                other => stack.push(other),
-            }
-        }
-        if stack.is_empty() {
-            return None;
-        }
-        stack.join("/")
-    } else {
-        return None;
-    };
-
-    if let Some(exact) = all_files
-        .iter()
-        .find(|f| f.eq_ignore_ascii_case(&candidate_base))
-    {
-        return Some(exact.clone());
-    }
-
-    for ext in [
-        ".vue", ".tsx", ".ts", ".jsx", ".js", ".svelte", ".css", ".scss",
-    ] {
-        let with_ext = format!("{candidate_base}{ext}");
-        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(&with_ext)) {
-            return Some(found.clone());
-        }
-    }
-
-    for idx in ["/index.ts", "/index.js", "/index.tsx", "/index.jsx"] {
-        let with_idx = format!("{candidate_base}{idx}");
-        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(&with_idx)) {
-            return Some(found.clone());
-        }
-    }
-
-    None
-}
-
-pub fn extract_relative_imports(
-    rel_path: &str,
-    content: &str,
-    all_files: &[String],
-) -> Vec<String> {
-    let mut resolved = Vec::new();
-    let import_from_re = Regex::new(
-        r#"(?m)import\s+(?:[^;{}'"]+|\{[^;]*\})\s+from\s+['"]([^'"]+)['"]"#,
-    )
-    .expect("valid import_from regex");
-    let import_side_re =
-        Regex::new(r#"(?m)import\s+['"]([^'"]+)['"]"#).expect("valid import_side regex");
-    let style_src_re =
-        Regex::new(r#"(?i)<style[^>]*\bsrc\s*=\s*['"]([^'"]+)['"]"#).expect("valid style_src regex");
-
-    let mut specs = Vec::new();
-    for cap in import_from_re.captures_iter(content) {
-        if let Some(m) = cap.get(1) {
-            specs.push(m.as_str());
-        }
-    }
-    for cap in import_side_re.captures_iter(content) {
-        if let Some(m) = cap.get(1) {
-            specs.push(m.as_str());
-        }
-    }
-    for cap in style_src_re.captures_iter(content) {
-        if let Some(m) = cap.get(1) {
-            specs.push(m.as_str());
-        }
-    }
-
-    for spec in specs {
-        if let Some(found) = resolve_import_spec_to_project_file(rel_path, spec, all_files) {
-            if !resolved.iter().any(|existing| existing == &found) {
-                resolved.push(found);
-            }
-        }
-    }
-
-    resolved
-}
-
-fn is_stylesheet_path(path: &str) -> bool {
-    let low = path.to_lowercase();
-    low.ends_with(".css") || low.ends_with(".scss")
-}
-
-fn is_ui_component_or_page(path: &str) -> bool {
-    let low = path.to_lowercase();
-    low.ends_with(".vue")
-        || low.ends_with(".tsx")
-        || low.ends_with(".jsx")
-        || low.ends_with(".svelte")
-        || low.ends_with(".html")
-}
-
-pub fn detect_frontend_stack(
-    project_root: &Path,
-    all_files: &[String],
-) -> Option<FrontendStackInfo> {
-    let is_frontend_repo = all_files.iter().any(|f| {
-        let low = f.to_lowercase();
-        let base = low.rsplit('/').next().unwrap_or(&low);
-        base == "package.json"
-            || base == "index.html"
-            || low.ends_with(".vue")
-            || low.ends_with(".tsx")
-            || low.ends_with(".jsx")
-            || low.ends_with(".svelte")
-            || low.ends_with(".css")
-            || low.ends_with(".scss")
-    });
-    if !is_frontend_repo {
-        return None;
-    }
-
-    let mut info = FrontendStackInfo::default();
-
-    if let Some(pkg_rel) = all_files.iter().find(|f| f.eq_ignore_ascii_case("package.json")) {
-        let full = project_root.join(pkg_rel);
-        if let Ok(meta) = std::fs::metadata(&full) {
-            if meta.is_file() && meta.len() <= 65_536 {
-                if let Ok(raw) = std::fs::read_to_string(&full) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        let has_dep = |name: &str| -> bool {
-                            json.get("dependencies")
-                                .and_then(|d| d.get(name))
-                                .is_some()
-                                || json
-                                    .get("devDependencies")
-                                    .and_then(|d| d.get(name))
-                                    .is_some()
-                        };
-
-                        info.framework = if has_dep("next") {
-                            Some("Next.js".to_string())
-                        } else if has_dep("nuxt") {
-                            Some("Nuxt".to_string())
-                        } else if has_dep("vue") {
-                            Some("Vue".to_string())
-                        } else if has_dep("react") {
-                            Some("React".to_string())
-                        } else if has_dep("svelte") {
-                            Some("Svelte".to_string())
-                        } else {
-                            None
-                        };
-
-                        if has_dep("vite") {
-                            info.bundler = Some("Vite".to_string());
-                        }
-
-                        info.tailwind_in_pkg = has_dep("tailwindcss")
-                            || has_dep("@tailwindcss/vite")
-                            || has_dep("@tailwindcss/postcss");
-
-                        let mut pkgs = Vec::new();
-                        for section in ["dependencies", "devDependencies"] {
-                            if let Some(obj) = json.get(section).and_then(|v| v.as_object()) {
-                                for k in obj.keys() {
-                                    if !pkgs.iter().any(|p: &String| p.eq_ignore_ascii_case(k)) {
-                                        pkgs.push(k.clone());
-                                    }
-                                }
-                            }
-                        }
-                        pkgs.sort_by_key(|p| p.to_lowercase());
-                        pkgs.truncate(40);
-                        info.installed_packages = pkgs;
-                    }
-                }
-            }
-        }
-    }
-
-    for entry_cand in [
-        "src/main.ts",
-        "src/main.js",
-        "src/main.tsx",
-        "src/main.jsx",
-        "src/index.ts",
-        "src/index.js",
-        "src/index.tsx",
-        "src/index.jsx",
-    ] {
-        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(entry_cand)) {
-            info.entry_file = Some(found.clone());
-            break;
-        }
-    }
-
-    let css_candidates = [
-        "src/style.css",
-        "src/styles.css",
-        "src/styles/main.css",
-        "src/assets/main.css",
-        "src/assets/base.css",
-        "src/index.css",
-        "src/main.css",
-        "src/app.css",
-        "src/App.css",
-        "app/globals.css",
-        "style.css",
-        "styles.css",
-    ];
-    for cand in css_candidates {
-        if info.global_css_files.len() >= 3 {
-            break;
-        }
-        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
-            if !info.global_css_files.contains(found) {
-                info.global_css_files.push(found.clone());
-            }
-        }
-    }
-    if info.global_css_files.is_empty() {
-        if let Some(fallback_css) = all_files
-            .iter()
-            .filter(|f| is_stylesheet_path(f))
-            .min_by_key(|f| (f.matches('/').count(), f.len()))
-        {
-            info.global_css_files.push(fallback_css.clone());
-        }
-    }
-
-    let mut push_imported_css = |p: String| {
-        if is_stylesheet_path(&p)
-            && !info
-                .imported_css_in_entry
-                .iter()
-                .any(|existing| existing.eq_ignore_ascii_case(&p))
-        {
-            info.imported_css_in_entry.push(p);
-        }
-    };
-
-    if let Some(ref entry) = info.entry_file.clone() {
-        if let Ok(content) = std::fs::read_to_string(project_root.join(entry)) {
-            for imp in extract_relative_imports(entry, &content, all_files) {
-                push_imported_css(imp);
-            }
-        }
-    }
-
-    for root_app in [
-        "src/App.vue",
-        "src/App.tsx",
-        "src/App.jsx",
-        "src/App.svelte",
-    ] {
-        if let Some(found_app) = all_files.iter().find(|f| f.eq_ignore_ascii_case(root_app)) {
-            if let Ok(content) = std::fs::read_to_string(project_root.join(found_app)) {
-                for imp in extract_relative_imports(found_app, &content, all_files) {
-                    push_imported_css(imp);
-                }
-            }
-        }
-    }
-
-    let mut has_tailwind_cdn = false;
-    if let Some(index_html) = all_files.iter().find(|f| f.eq_ignore_ascii_case("index.html")) {
-        if let Ok(html_content) = std::fs::read_to_string(project_root.join(index_html)) {
-            if html_content.contains("cdn.tailwindcss.com") {
-                has_tailwind_cdn = true;
-            }
-            let link_re =
-                Regex::new(r#"(?i)<link\b[^>]*rel\s*=\s*['"]stylesheet['"][^>]*>"#)
-                    .expect("valid link regex");
-            let href_re =
-                Regex::new(r#"(?i)\bhref\s*=\s*['"]([^'"]+)['"]"#).expect("valid href regex");
-            for m in link_re.find_iter(&html_content) {
-                if let Some(cap) = href_re.captures(m.as_str()) {
-                    if let Some(href) = cap.get(1) {
-                        if let Some(resolved_css) =
-                            resolve_import_spec_to_project_file(index_html, href.as_str(), all_files)
-                        {
-                            push_imported_css(resolved_css);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let any_global_in_entry = info.global_css_files.iter().any(|g| {
-        info.imported_css_in_entry
-            .iter()
-            .any(|imp| imp.eq_ignore_ascii_case(g))
-    });
-    info.css_entry_missing_import = !info.global_css_files.is_empty()
-        && info.entry_file.is_some()
-        && !any_global_in_entry
-        && info.imported_css_in_entry.is_empty();
-
-    if has_tailwind_cdn {
-        info.tailwind_active = true;
-    } else if info.tailwind_in_pkg {
-        let mut css_to_check = info.imported_css_in_entry.clone();
-        for g in &info.global_css_files {
-            if !css_to_check.iter().any(|c| c.eq_ignore_ascii_case(g)) {
-                css_to_check.push(g.clone());
-            }
-        }
-        let has_css_directive = css_to_check.iter().any(|css_rel| {
-            std::fs::read_to_string(project_root.join(css_rel))
-                .map(|body| {
-                    body.contains("@tailwind")
-                        || body.contains("@import \"tailwindcss\"")
-                        || body.contains("@import 'tailwindcss'")
-                        || body.contains("@import \"tailwindcss/")
-                        || body.contains("@import 'tailwindcss/")
-                })
-                .unwrap_or(false)
-        });
-
-        let has_vite_tw = [
-            "vite.config.ts",
-            "vite.config.js",
-            "vite.config.mjs",
-            "vite.config.cjs",
-        ]
-        .iter()
-        .any(|cfg| {
-            all_files
-                .iter()
-                .find(|f| f.eq_ignore_ascii_case(cfg))
-                .and_then(|rel| std::fs::read_to_string(project_root.join(rel)).ok())
-                .map(|c| c.contains("tailwindcss"))
-                .unwrap_or(false)
-        });
-
-        let has_postcss_tw = [
-            "postcss.config.js",
-            "postcss.config.cjs",
-            "postcss.config.mjs",
-            "postcss.config.ts",
-        ]
-        .iter()
-        .any(|cfg| {
-            all_files
-                .iter()
-                .find(|f| f.eq_ignore_ascii_case(cfg))
-                .and_then(|rel| std::fs::read_to_string(project_root.join(rel)).ok())
-                .map(|c| c.contains("tailwind"))
-                .unwrap_or(false)
-        });
-
-        let has_build_wiring = has_vite_tw
-            || has_postcss_tw
-            || matches!(info.framework.as_deref(), Some("Next.js" | "Nuxt"));
-
-        info.tailwind_active =
-            has_css_directive && has_build_wiring && !info.css_entry_missing_import;
-
-        if !info.tailwind_active {
-            let mut reasons = Vec::new();
-            if !has_build_wiring {
-                reasons.push("plugin Vite/PostCSS manquant");
-            }
-            if !has_css_directive {
-                reasons.push("directive @tailwind / @import \"tailwindcss\" absente");
-            }
-            if info.css_entry_missing_import {
-                reasons.push("feuille CSS non importée dans le point d'entrée");
-            }
-            if !reasons.is_empty() {
-                info.tailwind_broken_reason = Some(reasons.join(", "));
-            }
-        }
-    }
-
-    Some(info)
-}
-
-pub fn expand_design_targets_with_imports(
-    project_root: &Path,
-    all_files: &[String],
-    matched: &mut Vec<String>,
-    stack: Option<&FrontendStackInfo>,
-    max_files: usize,
-) {
-    augment_design_target_files(all_files, matched);
-    let cap = max_files.max(1);
-
-    let snapshot = matched.clone();
-    for rel in snapshot {
-        if matched.len() >= cap {
-            break;
-        }
-        if !is_ui_component_or_page(&rel) {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(project_root.join(&rel)) {
-            for imp in extract_relative_imports(&rel, &content, all_files) {
-                if matched.len() >= cap {
-                    break;
-                }
-                if (is_ui_component_or_page(&imp) || is_stylesheet_path(&imp))
-                    && !matched.iter().any(|existing| existing.eq_ignore_ascii_case(&imp))
-                {
-                    matched.push(imp);
-                }
-            }
-        }
-    }
-
-    if let Some(st) = stack {
-        if st.css_entry_missing_import && matched.len() < cap {
-            if let Some(ref entry) = st.entry_file {
-                if !matched.iter().any(|existing| existing.eq_ignore_ascii_case(entry)) {
-                    matched.push(entry.clone());
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CssAuditReport {
-    pub issues: Vec<String>,
-    pub flagged_files: Vec<String>,
-    pub needs_entry_import: Option<String>,
-}
-
-fn collect_css_class_selectors(css_text: &str, out: &mut HashSet<String>) {
-    let re = Regex::new(r"\.([A-Za-z_][A-Za-z0-9_-]*)").expect("valid css selector regex");
-    for cap in re.captures_iter(css_text) {
-        if let Some(m) = cap.get(1) {
-            out.insert(m.as_str().to_string());
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn is_tailwind_utility_token(tok: &str) -> bool {
-    if tok.is_empty() || tok.contains("://") {
-        return false;
-    }
-    let core = tok.rsplit(':').next().unwrap_or(tok).trim_start_matches('!');
-    if matches!(
-        core,
-        "h-screen"
-            | "w-screen"
-            | "min-h-screen"
-            | "flex-1"
-            | "flex-col"
-            | "items-center"
-            | "justify-between"
-            | "justify-end"
-            | "justify-start"
-            | "mx-auto"
-            | "rounded-lg"
-            | "rounded-xl"
-            | "rounded-full"
-            | "text-white"
-            | "overflow-y-auto"
-            | "shrink-0"
-    ) {
-        return true;
-    }
-
-    let prefixes = [
-        "w-[",
-        "h-[",
-        "bg-[",
-        "text-[",
-        "bg-gradient-to-",
-        "from-",
-        "to-",
-        "via-",
-        "space-y-",
-        "gap-",
-        "px-",
-        "py-",
-        "bg-gray-",
-        "bg-slate-",
-        "bg-zinc-",
-        "bg-neutral-",
-        "bg-blue-",
-        "bg-orange-",
-        "bg-red-",
-        "text-gray-",
-        "border-gray-",
-    ];
-    prefixes
-        .iter()
-        .any(|p| core.starts_with(p) && core.len() > p.len())
-}
-
-fn has_non_empty_css_rule(css_text: &str) -> bool {
-    let stripped_block = Regex::new(r"/\*[\s\S]*?\*/")
-        .map(|re| re.replace_all(css_text, "").into_owned())
-        .unwrap_or_else(|_| css_text.to_string());
-    if let (Some(open), Some(close)) = (stripped_block.find('{'), stripped_block.rfind('}')) {
-        open < close && !stripped_block[open + 1..close].trim().is_empty()
-    } else {
-        false
-    }
-}
-
-pub fn audit_frontend_css_issues(
-    project_root: &Path,
-    all_files: &[String],
-    touched_files: &[String],
-    is_designer_task: bool,
-) -> CssAuditReport {
-    let mut report = CssAuditReport::default();
-    let Some(stack) = detect_frontend_stack(project_root, all_files) else {
-        return report;
-    };
-
-    let mut global_css_classes = HashSet::new();
-    for rel in all_files.iter().filter(|f| is_stylesheet_path(f)).take(12) {
-        let full = project_root.join(rel);
-        if let Ok(meta) = std::fs::metadata(&full) {
-            if meta.is_file() && meta.len() <= 131_072 {
-                if let Ok(css_body) = std::fs::read_to_string(&full) {
-                    collect_css_class_selectors(&css_body, &mut global_css_classes);
-                }
-            }
-        }
-    }
-
-    let style_block_re =
-        Regex::new(r"(?is)<style\b[^>]*>([\s\S]*?)(?:</style>|$)").expect("valid style regex");
-    let template_block_re =
-        Regex::new(r"(?is)<template\b[^>]*>([\s\S]*?)</template>").expect("valid template regex");
-
-    let mut push_flagged = |rel: &str| {
-        if !report
-            .flagged_files
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(rel))
-        {
-            report.flagged_files.push(rel.to_string());
-        }
-    };
-
-    // Anomalie : feuille CSS globale existante non importée dans le point d'entrée
-    if stack.css_entry_missing_import && !stack.global_css_files.is_empty() {
-        let entry = stack.entry_file.clone().unwrap_or_default();
-        report.issues.push(format!(
-            "La feuille CSS globale `{}` n'est importée ni dans `{entry}` ni dans `App` / `index.html` : aucun style global ne sera chargé.",
-            stack.global_css_files[0]
-        ));
-        if !entry.is_empty() {
-            report.needs_entry_import = Some(entry);
-        }
-    }
-
-    // Anomalie 3 : tâche Designer sans Tailwind actif, aucune règle CSS écrite
-    if is_designer_task && !stack.tailwind_active {
-        let has_touched_css_rules = touched_files
-            .iter()
-            .filter(|f| is_stylesheet_path(f))
-            .any(|css_rel| {
-                std::fs::read_to_string(project_root.join(css_rel))
-                    .map(|body| has_non_empty_css_rule(&body))
-                    .unwrap_or(false)
-            });
-
-        if !has_touched_css_rules {
-            for rel in touched_files {
-                if !rel.to_lowercase().ends_with(".vue") {
-                    continue;
-                }
-                let Ok(content) = std::fs::read_to_string(project_root.join(rel)) else {
-                    continue;
-                };
-                let has_structural_template = template_block_re
-                    .captures(&content)
-                    .and_then(|c| c.get(1))
-                    .map(|m| {
-                        let low_tpl = m.as_str().to_lowercase();
-                        ["<div", "<aside", "<main", "<nav", "<section", "<header"]
-                            .iter()
-                            .any(|tag| low_tpl.contains(tag))
-                    })
-                    .unwrap_or(false);
-                if !has_structural_template {
-                    continue;
-                }
-
-                let has_style_rules = style_block_re
-                    .captures_iter(&content)
-                    .any(|cap| cap.get(1).map(|m| m.as_str().contains('{')).unwrap_or(false));
-                if !has_style_rules {
-                    report.issues.push(format!(
-                        "Le composant `{rel}` contient une structure `<template>` sans aucun bloc `<style>` avec des règles CSS (et aucun fichier CSS global n'a été mis à jour)."
-                    ));
-                    push_flagged(rel);
-                }
-            }
-        }
-    }
-
-    report
 }
 
 fn role_display_name(role: &str) -> &'static str {
@@ -1954,108 +1065,8 @@ pub fn match_files_deterministically(
         }
     }
 
-    if !matched.is_empty() {
-        return (matched, true);
-    }
-
-    let is_install = is_install_or_setup_prompt(&prompt_lower);
-    let wants_tailwind_setup = is_install && prompt_lower.contains("tailwind");
-    let max_kw_matches = if wants_tailwind_setup { 3 } else { 2 };
-
-    let mut add_if_exists = |cand: &str| {
-        if matched.len() >= max_kw_matches {
-            return;
-        }
-        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
-            if !matched.contains(found) {
-                matched.push(found.clone());
-            }
-        }
-    };
-
-    if prompt_lower.contains("vite") {
-        if all_files.iter().any(|f| f.eq_ignore_ascii_case("vite.config.ts")) {
-            add_if_exists("vite.config.ts");
-        } else {
-            add_if_exists("vite.config.js");
-        }
-        if ["script", "start", "démarre", "demarre", "serveur", "server", "build", "dev"]
-            .iter()
-            .any(|kw| prompt_lower.contains(kw))
-        {
-            add_if_exists("package.json");
-        }
-    }
-    if prompt_lower.contains("tauri") {
-        add_if_exists("src-tauri/tauri.conf.json");
-    }
-    if prompt_lower.contains("tsconfig") {
-        add_if_exists("tsconfig.json");
-    }
-    if prompt_lower.contains("cargo") {
-        add_if_exists("src-tauri/Cargo.toml");
-    }
-    if prompt_lower.contains("package.json")
-        || prompt_lower.contains("dépendance")
-        || prompt_lower.contains("dependance")
-        || prompt_lower.contains("dependencies")
-    {
-        add_if_exists("package.json");
-    }
-    if is_install
-        || prompt_lower.contains("npm ")
-        || prompt_lower.contains("pnpm ")
-        || prompt_lower.contains("yarn ")
-    {
-        if !prompt_lower.contains("cargo ") && !prompt_lower.contains("pip ") {
-            add_if_exists("package.json");
-        }
-        if prompt_lower.contains("tailwind")
-            || prompt_lower.contains("vite")
-            || prompt_lower.contains("plugin")
-        {
-            let has_vite_cfg = all_files.iter().any(|f| {
-                f.eq_ignore_ascii_case("vite.config.ts")
-                    || f.eq_ignore_ascii_case("vite.config.js")
-            });
-            if has_vite_cfg {
-                if all_files
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case("vite.config.ts"))
-                {
-                    add_if_exists("vite.config.ts");
-                } else {
-                    add_if_exists("vite.config.js");
-                }
-            } else {
-                for cand in [
-                    "postcss.config.js",
-                    "postcss.config.cjs",
-                    "tailwind.config.ts",
-                    "tailwind.config.js",
-                ] {
-                    add_if_exists(cand);
-                }
-            }
-        }
-        if wants_tailwind_setup {
-            for css_cand in [
-                "src/index.css",
-                "src/style.css",
-                "src/styles/main.css",
-                "src/assets/main.css",
-                "src/main.css",
-                "app/globals.css",
-            ] {
-                if all_files.iter().any(|f| f.eq_ignore_ascii_case(css_cand)) {
-                    add_if_exists(css_cand);
-                    break;
-                }
-            }
-        }
-    }
-
-    (matched, false)
+    let explicit = !matched.is_empty();
+    (matched, explicit)
 }
 
 fn filter_files_by_size_budget(
@@ -2093,104 +1104,6 @@ fn filter_files_by_size_budget(
     kept
 }
 
-pub fn collect_structural_context_files(
-    project_root: &Path,
-    all_files: &[String],
-    target_files: &[String],
-    is_cloud_exec: bool,
-    is_global_task: bool,
-    is_design_task: bool,
-    exec_num_ctx: usize,
-) -> Vec<String> {
-    if !is_global_task && !(is_cloud_exec && target_files.is_empty()) && !is_design_task {
-        return Vec::new();
-    }
-
-    let push_if_new = |cand: &str, out: &mut Vec<String>| {
-        if target_files.iter().any(|t| t.eq_ignore_ascii_case(cand)) {
-            return;
-        }
-        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(cand)) {
-            out.push(cand.to_string());
-        }
-    };
-
-    if is_design_task && !is_global_task {
-        let (max_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
-            (3usize, 6_144u64, 20_480u64)
-        } else {
-            (2usize, 6_144u64, 6_144u64)
-        };
-        let mut candidates = Vec::new();
-        for name in [
-            "index.html",
-            "src/main.js",
-            "src/main.ts",
-            "src/main.tsx",
-            "src/main.jsx",
-            "vite.config.js",
-            "vite.config.ts",
-            "package.json",
-        ] {
-            if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(name)) {
-                push_if_new(found, &mut candidates);
-            }
-        }
-        return filter_files_by_size_budget(
-            project_root,
-            candidates,
-            max_files,
-            max_single_bytes,
-            max_total_bytes,
-        );
-    }
-
-    let (max_files, max_single_bytes, max_total_bytes) = if is_cloud_exec {
-        (10usize, 32_768u64, 98_304u64)
-    } else if exec_num_ctx >= 16_384 {
-        (4usize, 12_288u64, 24_576u64)
-    } else {
-        (3usize, 6_144u64, 10_240u64)
-    };
-
-    let mut candidates: Vec<String> = Vec::new();
-    let manifests = [
-        "package.json",
-        "Cargo.toml",
-        "src-tauri/Cargo.toml",
-        "src-tauri/tauri.conf.json",
-        "pyproject.toml",
-        "requirements.txt",
-        "go.mod",
-        "vite.config.ts",
-        "vite.config.js",
-        "tsconfig.json",
-        "index.html",
-        "README.md",
-        "src/App.vue",
-        "src/App.tsx",
-        "src/main.ts",
-        "src/main.js",
-        "src/main.tsx",
-        "src/main.jsx",
-        "src-tauri/src/lib.rs",
-        "src-tauri/src/models.rs",
-    ];
-    for name in manifests {
-        if let Some(found) = all_files.iter().find(|f| f.eq_ignore_ascii_case(name)) {
-            push_if_new(found, &mut candidates);
-        }
-    }
-
-    filter_files_by_size_budget(
-        project_root,
-        candidates,
-        max_files,
-        max_single_bytes,
-        max_total_bytes,
-    )
-}
-
 #[derive(Debug, Clone)]
 struct CartographerPlan {
     target_files: Vec<String>,
@@ -2212,8 +1125,6 @@ async fn run_cartographer(
     carto_model: &str,
     exec_provider: &str,
     ollama_running: bool,
-    is_design_task: bool,
-    frontend_stack: Option<&FrontendStackInfo>,
 ) -> CartographerPlan {
     if all_files.is_empty() {
         let is_global_task = is_global_or_doc_task(user_prompt, &[]);
@@ -2236,19 +1147,8 @@ async fn run_cartographer(
     } else {
         (4usize, 20_480u64, 32_768u64)
     };
-    let doc_focused_prompt = is_doc_focused_prompt(&user_prompt.to_lowercase());
-    let install_setup_prompt = is_install_or_setup_prompt(user_prompt);
 
-    let (mut tier1, explicit) = match_files_deterministically(user_prompt, attachments, all_files);
-    if is_design_task && !tier1.is_empty() && !doc_focused_prompt && !install_setup_prompt {
-        expand_design_targets_with_imports(
-            project_root,
-            all_files,
-            &mut tier1,
-            frontend_stack,
-            max_target_files,
-        );
-    }
+    let (tier1, explicit) = match_files_deterministically(user_prompt, attachments, all_files);
     let budgeted_tier1 = filter_files_by_size_budget(
         project_root,
         tier1,
@@ -2259,247 +1159,142 @@ async fn run_cartographer(
 
     let (target_files, explicit_match, base_note, cartographer_tokens) =
         if !budgeted_tier1.is_empty() {
-            let note = if explicit {
-                "0 tok déterministe (mention directe)".to_string()
-            } else {
-                "0 tok déterministe (mot-clé outillage)".to_string()
-            };
-            (budgeted_tier1, explicit, note, None)
+            (
+                budgeted_tier1,
+                explicit,
+                "0 tok déterministe (mention directe)".to_string(),
+                None,
+            )
         } else {
-            // Voie rapide 0 token pour petits dépôts UI : graphe UI + imports sans LLM routeur
-            let mut fast_ui_budgeted = Vec::new();
-            if is_design_task && !doc_focused_prompt && !install_setup_prompt && all_files.len() <= 24 {
-                let mut fast_ui = Vec::new();
-                expand_design_targets_with_imports(
-                    project_root,
-                    all_files,
-                    &mut fast_ui,
-                    frontend_stack,
-                    max_target_files,
-                );
-                fast_ui_budgeted = filter_files_by_size_budget(
-                    project_root,
-                    fast_ui,
-                    max_target_files,
-                    max_single_bytes,
-                    max_total_bytes,
-                );
-            }
-
-            if !fast_ui_budgeted.is_empty() {
-                (
-                    fast_ui_budgeted,
-                    false,
-                    "0 tok déterministe (graphe UI + imports)".to_string(),
-                    None,
-                )
-            } else {
-                let can_call_llm = if carto_provider == "ollama" {
-                    ollama_running
-                        || providers::build_fallback_candidates(
-                            carto_provider,
-                            carto_model,
-                            "cartographer",
-                            settings,
-                            ollama_running,
-                        )
-                        .iter()
-                        .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
-                } else {
-                    providers::find_provider_key(settings, carto_provider).is_some()
-                        || ollama_running
-                        || providers::build_fallback_candidates(
-                            carto_provider,
-                            carto_model,
-                            "cartographer",
-                            settings,
-                            ollama_running,
-                        )
-                        .iter()
-                        .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
-                };
-
-                if all_files.len() <= 250 || !can_call_llm {
-                    let mut fallback = Vec::new();
-                    if is_design_task && !doc_focused_prompt && !install_setup_prompt {
-                        expand_design_targets_with_imports(
-                            project_root,
-                            all_files,
-                            &mut fallback,
-                            frontend_stack,
-                            max_target_files,
-                        );
-                    }
-                    let budgeted = filter_files_by_size_budget(
-                        project_root,
-                        fallback,
-                        max_target_files,
-                        max_single_bytes,
-                        max_total_bytes,
-                    );
-                    (
-                        budgeted,
-                        false,
-                        "0 tok déterministe (arborescence directe injectée)".to_string(),
-                        None,
-                    )
-                } else if all_files.len() > 400 {
-                    let mut fallback = Vec::new();
-                    if is_design_task && !doc_focused_prompt {
-                        expand_design_targets_with_imports(
-                            project_root,
-                            all_files,
-                            &mut fallback,
-                            frontend_stack,
-                            max_target_files,
-                        );
-                    }
-                    let budgeted = filter_files_by_size_budget(
-                        project_root,
-                        fallback,
-                        max_target_files,
-                        max_single_bytes,
-                        max_total_bytes,
-                    );
-                    (
-                        budgeted,
-                        false,
-                        "Dépôt volumineux (>400 fichiers) · repo-map native".to_string(),
-                        None,
-                    )
-                } else {
-                    let mut prioritized = Vec::new();
-                    let mut others = Vec::new();
-                    for f in all_files {
-                        if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
-                            prioritized.push(f.clone());
-                        } else {
-                            others.push(f.clone());
-                        }
-                    }
-                    prioritized.extend(others);
-                    let compact_limit = if is_cloud_exec { 200 } else { 100 };
-                    let compact_files: Vec<String> =
-                        prioritized.into_iter().take(compact_limit).collect();
-
-                    let sys = format!(
-                        "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum {max_target_files} chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"src/App.vue\"] ou []). Aucun texte ni explication."
-                    );
-                    let user = format!(
-                        "Fichiers:\n{}\n\nDemande:\n{}",
-                        compact_files.join("\n"),
-                        truncate_chars(user_prompt.trim(), 1600)
-                    );
-
-                    match providers::call_provider_oneshot_with_fallback(
+            let can_call_llm = if carto_provider == "ollama" {
+                ollama_running
+                    || providers::build_fallback_candidates(
                         carto_provider,
                         carto_model,
                         "cartographer",
-                        ollama_running,
                         settings,
-                        &sys,
-                        &user,
-                        160,
-                        0.0,
+                        ollama_running,
                     )
-                    .await
-                    {
-                        Ok((reply, p_tok, c_tok, used_prov, _used_mdl, fb_reason)) => {
-                            let mut routed = Vec::new();
-                            if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
-                                if start < end {
-                                    if let Ok(arr) =
-                                        serde_json::from_str::<Vec<String>>(&reply[start..=end])
-                                    {
-                                        for cand in arr {
-                                            let clean = cand.trim().trim_start_matches("./");
-                                            if let Some(canon) =
-                                                all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
-                                            {
-                                                if !routed.contains(canon) {
-                                                    routed.push(canon.clone());
-                                                }
+                    .iter()
+                    .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
+            } else {
+                providers::find_provider_key(settings, carto_provider).is_some()
+                    || ollama_running
+                    || providers::build_fallback_candidates(
+                        carto_provider,
+                        carto_model,
+                        "cartographer",
+                        settings,
+                        ollama_running,
+                    )
+                    .iter()
+                    .any(|(p, _)| p != "ollama" && providers::find_provider_key(settings, p).is_some())
+            };
+
+            if all_files.len() <= 250 || !can_call_llm {
+                (
+                    Vec::new(),
+                    false,
+                    "0 tok déterministe (WorkspaceSnapshot injecté)".to_string(),
+                    None,
+                )
+            } else if all_files.len() > 400 {
+                (
+                    Vec::new(),
+                    false,
+                    "Dépôt volumineux (>400 fichiers) · repo-map native".to_string(),
+                    None,
+                )
+            } else {
+                let mut prioritized = Vec::new();
+                let mut others = Vec::new();
+                for f in all_files {
+                    if !f.contains('/') {
+                        prioritized.push(f.clone());
+                    } else {
+                        others.push(f.clone());
+                    }
+                }
+                prioritized.extend(others);
+                let compact_limit = if is_cloud_exec { 200 } else { 100 };
+                let compact_files: Vec<String> =
+                    prioritized.into_iter().take(compact_limit).collect();
+
+                let sys = format!(
+                    "Tu es un routeur de fichiers. À partir de la liste des fichiers du projet et de la demande utilisateur, retourne UNIQUEMENT un tableau JSON contenant au maximum {max_target_files} chemins relatifs exacts de fichiers nécessaires pour répondre (ex: [\"chemin/fichier.ext\"] ou []). Aucun texte ni explication."
+                );
+                let user = format!(
+                    "Fichiers:\n{}\n\nDemande:\n{}",
+                    compact_files.join("\n"),
+                    truncate_chars(user_prompt.trim(), 1600)
+                );
+
+                match providers::call_provider_oneshot_with_fallback(
+                    carto_provider,
+                    carto_model,
+                    "cartographer",
+                    ollama_running,
+                    settings,
+                    &sys,
+                    &user,
+                    160,
+                    0.0,
+                )
+                .await
+                {
+                    Ok((reply, p_tok, c_tok, used_prov, _used_mdl, fb_reason)) => {
+                        let mut routed = Vec::new();
+                        if let (Some(start), Some(end)) = (reply.find('['), reply.rfind(']')) {
+                            if start < end {
+                                if let Ok(arr) =
+                                    serde_json::from_str::<Vec<String>>(&reply[start..=end])
+                                {
+                                    for cand in arr {
+                                        let clean = cand.trim().trim_start_matches("./");
+                                        if let Some(canon) =
+                                            all_files.iter().find(|f| f.eq_ignore_ascii_case(clean))
+                                        {
+                                            if !routed.contains(canon) {
+                                                routed.push(canon.clone());
                                             }
                                         }
                                     }
                                 }
                             }
-                            if is_design_task && !doc_focused_prompt {
-                                expand_design_targets_with_imports(
-                                    project_root,
-                                    all_files,
-                                    &mut routed,
-                                    frontend_stack,
-                                    max_target_files,
-                                );
-                            }
-                            let budgeted = filter_files_by_size_budget(
-                                project_root,
-                                routed,
-                                max_target_files,
-                                max_single_bytes,
-                                max_total_bytes,
-                            );
-                            let fb_tag = if fb_reason.is_some() { " (repli)" } else { "" };
-                            let note = if budgeted.is_empty() {
-                                format!("Routeur IA ({used_prov}{fb_tag} · aucun fichier ciblé)")
-                            } else {
-                                format!("Routeur IA ({used_prov}{fb_tag})")
-                            };
-                            (budgeted, false, note, Some((p_tok, c_tok)))
                         }
-                        Err(_) => {
-                            let mut fallback = Vec::new();
-                            if is_design_task && !doc_focused_prompt {
-                                expand_design_targets_with_imports(
-                                    project_root,
-                                    all_files,
-                                    &mut fallback,
-                                    frontend_stack,
-                                    max_target_files,
-                                );
-                            }
-                            let budgeted = filter_files_by_size_budget(
-                                project_root,
-                                fallback,
-                                max_target_files,
-                                max_single_bytes,
-                                max_total_bytes,
-                            );
-                            (
-                                budgeted,
-                                false,
-                                "Repli repo-map native".to_string(),
-                                None,
-                            )
-                        }
+                        let budgeted = filter_files_by_size_budget(
+                            project_root,
+                            routed,
+                            max_target_files,
+                            max_single_bytes,
+                            max_total_bytes,
+                        );
+                        let fb_tag = if fb_reason.is_some() { " (repli)" } else { "" };
+                        let note = if budgeted.is_empty() {
+                            format!("Routeur IA ({used_prov}{fb_tag} · aucun fichier ciblé)")
+                        } else {
+                            format!("Routeur IA ({used_prov}{fb_tag})")
+                        };
+                        (budgeted, false, note, Some((p_tok, c_tok)))
                     }
+                    Err(_) => (
+                        Vec::new(),
+                        false,
+                        "Repli repo-map native".to_string(),
+                        None,
+                    ),
                 }
             }
         };
 
     let is_global_task = is_global_or_doc_task(user_prompt, &target_files);
-    let read_only_files = collect_structural_context_files(
-        project_root,
-        all_files,
-        &target_files,
-        is_cloud_exec,
-        is_global_task,
-        is_design_task && !doc_focused_prompt,
-        exec_num_ctx,
-    );
-    let strategy_note = if read_only_files.is_empty() {
-        base_note
-    } else {
-        format!("{base_note} + {} réf. lecture seule", read_only_files.len())
-    };
 
     CartographerPlan {
         target_files,
-        read_only_files,
+        read_only_files: Vec::new(),
         explicit_match,
         is_global_task,
-        strategy_note,
+        strategy_note: base_note,
         cartographer_tokens,
     }
 }
@@ -2717,9 +1512,9 @@ pub fn list_project_rules(project_root: &Path) -> Vec<ProjectRuleItem> {
                                 .file_stem()
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_default();
-                            let category = if stem.contains("vue") || stem.contains("frontend") || stem.contains("ui") {
+                            let category = if stem.contains("frontend") || stem.contains("ui") || stem.contains("client") {
                                 "frontend"
-                            } else if stem.contains("rust") || stem.contains("tauri") || stem.contains("backend") || stem.contains("api") {
+                            } else if stem.contains("backend") || stem.contains("api") || stem.contains("server") {
                                 "backend"
                             } else if stem.contains("git") {
                                 "git"
@@ -2762,21 +1557,6 @@ pub async fn init_project_agent_rules(
         .await
         .map_err(|e| format!("Impossible de créer le dossier .agents/rules: {e}"))?;
 
-    // Détection de l'écosystème
-    let has_cargo = root_path.join("Cargo.toml").exists();
-    let has_pkg = root_path.join("package.json").exists();
-    let pkg_content = if has_pkg {
-        tokio::fs::read_to_string(root_path.join("package.json")).await.unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let prompt_lower = initial_prompt.unwrap_or("").to_lowercase();
-    let is_vue = pkg_content.contains("\"vue\"") || prompt_lower.contains("vue");
-    let is_react = pkg_content.contains("\"react\"") || prompt_lower.contains("react");
-    let is_tauri = has_cargo || pkg_content.contains("@tauri-apps") || prompt_lower.contains("tauri");
-    let is_tailwind = pkg_content.contains("tailwindcss") || prompt_lower.contains("tailwind");
-    let is_python = root_path.join("pyproject.toml").exists() || root_path.join("requirements.txt").exists() || prompt_lower.contains("python");
-
     let prompt_desc = initial_prompt.unwrap_or("").trim();
 
     // 1. Initialiser AGENTS.md s'il n'existe pas encore
@@ -2794,37 +1574,15 @@ pub async fn init_project_agent_rules(
             ));
         }
 
-        agents_content.push_str("## 2. Architecture & Technologies\n");
-        if is_tauri {
-            agents_content.push_str("- **Desktop / Backend** : Tauri v2, Rust 2021 (moteur natif, Tokio, Serde).\n");
-        }
-        if is_vue {
-            agents_content.push_str("- **Frontend** : Vue 3 (Composition API avec `<script setup lang=\"ts\">`), Vite, Pinia.\n");
-        } else if is_react {
-            agents_content.push_str("- **Frontend** : React, TypeScript strict, Vite.\n");
-        }
-        if is_tailwind {
-            agents_content.push_str("- **Styles** : Tailwind CSS.\n");
-        }
-        if is_python {
-            agents_content.push_str("- **Backend / Scripts** : Python 3, typage strict.\n");
-        }
-
-        agents_content.push_str("\n## 3. Commandes de Build & Vérification\n```bash\n");
-        if has_pkg || is_vue || is_react {
-            agents_content.push_str("# Frontend vérification TypeScript et build\nnpm run build\n");
-        }
-        if has_cargo || is_tauri {
-            agents_content.push_str("# Backend Rust check & linter\ncargo check --manifest-path src-tauri/Cargo.toml\ncargo clippy --manifest-path src-tauri/Cargo.toml\n");
-        }
-        if is_python {
-            agents_content.push_str("# Python tests & types\npytest\nmypy .\n");
-        }
-        agents_content.push_str("```\n\n## 4. Règles Fondamentales pour les Agents\n\
-            1. **Zéro Régression de Types** : TypeScript strict partout, interdiction absolue d'utiliser `any`.\n\
-            2. **Gestion d'Erreurs Robuste** : Gérer les erreurs via `Result<T, E>` côté Rust et des try/catch typés côté frontend.\n\
-            3. **Édition Chirurgicale** : Préserver scrupuleusement l'indentation et le code existant.\n\
-            4. **Structure Modulaire** : Les directives thématiques sont compartimentées dans le dossier `.agents/rules/`.\n");
+        agents_content.push_str(
+            "## 2. Commandes de Build & Vérification\n\
+            S'appuyer sur les manifestes et configurations déclarés à la racine du projet pour exécuter les commandes de compilation, d'analyse statique et de test adaptées.\n\n\
+            ## 3. Règles Fondamentales pour les Agents\n\
+            1. **Zéro Régression de Types** : Respecter le typage strict requis par le projet.\n\
+            2. **Gestion d'Erreurs Robuste** : Gérer explicitement toutes les erreurs et cas limites sans panique ni crash silencieux.\n\
+            3. **Édition Chirurgicale** : Préserver scrupuleusement le style, l'indentation et le code existant.\n\
+            4. **Structure Modulaire** : Les directives thématiques complémentaires sont réparties dans le dossier `.agents/rules/`.\n"
+        );
 
         tokio::fs::write(&agents_path, agents_content)
             .await
@@ -2833,38 +1591,11 @@ pub async fn init_project_agent_rules(
     }
 
     // 2. Initialiser les règles modulaires dans .agents/rules/
-    if (is_vue || is_react) && !rules_dir.join("frontend.md").exists() && !rules_dir.join("frontend-vue.md").exists() {
-        let fe_file = if is_vue { "frontend-vue.md" } else { "frontend.md" };
-        let fe_content = if is_vue {
-            "# Règle Frontend : Vue 3 & TypeScript\n\n\
-            - **Composition API obligatoire** : toujours utiliser `<script setup lang=\"ts\">`.\n\
-            - **Props & Événements typés** : définir explicitement les types avec `defineProps<{...}>` et `defineEmits<{...}>`.\n\
-            - **TypeScript strict** : aucun `any` toléré. Utiliser `unknown` ou des interfaces dédiées dans `src/types/`.\n\
-            - **Stores Pinia** : syntaxe Setup Store avec refs et computeds.\n"
-        } else {
-            "# Règle Frontend : React & TypeScript\n\n\
-            - Composants fonctionnels avec hooks typés (`useState<T>`, `useMemo`).\n\
-            - Typage strict des props avec interfaces TypeScript dédiées.\n\
-            - Aucun type `any` toléré.\n"
-        };
-        tokio::fs::write(rules_dir.join(fe_file), fe_content).await.map_err(|e| e.to_string())?;
-        created_files.push(format!(".agents/rules/{fe_file}"));
-    }
-
-    if is_tauri && !rules_dir.join("backend-rust.md").exists() && !rules_dir.join("backend-rust-tauri.md").exists() {
-        let be_content = "# Règle Backend : Rust & Tauri v2\n\n\
-            - **Gestion d'erreurs** : Toujours utiliser `Result<T, E>` et `anyhow`.\n\
-            - **Zéro panique** : Ne jamais utiliser `.unwrap()` ou `.expect()` en production.\n\
-            - **Commandes Tauri** : Annoter avec `#[tauri::command]` et enregistrer dans `generate_handler![...]`.\n";
-        tokio::fs::write(rules_dir.join("backend-rust-tauri.md"), be_content).await.map_err(|e| e.to_string())?;
-        created_files.push(".agents/rules/backend-rust-tauri.md".to_string());
-    }
-
     if !rules_dir.join("validation.md").exists() {
         let val_content = "# Règle : Validation & Contrôle Qualité\n\n\
             Avant de clore une tâche ou proposer des modifications :\n\
-            1. Exécuter la vérification des types et le build de production.\n\
-            2. Corriger immédiatement toute erreur de compilation ou warning bloquant.\n\
+            1. Exécuter la vérification des types, la compilation ou les tests déclarés dans le projet.\n\
+            2. Corriger immédiatement toute erreur de compilation ou avertissement bloquant.\n\
             3. Vérifier que les interfaces et contrats d'API sont synchronisés.\n";
         tokio::fs::write(rules_dir.join("validation.md"), val_content).await.map_err(|e| e.to_string())?;
         created_files.push(".agents/rules/validation.md".to_string());
@@ -2876,7 +1607,7 @@ pub async fn init_project_agent_rules(
             - `feat(...)` : nouvelle fonctionnalité.\n\
             - `fix(...)` : correction de bug.\n\
             - `refactor(...)` : refactorisation sans changement fonctionnel.\n\
-            - `style(...)` : retouches CSS/UI cosmétiques.\n\
+            - `style(...)` : retouches cosmétiques / UI.\n\
             - `chore(...)` : maintenance et dépendances.\n";
         tokio::fs::write(rules_dir.join("git-workflow.md"), git_content).await.map_err(|e| e.to_string())?;
         created_files.push(".agents/rules/git-workflow.md".to_string());
@@ -3082,70 +1813,41 @@ pub fn parse_architect_plan(raw: &str, default_role: &str) -> ParsedArchitectPla
 
 fn build_native_system_prompt(
     role: &str,
-    edit_format: &str,
+    _edit_format: &str,
     active_mcp: &[&McpServerConfig],
     mcp_schemas_note: &str,
-    _frontend_stack: Option<&FrontendStackInfo>,
 ) -> String {
-    let edit_rules = if edit_format == "diff" {
-        "FORMATS D'ÉCRITURE ET D'ÉDITION DE FICHIERS :\n\
+    let edit_rules = "PROTOCOLE D'ÉCRITURE ET D'ÉDITION DE FICHIERS (Tool-First) :\n\
         1. CRÉATION OU RÉÉCRITURE COMPLÈTE (`write_file`) :\n\
-           Pour créer un nouveau fichier ou remplacer un fichier existant dans son intégralité, utilise `write_file` avec son contenu COMPLET (aucune limite de lignes).\n\
-           Via bloc Markdown : écris son chemin relatif EXACT brut suivi du bloc de code complet :\n\
-           ### chemin/du/fichier.ext\n\
-           ```langage\n\
-           // Contenu complet...\n\
-           ```\n\
+           Utilise impérativement l'outil `write_file` pour créer un nouveau fichier ou remplacer intégralement un fichier existant, SANS AUCUNE LIMITE DE LIGNES.\n\
         2. PATCH COURT SUR FICHIER EXISTANT (`edit_file`) :\n\
-           Pour une modification ciblée sur un fichier déjà existant, utilise `edit_file` avec un bloc SEARCH/REPLACE exact (patch court) :\n\
-           ### chemin/du/fichier.ext\n\
-           ```langage\n\
-           <<<<<<< SEARCH\n\
-           lignes exactes existantes\n\
-           =======\n\
-           nouvelles lignes de remplacement\n\
-           >>>>>>> REPLACE\n\
-           ```"
-    } else {
-        "FORMATS D'ÉCRITURE ET D'ÉDITION DE FICHIERS (`whole`) :\n\
-        1. CRÉATION OU RÉÉCRITURE COMPLÈTE (`write_file`) :\n\
-           Pour créer ou modifier un fichier, utilise `write_file` avec le contenu COMPLET et opérationnel du fichier (sans TODO ni ellipsis, aucune limite de lignes) :\n\
-           ### chemin/du/fichier.ext\n\
-           ```langage\n\
-           // Contenu complet...\n\
-           ```\n\
-        2. PATCH COURT SUR FICHIER EXISTANT (`edit_file`) :\n\
-           Pour un patch court ciblé sur un fichier marqué [TRONQUÉ] ou existant, utilise exclusivement des blocs `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE`."
-    };
+           Utilise l'outil `edit_file` uniquement pour des modifications localisées (patch court) via un ou plusieurs blocs SEARCH/REPLACE exacts sur un fichier déjà existant.\n\
+           N'utilise JAMAIS `edit_file` pour créer un fichier inexistant.\n\
+        3. LECTURE PRÉALABLE (`read_file` / `search_code`) :\n\
+           Si un fichier existant n'est pas déjà affiché en entier dans ton contexte ou si un patch `edit_file` échoue, lis-le d'abord avec `read_file` avant de retenter un patch ou d'utiliser `write_file`.";
 
     let role_rules = match role {
-        "designer" => {
-            let css_policy = "- Stack CSS : Tu peux utiliser librement Tailwind CSS (classes utilitaires flex, grid, w-[...], etc.) ainsi que du CSS natif selon les besoins du projet.";
-            format!(
-                "CONSIGNES DU RÔLE (`Designer UI/UX`) :\n\
-                {css_policy}\n\
-                - Reset de base obligatoire dans le CSS global ou le composant racine : `*, *::before, *::after {{ box-sizing: border-box; }}` et `html, body, #app {{ margin: 0; padding: 0; height: 100%; width: 100%; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}`.\n\
-                - Respecte scrupuleusement CHAQUE spécification chiffrée, visuelle et comportementale demandée (largeurs/hauteurs exactes, couleurs, dégradés `linear-gradient(...)`, alignements droite/gauche, états initiaux et interactions).\n\
-                - Mets à jour de manière cohérente le layout parent ET les composants enfants importés concernés afin qu'aucune vue ne reste non stylée."
-            )
-        }
+        "designer" => "CONSIGNES DU RÔLE (`Designer UI/UX`) :\n\
+        - Respecte la stack, les conventions de style et les dépendances réellement présentes dans les manifestes du projet.\n\
+        - Respecte scrupuleusement CHAQUE spécification chiffrée, visuelle, typographique et comportementale demandée.\n\
+        - Mets à jour de manière cohérente le layout parent et les composants ou feuilles de style concernés.".to_string(),
         "refactoring" => "CONSIGNES DU RÔLE (`Refactoring`) :\n\
         - Préserve strictement le comportement externe existant tout en améliorant la lisibilité, le découpage et le typage sans régression.".to_string(),
         "tester" => "CONSIGNES DU RÔLE (`Testeur`) :\n\
-        - Écris des tests déterministes, isolés et directement exécutables couvrant le comportement demandé sans modifier la logique métier.".to_string(),
+        - Écris des tests déterministes, isolés et directement exécutables couvrant le comportement demandé sans modifier la logique métier existante, puis exécute-les via `run_command`.".to_string(),
         "terminal" => "CONSIGNES DU RÔLE (`Terminal / Shell`) :\n\
-        - Rôle prioritaire : diagnostic d'environnement, exécution de commandes shell, installation de dépendances et scripts via l'outil `run_command`.\n\
-        - Lis les fichiers de configuration nécessaires (ex. `package.json`, `Cargo.toml`, `.env`) avec l'outil `read_file`.\n\
-        - N'édite ou ne crée de fichiers QUE si nécessaire pour réparer la configuration ou les scripts d'installation.\n\
-        - NE RÉÉCRIS JAMAIS les composants d'interface ou le code applicatif qui n'ont rien à voir avec l'erreur signalée.\n\
-        - INTERDICTION FORMELLE DE SERVEUR PERSISTANT : Ne lance JAMAIS de serveur de développement en tâche de fond (`npm run dev`, `vite`, `npm start`, `cargo run`, etc.) ni de commande bloquante sans fin. Pour tester le build ou le typage, utilise EXCLUSIVEMENT des commandes à fin déterministe (`npm run build`, `npx vue-tsc --noEmit`, `cargo check`, `cargo test`).".to_string(),
+        - Rôle prioritaire : diagnostic d'environnement, exécution de commandes shell, installation de dépendances et exécution de scripts de build/test via `run_command`.\n\
+        - Lis les fichiers de configuration nécessaires avec `read_file` avant toute modification.\n\
+        - N'édite ou ne crée de fichiers que si nécessaire pour réparer la configuration ou les scripts.\n\
+        - INTERDICTION FORMELLE DE SERVEUR PERSISTANT : Ne lance JAMAIS de serveur de développement en tâche de fond ou de commande watch bloquante sans fin. Utilise exclusivement des commandes terminales déterministes.".to_string(),
         "research" => "CONSIGNES DU RÔLE (`Recherche & Documentation`) :\n\
-        - Rôle prioritaire : rechercher des documentations officielles, des solutions à des erreurs récentes ou des versions compatibles avec l'outil `web_search` et lire les pages pertinentes avec `fetch_url`.\n\
+        - Rôle prioritaire : rechercher des documentations officielles, des solutions à des erreurs ou des versions compatibles avec `web_search` et lire les pages pertinentes avec `fetch_url`.\n\
         - Synthétise clairement les résultats trouvés pour alimenter la résolution du problème.".to_string(),
         _ => "CONSIGNES DU RÔLE (`Codeur`) :\n\
-        - Produis du code complet, robuste et opérationnel, sans TODO ni placeholder, cohérent avec l'architecture et les imports du projet.\n\
-        - PÉRIMÈTRE STRICT : modifie uniquement ce qui est explicitement demandé par l'utilisateur dans le dernier message. Ne réécris jamais des composants UI ou fichiers existants non demandés.\n\
-        - INSTALLATION DE PAQUETS : si l'utilisateur demande d'installer/ajouter une librairie (ex. `tailwindcss`, `@iconify/vue`, etc.), exécute d'abord la commande d'installation via l'outil `run_command` (ex. `npm install ...`), puis mets à jour uniquement les fichiers de configuration concernés (`vite.config.*`, feuille CSS globale) sans réécrire les composants applicatifs sauf demande explicite.".to_string(),
+        - Analyse d'abord l'instantané du projet (`WorkspaceSnapshot` : arborescence, manifestes racine, scripts et chemins déclarés introuvables).\n\
+        - Produis du code complet, robuste et opérationnel, sans TODO ni placeholder, cohérent avec les conventions et dépendances du projet.\n\
+        - Si la tâche exige de créer ou corriger plusieurs fichiers manquants ou liés, enchaîne tous les appels `write_file` / `edit_file` nécessaires avant de conclure.\n\
+        - Lorsque le projet déclare un script ou une commande de build/check/test déterministe et non-bloquant, vérifie tes modifications avec `run_command` avant de rendre la main.".to_string(),
     };
 
     let mcp_section = if active_mcp.is_empty() {
@@ -3162,7 +1864,7 @@ fn build_native_system_prompt(
             <tool_call>{{\"name\":\"mcp_call\",\"arguments\":{{\"server\":\"nom_serveur\",\"tool\":\"nom_outil\",\"arguments\":{{}}}}}}</tool_call>"
         );
         if !mcp_schemas_note.trim().is_empty() {
-            s.push_str("\n");
+            s.push('\n');
             s.push_str(mcp_schemas_note.trim());
         }
         s
@@ -3174,28 +1876,24 @@ fn build_native_system_prompt(
         {role_rules}\n\n\
         {edit_rules}\n\n\
         RÈGLES ET DIRECTIVES DU PROJET (.agents/rules & AGENTS.md) :\n\
-        - Ce projet applique les directives de `AGENTS.md` et `.agents/rules/*.md`. Tu DOIS toujours les respecter scrupuleusement (standards de code, conventions, typage strict sans `any`, gestion d'erreurs, commandes de test/build).\n\
-        - GESTION DU TAG `@rules` : Si la demande mentionne `@rules` ou demande d'ajouter/modifier une consigne projet (ex: `@rules interdire l'usage de any`), tu DOIS identifier la catégorie adéquate (frontend, backend, validation, git, ou créer `.agents/rules/<nom>.md`), ajouter ou mettre à jour la règle avec `write_file` ou `edit_file`, et confirmer clairement dans ton résumé le fichier modifié.\n\n\
-        STYLE DE RÉPONSE :\n\
-        - CRÉATION / MODIFICATION MULTI-FICHIERS : Si la tâche demande de créer ou configurer plusieurs fichiers (ex: `index.html`, `src/main.ts`, `src/App.vue`, `vite.config.ts`), émets TOUS les blocs de fichiers attendus dès que tes informations sont prêtes, sans étaler un fichier par tour.\n\
-        - Les blocs d'édition de fichiers sont appliqués automatiquement sur le disque puis masqués de la conversation (le diff détaillé apparaît dans un menu dédié).\n\
-        - MODULARITÉ (ANTI-MONOLITHE) : privilégie des fichiers et composants modulaires courts (150–300 lignes max par fichier) plutôt qu'un fichier monolithique.\n\
-        - DÉPENDANCES & PACKS EXTERNES : vérifie toujours la liste `Paquets installés (package.json)` fournie. N'utilise JAMAIS une classe CSS de pack d'icônes (ex. `ri-*` de Remix Icon, `fa-*`), un composant de lib externe ou un import de paquet absent des paquets installés sans l'avoir d'abord installé via `run_command` (`npm install ...`) ET importé dans le point d'entrée ou le composant (ex. `import 'remixicon/fonts/remixicon.css'` dans `src/main.js`/`src/main.ts`).\n\
-        - N'écris JAMAIS de phrase d'introduction annonçant un bloc de code (« Voici les modifications nécessaires : », « Voici le code mis à jour : », « Modifiez le fichier comme suit : »).\n\
-        - Émets directement les blocs d'édition, puis conclus par un bref résumé autonome au passé composé expliquant concrètement ce qui a été généré ou modifié dans chaque fichier en le citant par un lien Markdown cliquable `[NomFichier](chemin/relatif/NomFichier)` (ex. `[App.vue](src/App.vue)`).\n\
-        - Si la demande utilisateur comporte plusieurs tâches ou points distincts, présente ce résumé en liste à puces (`- ...`), une puce par demande traitée avec les fichiers cliquables concernés.\n\
+        - Si le projet contient `AGENTS.md` ou `.agents/rules/*.md`, respecte scrupuleusement leurs conventions (typage strict, gestion d'erreurs, commandes de validation).\n\
+        - GESTION DU TAG `@rules` : Si la demande mentionne `@rules` ou demande d'ajouter/modifier une consigne projet, mets à jour `.agents/rules/<nom>.md` ou `AGENTS.md` avec `write_file` / `edit_file` et confirme clairement dans ton résumé.\n\n\
+        DÉPENDANCES & INTERDICTION DE SERVEUR BLOQUANT :\n\
+        - Vérifie toujours les manifestes racine fournis avant d'importer ou d'utiliser une dépendance externe ; installe toute dépendance manquante via `run_command` si besoin.\n\
+        - Ne lance JAMAIS de commande bloquante (serveur de dev, watcher).\n\n\
+        STYLE DE RÉPONSE FINALE (après tous tes appels d'outils) :\n\
+        - Quand toutes les écritures et vérifications sont terminées, conclus par un bref résumé au passé composé citant chaque fichier touché via un lien Markdown cliquable `[NomFichier](chemin/relatif/NomFichier)`.\n\
         - N'ajoute JAMAIS de section `### Fichiers modifiés` en fin de message.\n\n\
         OUTILS DISPONIBLES (appel d'outil natif JSON ou balise `<tool_call>`) :\n\
-        <tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"src/...\",\"start_line\":1,\"end_line\":120}}}}</tool_call> (start_line/end_line optionnels et recommandés pour les fichiers > 200 lignes)\n\
-        <tool_call>{{\"name\":\"search_code\",\"arguments\":{{\"query\":\"motif\",\"path_filter\":\"src/\"}}}}</tool_call>\n\
+        <tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"chemin/fichier\",\"start_line\":1,\"end_line\":120}}}}</tool_call> (start_line/end_line optionnels)\n\
+        <tool_call>{{\"name\":\"search_code\",\"arguments\":{{\"query\":\"motif\",\"path_filter\":\"dossier/\"}}}}</tool_call>\n\
         <tool_call>{{\"name\":\"list_files\",\"arguments\":{{}}}}</tool_call>\n\
-        <tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"src/...\",\"content\":\"...\"}}}}</tool_call> (CRÉATION COMPLÈTE ou réécriture totale d'un fichier sans limite de lignes)\n\
-        <tool_call>{{\"name\":\"edit_file\",\"arguments\":{{\"path\":\"src/...\",\"search\":\"extrait exact\",\"replace\":\"nouveau texte\"}}}}</tool_call> (PATCH COURT chirurgical SEARCH/REPLACE sur fichier existant, accepte aussi `edits: [...]`)\n\
-        <tool_call>{{\"name\":\"delete_file\",\"arguments\":{{\"path\":\"...\",\"reason\":\"motif\"}}}}</tool_call> (requiert une confirmation utilisateur dans l'interface)\n\
-        <tool_call>{{\"name\":\"run_command\",\"arguments\":{{\"command\":\"...\",\"timeout_secs\":90}}}}</tool_call> (`timeout_secs` optionnel 5..300s ; confirmation demandée si commande destructrice)\n\
-        <tool_call>{{\"name\":\"web_search\",\"arguments\":{{\"query\":\"recherche ciblée\",\"max_results\":5}}}}</tool_call> (recherche web sans clé pour docs, solutions, paquets récents)\n\
-        <tool_call>{{\"name\":\"fetch_url\",\"arguments\":{{\"url\":\"https://...\",\"max_chars\":12000}}}}</tool_call> (lecture et extraction texte épuré d'une page ou documentation en ligne)\n\
-        Les commandes shell à afficher simplement à l'utilisateur vont dans un bloc ```bash ... ``` standard (hors <tool_call>).{mcp_section}"
+        <tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"path\":\"chemin/fichier\",\"content\":\"...\"}}}}</tool_call> (CRÉATION COMPLÈTE ou réécriture totale sans limite de lignes)\n\
+        <tool_call>{{\"name\":\"edit_file\",\"arguments\":{{\"path\":\"chemin/fichier\",\"search\":\"extrait exact\",\"replace\":\"nouveau texte\"}}}}</tool_call> (PATCH COURT SEARCH/REPLACE sur fichier existant ; accepte aussi `edits: [...]`)\n\
+        <tool_call>{{\"name\":\"delete_file\",\"arguments\":{{\"path\":\"chemin/fichier\",\"reason\":\"motif\"}}}}</tool_call> (requiert confirmation utilisateur)\n\
+        <tool_call>{{\"name\":\"run_command\",\"arguments\":{{\"command\":\"...\",\"timeout_secs\":90}}}}</tool_call> (commande terminale déterministe)\n\
+        <tool_call>{{\"name\":\"web_search\",\"arguments\":{{\"query\":\"recherche ciblée\",\"max_results\":5}}}}</tool_call>\n\
+        <tool_call>{{\"name\":\"fetch_url\",\"arguments\":{{\"url\":\"https://...\",\"max_chars\":12000}}}}</tool_call>{mcp_section}"
     )
 }
 
@@ -3208,11 +1906,10 @@ async fn build_native_initial_user_message(
     attachments: Option<&[AttachedFile]>,
     image_base64_list: Vec<String>,
     architect_spec: Option<&str>,
-    all_project_files: &[String],
+    workspace_snapshot: &WorkspaceSnapshot,
     target_files: &[String],
     read_only_files: &[String],
     repo_map_text: Option<&str>,
-    frontend_stack: Option<&FrontendStackInfo>,
     is_cloud: bool,
 ) -> (LlmMessage, HashSet<String>, HashSet<String>) {
     let mut parts = Vec::new();
@@ -3235,10 +1932,6 @@ async fn build_native_initial_user_message(
         ));
     }
 
-    if let Some(fs_info) = frontend_stack {
-        parts.push(fs_info.format_summary());
-    }
-
     if !project.shared_directories.is_empty() {
         parts.push(format!(
             "[Dossiers partagés]\n{}",
@@ -3251,21 +1944,9 @@ async fn build_native_initial_user_message(
         ));
     }
 
-    if !all_project_files.is_empty() {
-        let max_tree = if is_cloud { 300usize } else { 150usize };
-        let shown: Vec<&str> = all_project_files.iter().take(max_tree).map(String::as_str).collect();
-        let mut tree = shown.join("\n  ");
-        if all_project_files.len() > max_tree {
-            tree.push_str(&format!(
-                "\n  ... (+{} autres fichiers)",
-                all_project_files.len() - max_tree
-            ));
-        }
-        parts.push(format!(
-            "[Arborescence complète du projet ({} fichiers)]\n  {}",
-            all_project_files.len(),
-            tree
-        ));
+    let snapshot_text = workspace_snapshot.format_for_prompt(is_cloud);
+    if !snapshot_text.trim().is_empty() {
+        parts.push(snapshot_text);
     }
 
     if let Some(rmap) = repo_map_text {
@@ -3310,7 +1991,7 @@ async fn build_native_initial_user_message(
                     truncated_files.insert(rel.clone());
                     let clipped = truncate_chars(&content, clip_chars);
                     file_sections.push(format!(
-                        "### {rel} [TRONQUÉ · {total_lines} lignes — utilise SEARCH/REPLACE et `read_file` avec start_line/end_line ou `search_code` pour voir la suite]\n```\n{clipped}\n```"
+                        "### {rel} [TRONQUÉ · {total_lines} lignes — utilise `edit_file` ou `read_file` avec start_line/end_line ou `search_code` pour voir la suite]\n```\n{clipped}\n```"
                     ));
                 } else {
                     file_sections.push(format!("### {rel}\n```\n{content}\n```"));
@@ -3320,7 +2001,7 @@ async fn build_native_initial_user_message(
         }
         if !file_sections.is_empty() {
             parts.push(format!(
-                "[Fichiers cibles éditables]\n{}",
+                "[Fichiers cibles préchargés]\n{}",
                 file_sections.join("\n\n")
             ));
         }
@@ -3328,10 +2009,9 @@ async fn build_native_initial_user_message(
 
     // Suffixe dynamique
     let compact_conv = if is_cloud {
-        compact_conv_ctx_for_prompt(conv_ctx, 800, 4)
+        compact_conv_ctx_for_prompt(conv_ctx, 900, 4)
     } else {
-        // Modèle local : uniquement Synthèse de l'état actuel + Tour N-1
-        compact_conv_ctx_for_prompt(conv_ctx, 350, 1)
+        compact_conv_ctx_for_prompt(conv_ctx, 600, 2)
     };
     if !compact_conv.is_empty() {
         parts.push(format!(
@@ -3340,7 +2020,7 @@ async fn build_native_initial_user_message(
     }
     if let Some(spec) = architect_spec {
         if !spec.trim().is_empty() {
-            parts.push(format!("[Plan Architecte]\n{}", spec.trim()));
+            parts.push(format!("[Cadrage / Handoff de mission]\n{}", spec.trim()));
         }
     }
     if let Some(att_list) = attachments {
@@ -3353,7 +2033,7 @@ async fn build_native_initial_user_message(
         }
     }
 
-    parts.push(format!("[Demande utilisateur]\n{}", user_prompt.trim()));
+    parts.push(format!("[Demande & Instructions de mission]\n{}", user_prompt.trim()));
     let text = parts.join("\n\n");
     let msg = if image_base64_list.is_empty() {
         LlmMessage::user(text)
@@ -3458,6 +2138,7 @@ struct NativeLoopResult {
     thinking: Option<String>,
     tool_results: Vec<ToolExecutionResult>,
     applied_files: Vec<String>,
+    last_post_edit_verification: Option<(String, bool, String)>,
     prompt_tokens: usize,
     completion_tokens: usize,
     turns_run: usize,
@@ -3484,11 +2165,10 @@ async fn execute_native_agent_loop(
     role: &str,
     ollama_running: bool,
     settings: &AppSettings,
-    all_project_files: &[String],
+    workspace_snapshot: &WorkspaceSnapshot,
     target_files: &[String],
     read_only_files: &[String],
     strategy: &ExecutionStrategy,
-    frontend_stack: Option<&FrontendStackInfo>,
     mcp_servers: &[McpServerConfig],
     cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<NativeLoopResult> {
@@ -3497,6 +2177,7 @@ async fn execute_native_agent_loop(
     }
 
     let project_root = Path::new(&project.root_path);
+    let all_project_files = &workspace_snapshot.all_files;
     let is_cloud = provider != "ollama";
     let num_ctx = effective_num_ctx(settings);
 
@@ -3563,11 +2244,10 @@ async fn execute_native_agent_loop(
         attachments,
         image_base64_list,
         architect_spec,
-        all_project_files,
+        workspace_snapshot,
         target_files,
         read_only_files,
         repo_map_text.as_deref(),
-        frontend_stack,
         is_cloud,
     )
     .await;
@@ -3583,7 +2263,6 @@ async fn execute_native_agent_loop(
         &effective_edit_format,
         &active_mcp,
         &mcp_schemas_note,
-        frontend_stack,
     );
     let mut messages = vec![LlmMessage::system(system_prompt), initial_user_msg];
 
@@ -3621,18 +2300,20 @@ async fn execute_native_agent_loop(
     let mut active_provider = provider.to_string();
     let mut active_model = model.to_string();
     let mut last_fallback_reason: Option<String> = None;
+    let mut last_post_edit_verification: Option<(String, bool, String)> = None;
 
-    let mut max_loop_turns = strategy.max_turns.max(8);
+    let mut max_loop_turns = strategy.max_turns.max(4);
     let mut reading_turns = 0usize;
     let mut turn = 0usize;
-    let mut last_turn_tool_signatures: HashSet<String> = HashSet::new();
+    let mut disk_revision: usize = 0;
+    let mut tool_call_history: HashMap<String, (bool, usize)> = HashMap::new();
 
     while turn < max_loop_turns {
         if is_cancelled(cancel_rx) {
             anyhow::bail!("CANCELLED_BY_USER");
         }
-        turns_run = turn + 1;
         turn += 1;
+        turns_run = turn;
 
         let stream_start = format!(
             "[Tour {}/{}] Appel {}:{} (format {})...",
@@ -3742,8 +2423,8 @@ async fn execute_native_agent_loop(
         };
         let stream_done = format!(
             "[Tour {}/{}] Réponse reçue de {}:{} ({} in / {} out{}).",
-            turn + 1,
-            strategy.max_turns,
+            turns_run,
+            max_loop_turns,
             used_provider,
             used_model,
             res.prompt_tokens,
@@ -3797,8 +2478,6 @@ async fn execute_native_agent_loop(
         let mut tool_outputs = Vec::new();
         let mut wrote_via_tool = false;
         let mut tool_had_failure = false;
-        let mut current_turn_tool_signatures: HashSet<String> = HashSet::new();
-        let mut duplicate_alert_triggered = false;
 
         for tc in tool_calls {
             if is_cancelled(cancel_rx) {
@@ -3810,292 +2489,173 @@ async fn execute_native_agent_loop(
                 tc.name,
                 serde_json::to_string(&tc.arguments).unwrap_or_default()
             );
-            if last_turn_tool_signatures.contains(&tc_sig) {
-                let alert_msg = "ALERTE SYSTÈME : Tu viens d'exécuter exactement la même action qui a échoué. Ne répète pas cet appel. Lis d'abord le fichier complet avec read_file ou change d'approche.";
-                if !duplicate_alert_triggered {
-                    messages.push(LlmMessage::system(alert_msg));
-                    duplicate_alert_triggered = true;
+            if let Some(&(prev_success, prev_rev)) = tool_call_history.get(&tc_sig) {
+                if prev_rev == disk_revision && (!prev_success || tc.name != "read_file") {
+                    let alert_msg = "ALERTE SYSTÈME : Tu viens d'exécuter exactement la même action qui a échoué. Ne répète pas cet appel. Lis d'abord le fichier complet avec read_file ou change d'approche.";
+                    tool_outputs.push(format!("[{}]\n{}", tc.name, alert_msg));
+                    all_tool_results.push(ToolExecutionResult {
+                        tool: tc.name.clone(),
+                        success: false,
+                        message: alert_msg.to_string(),
+                        path: tc
+                            .arguments
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    });
+                    tool_had_failure = true;
+                    continue;
                 }
-                tool_outputs.push(format!("[{}]\n{}", tc.name, alert_msg));
-                all_tool_results.push(ToolExecutionResult {
-                    tool: tc.name.clone(),
-                    success: false,
-                    message: alert_msg.to_string(),
-                    path: tc
-                        .arguments
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                });
-                tool_had_failure = true;
-                continue;
             }
-            current_turn_tool_signatures.insert(tc_sig);
-            if tc.name == "mcp_call" {
-                let server_ref = tc
-                    .arguments
-                    .get("server")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let tool_name = tc
-                    .arguments
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let tool_args = tc
-                    .arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
 
-                let matched_srv = active_mcp
-                    .iter()
-                    .find(|s| s.name.eq_ignore_ascii_case(server_ref) || s.id == server_ref)
-                    .copied();
+            let exec_outcome: Option<(bool, bool)> = 'exec_tc: {
+                if tc.name == "mcp_call" {
+                    let server_ref = tc
+                        .arguments
+                        .get("server")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let tool_name = tc
+                        .arguments
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let tool_args = tc
+                        .arguments
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
 
-                if let Some(srv) = matched_srv {
-                    let msg_line = format!("[MCP] {} -> {}...", srv.name, tool_name);
-                    let _ = app.emit("aider:stream", (conversation_id, &msg_line));
-                    let fut = mcp::call_tool_for_server(srv, project_root, tool_name, &tool_args);
-                    let call_res = tokio::select! {
-                        biased;
-                        _ = wait_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
-                        r = fut => r,
-                    };
-                    match call_res {
-                        Ok(out) => {
-                            let clipped = truncate_chars(&out, tool_output_budget);
+                    let matched_srv = active_mcp
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(server_ref) || s.id == server_ref)
+                        .copied();
+
+                    if let Some(srv) = matched_srv {
+                        let msg_line = format!("[MCP] {} -> {}...", srv.name, tool_name);
+                        let _ = app.emit("aider:stream", (conversation_id, &msg_line));
+                        let fut = mcp::call_tool_for_server(srv, project_root, tool_name, &tool_args);
+                        let call_res = tokio::select! {
+                            biased;
+                            _ = wait_cancelled(cancel_rx) => anyhow::bail!("CANCELLED_BY_USER"),
+                            r = fut => r,
+                        };
+                        match call_res {
+                            Ok(out) => {
+                                let clipped = truncate_chars(&out, tool_output_budget);
+                                all_tool_results.push(ToolExecutionResult {
+                                    tool: format!("mcp:{}:{}", srv.name, tool_name),
+                                    success: true,
+                                    message: format!("MCP {}::{} exécuté.", srv.name, tool_name),
+                                    path: None,
+                                });
+                                tool_outputs.push(format!(
+                                    "[MCP {}::{}]\n{}",
+                                    srv.name, tool_name, clipped
+                                ));
+                                break 'exec_tc Some((true, false));
+                            }
+                            Err(e) => {
+                                tool_had_failure = true;
+                                all_tool_results.push(ToolExecutionResult {
+                                    tool: format!("mcp:{}:{}", srv.name, tool_name),
+                                    success: false,
+                                    message: format!("Erreur MCP {}::{} : {}", srv.name, tool_name, e),
+                                    path: None,
+                                });
+                                tool_outputs.push(format!(
+                                    "[Erreur MCP {}::{}] {}",
+                                    srv.name, tool_name, e
+                                ));
+                                break 'exec_tc Some((false, false));
+                            }
+                        }
+                    } else {
+                        tool_had_failure = true;
+                        tool_outputs.push(format!(
+                            "[Erreur MCP] Serveur '{server_ref}' introuvable ou inactif."
+                        ));
+                        break 'exec_tc Some((false, false));
+                    }
+                }
+
+                if tc.name == "delete_file" {
+                    let raw_path = match tc.arguments.get("path").and_then(|v| v.as_str()) {
+                        Some(p) => p,
+                        None => {
+                            tool_had_failure = true;
+                            let err_msg = "Paramètre 'path' manquant".to_string();
                             all_tool_results.push(ToolExecutionResult {
-                                tool: format!("mcp:{}:{}", srv.name, tool_name),
-                                success: true,
-                                message: format!("MCP {}::{} exécuté.", srv.name, tool_name),
+                                tool: "delete_file".to_string(),
+                                success: false,
+                                message: err_msg.clone(),
                                 path: None,
                             });
-                            tool_outputs.push(format!(
-                                "[MCP {}::{}]\n{}",
-                                srv.name, tool_name, clipped
-                            ));
+                            tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
+                            break 'exec_tc Some((false, false));
                         }
+                    };
+                    let clean_path = match crate::tools::fs::sanitize_tool_path(raw_path) {
+                        Ok(p) => p,
                         Err(e) => {
                             tool_had_failure = true;
                             all_tool_results.push(ToolExecutionResult {
-                                tool: format!("mcp:{}:{}", srv.name, tool_name),
+                                tool: "delete_file".to_string(),
                                 success: false,
-                                message: format!("Erreur MCP {}::{} : {}", srv.name, tool_name, e),
+                                message: format!("Erreur delete_file : {e}"),
                                 path: None,
                             });
-                            tool_outputs.push(format!(
-                                "[Erreur MCP {}::{}] {}",
-                                srv.name, tool_name, e
-                            ));
+                            tool_outputs.push(format!("[Erreur delete_file] {e}"));
+                            break 'exec_tc Some((false, false));
                         }
-                    }
-                } else {
-                    tool_had_failure = true;
-                    tool_outputs.push(format!(
-                        "[Erreur MCP] Serveur '{server_ref}' introuvable ou inactif."
-                    ));
-                }
-                continue;
-            }
-
-            if tc.name == "delete_file" {
-                let raw_path = match tc.arguments.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => {
+                    };
+                    let target_path = project_root.join(&clean_path);
+                    if !target_path.exists() {
                         tool_had_failure = true;
-                        let err_msg = "Paramètre 'path' manquant".to_string();
+                        let err_msg = format!("Fichier '{}' introuvable", clean_path);
                         all_tool_results.push(ToolExecutionResult {
                             tool: "delete_file".to_string(),
                             success: false,
                             message: err_msg.clone(),
-                            path: None,
+                            path: Some(clean_path),
                         });
                         tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
-                        continue;
+                        break 'exec_tc Some((false, false));
                     }
-                };
-                let clean_path = match crate::tools::fs::sanitize_tool_path(raw_path) {
-                    Ok(p) => p,
-                    Err(e) => {
+                    if !target_path.is_file() {
                         tool_had_failure = true;
+                        let err_msg = format!("'{}' n'est pas un fichier supprimable", clean_path);
                         all_tool_results.push(ToolExecutionResult {
                             tool: "delete_file".to_string(),
-                            success: false,
-                            message: format!("Erreur delete_file : {e}"),
-                            path: None,
-                        });
-                        tool_outputs.push(format!("[Erreur delete_file] {e}"));
-                        continue;
-                    }
-                };
-                let target_path = project_root.join(&clean_path);
-                if !target_path.exists() {
-                    tool_had_failure = true;
-                    let err_msg = format!("Fichier '{}' introuvable", clean_path);
-                    all_tool_results.push(ToolExecutionResult {
-                        tool: "delete_file".to_string(),
-                        success: false,
-                        message: err_msg.clone(),
-                        path: Some(clean_path),
-                    });
-                    tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
-                    continue;
-                }
-                if !target_path.is_file() {
-                    tool_had_failure = true;
-                    let err_msg = format!("'{}' n'est pas un fichier supprimable", clean_path);
-                    all_tool_results.push(ToolExecutionResult {
-                        tool: "delete_file".to_string(),
-                        success: false,
-                        message: err_msg.clone(),
-                        path: Some(clean_path),
-                    });
-                    tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
-                    continue;
-                }
-
-                let reason = tc
-                    .arguments
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-
-                let ask_line = format!(
-                    "[Validation] Confirmation demandée pour supprimer `{clean_path}`..."
-                );
-                let _ = app.emit("aider:stream", (conversation_id, &ask_line));
-
-                let approved = match crate::tools::approval::request_tool_approval(
-                    app,
-                    conversation_id,
-                    "delete_file",
-                    "Confirmation de suppression",
-                    &clean_path,
-                    reason,
-                    cancel_rx,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) if e.contains("CANCELLED_BY_USER") => {
-                        anyhow::bail!("CANCELLED_BY_USER");
-                    }
-                    Err(e) => {
-                        tool_had_failure = true;
-                        all_tool_results.push(ToolExecutionResult {
-                            tool: "delete_file".to_string(),
-                            success: false,
-                            message: format!("Erreur validation delete_file : {e}"),
-                            path: Some(clean_path),
-                        });
-                        tool_outputs.push(format!("[Erreur delete_file] {e}"));
-                        continue;
-                    }
-                };
-
-                if !approved {
-                    tool_had_failure = true;
-                    let deny_msg =
-                        format!("Suppression de `{clean_path}` refusée par l'utilisateur.");
-                    let _ = app.emit(
-                        "aider:stream",
-                        (conversation_id, &format!("[Validation] {deny_msg}")),
-                    );
-                    all_tool_results.push(ToolExecutionResult {
-                        tool: "delete_file".to_string(),
-                        success: false,
-                        message: deny_msg,
-                        path: Some(clean_path.clone()),
-                    });
-                    tool_outputs.push(format!(
-                        "[delete_file: {clean_path}] Refusé par l'utilisateur. Ne supprime pas ce fichier."
-                    ));
-                    continue;
-                }
-
-                match crate::tools::fs::delete_file(project_root, &tc.arguments).await {
-                    Ok(tr) => {
-                        wrote_via_tool = true;
-                        let pfx = format!("{clean_path}:");
-                        already_read.retain(|k| k != &clean_path && !k.starts_with(&pfx));
-                        if seen_applied.insert(clean_path.clone()) {
-                            all_applied_files.push(clean_path.clone());
-                        }
-                        let ok_line = format!("[Outil] Fichier supprimé : `{clean_path}`.");
-                        let _ = app.emit("aider:stream", (conversation_id, &ok_line));
-                        all_tool_results.push(tr.clone());
-                        tool_outputs.push(format!("[delete_file] {}", tr.message));
-                    }
-                    Err(e) => {
-                        tool_had_failure = true;
-                        all_tool_results.push(ToolExecutionResult {
-                            tool: "delete_file".to_string(),
-                            success: false,
-                            message: format!("Erreur delete_file : {e}"),
-                            path: Some(clean_path),
-                        });
-                        tool_outputs.push(format!("[Erreur delete_file] {e}"));
-                    }
-                }
-                continue;
-            }
-
-            if tc.name == "run_command" {
-                let cmd_str = match tc
-                    .arguments
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(c) => c,
-                    None => {
-                        tool_had_failure = true;
-                        let err_msg = "Paramètre 'command' manquant".to_string();
-                        all_tool_results.push(ToolExecutionResult {
-                            tool: "run_command".to_string(),
                             success: false,
                             message: err_msg.clone(),
-                            path: None,
+                            path: Some(clean_path),
                         });
-                        tool_outputs.push(format!("[Erreur run_command] {err_msg}"));
-                        continue;
+                        tool_outputs.push(format!("[Erreur delete_file] {err_msg}"));
+                        break 'exec_tc Some((false, false));
                     }
-                };
-                let timeout_secs = crate::tools::shell::parse_timeout_secs(&tc.arguments);
 
-                if let Some(daemon_err) = crate::tools::shell::is_daemon_or_dev_server_command(cmd_str) {
-                    tool_had_failure = true;
-                    all_tool_results.push(ToolExecutionResult {
-                        tool: "run_command".to_string(),
-                        success: false,
-                        message: daemon_err.to_string(),
-                        path: None,
-                    });
-                    tool_outputs.push(format!("[Erreur run_command] {daemon_err}"));
-                    let stream_err = format!("[run_command bloqué] {daemon_err}");
-                    let _ = app.emit("aider:stream", (conversation_id, &stream_err));
-                    continue;
-                }
+                    let reason = tc
+                        .arguments
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
 
-                if let Some(reason) = crate::tools::shell::is_destructive_command(cmd_str) {
                     let ask_line = format!(
-                        "[Validation] Confirmation demandée pour commande sensible : `{}`...",
-                        truncate_chars(cmd_str, 80)
+                        "[Validation] Confirmation demandée pour supprimer `{clean_path}`..."
                     );
                     let _ = app.emit("aider:stream", (conversation_id, &ask_line));
 
                     let approved = match crate::tools::approval::request_tool_approval(
                         app,
                         conversation_id,
-                        "run_command",
-                        "Confirmation de commande sensible",
-                        cmd_str,
-                        Some(reason.to_string()),
+                        "delete_file",
+                        "Confirmation de suppression",
+                        &clean_path,
+                        reason,
                         cancel_rx,
                     )
                     .await
@@ -4107,248 +2667,392 @@ async fn execute_native_agent_loop(
                         Err(e) => {
                             tool_had_failure = true;
                             all_tool_results.push(ToolExecutionResult {
-                                tool: "run_command".to_string(),
+                                tool: "delete_file".to_string(),
                                 success: false,
-                                message: format!("Erreur validation run_command : {e}"),
-                                path: None,
+                                message: format!("Erreur validation delete_file : {e}"),
+                                path: Some(clean_path),
                             });
-                            tool_outputs.push(format!("[Erreur run_command] {e}"));
-                            continue;
+                            tool_outputs.push(format!("[Erreur delete_file] {e}"));
+                            break 'exec_tc Some((false, false));
                         }
                     };
 
                     if !approved {
                         tool_had_failure = true;
-                        let deny_msg = format!(
-                            "Exécution de la commande `{}` refusée par l'utilisateur.",
-                            truncate_chars(cmd_str, 80)
-                        );
+                        let deny_msg =
+                            format!("Suppression de `{clean_path}` refusée par l'utilisateur.");
                         let _ = app.emit(
                             "aider:stream",
                             (conversation_id, &format!("[Validation] {deny_msg}")),
                         );
                         all_tool_results.push(ToolExecutionResult {
-                            tool: "run_command".to_string(),
+                            tool: "delete_file".to_string(),
                             success: false,
                             message: deny_msg,
-                            path: None,
+                            path: Some(clean_path.clone()),
                         });
                         tool_outputs.push(format!(
-                            "[run_command] Exécution refusée par l'utilisateur pour `{cmd_str}`."
+                            "[delete_file: {clean_path}] Refusé par l'utilisateur. Ne supprime pas ce fichier."
                         ));
-                        continue;
+                        break 'exec_tc Some((false, false));
+                    }
+
+                    match crate::tools::fs::delete_file(project_root, &tc.arguments).await {
+                        Ok(tr) => {
+                            wrote_via_tool = true;
+                            let pfx = format!("{clean_path}:");
+                            already_read.retain(|k| k != &clean_path && !k.starts_with(&pfx));
+                            if seen_applied.insert(clean_path.clone()) {
+                                all_applied_files.push(clean_path.clone());
+                            }
+                            let ok_line = format!("[Outil] Fichier supprimé : `{clean_path}`.");
+                            let _ = app.emit("aider:stream", (conversation_id, &ok_line));
+                            all_tool_results.push(tr.clone());
+                            tool_outputs.push(format!("[delete_file] {}", tr.message));
+                            break 'exec_tc Some((true, true));
+                        }
+                        Err(e) => {
+                            tool_had_failure = true;
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: "delete_file".to_string(),
+                                success: false,
+                                message: format!("Erreur delete_file : {e}"),
+                                path: Some(clean_path),
+                            });
+                            tool_outputs.push(format!("[Erreur delete_file] {e}"));
+                            break 'exec_tc Some((false, false));
+                        }
                     }
                 }
 
-                let cmd_line = format!("[Cmd] {}", truncate_chars(cmd_str, 120));
-                let _ = app.emit("aider:stream", (conversation_id, &cmd_line));
-                let running_notice = format!(
-                    "{}\n\n💻 *Exécution :* `{}`",
-                    turn_live_content.trim(),
-                    truncate_chars(cmd_str, 90)
-                );
-                let _ = app.emit("aider:live_chunk", (conversation_id, &running_notice));
-
-                match crate::tools::shell::run_command_streaming(
-                    project_root,
-                    cmd_str,
-                    timeout_secs,
-                    Some(cancel_rx),
-                    |line| {
-                        let stream_msg = format!("[cmd] {line}");
-                        let _ = app.emit("aider:stream", (conversation_id, &stream_msg));
-                    },
-                )
-                .await
-                {
-                    Ok(tr) => {
-                        if !tr.success {
+                if tc.name == "run_command" {
+                    let cmd_str = match tc
+                        .arguments
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(c) => c,
+                        None => {
                             tool_had_failure = true;
+                            let err_msg = "Paramètre 'command' manquant".to_string();
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: "run_command".to_string(),
+                                success: false,
+                                message: err_msg.clone(),
+                                path: None,
+                            });
+                            tool_outputs.push(format!("[Erreur run_command] {err_msg}"));
+                            break 'exec_tc Some((false, false));
                         }
-                        let outcome_icon = if tr.success { "✓" } else { "✕" };
-                        let running_outcome = format!(
-                            "{}\n\n💻 `{}` -> {} {}",
-                            turn_live_content.trim(),
-                            truncate_chars(cmd_str, 70),
-                            outcome_icon,
-                            if tr.success { "terminé" } else { "erreur" }
-                        );
-                        let _ = app.emit("aider:live_chunk", (conversation_id, &running_outcome));
-                        let clipped = truncate_chars(&tr.message, tool_output_budget);
-                        let cmd_summary = format!("`{}`: {}", truncate_chars(cmd_str, 70), truncate_chars(&tr.message, 600));
+                    };
+                    let timeout_secs = crate::tools::shell::parse_timeout_secs(&tc.arguments);
+
+                    if let Some(daemon_err) =
+                        crate::tools::shell::is_daemon_or_dev_server_command(cmd_str)
+                    {
+                        tool_had_failure = true;
                         all_tool_results.push(ToolExecutionResult {
-                            tool: tr.tool.clone(),
-                            success: tr.success,
-                            message: cmd_summary,
+                            tool: "run_command".to_string(),
+                            success: false,
+                            message: daemon_err.to_string(),
                             path: None,
                         });
-                        tool_outputs.push(format!(
-                            "[run_command (succès={})]\n{}",
-                            tr.success, clipped
-                        ));
+                        tool_outputs.push(format!("[Erreur run_command] {daemon_err}"));
+                        let stream_err = format!("[run_command bloqué] {daemon_err}");
+                        let _ = app.emit("aider:stream", (conversation_id, &stream_err));
+                        break 'exec_tc Some((false, false));
                     }
-                    Err(e) if e.contains("CANCELLED_BY_USER") => {
-                        anyhow::bail!("CANCELLED_BY_USER");
+
+                    if let Some(reason) = crate::tools::shell::is_destructive_command(cmd_str) {
+                        let ask_line = format!(
+                            "[Validation] Confirmation demandée pour commande sensible : `{}`...",
+                            truncate_chars(cmd_str, 80)
+                        );
+                        let _ = app.emit("aider:stream", (conversation_id, &ask_line));
+
+                        let approved = match crate::tools::approval::request_tool_approval(
+                            app,
+                            conversation_id,
+                            "run_command",
+                            "Confirmation de commande sensible",
+                            cmd_str,
+                            Some(reason.to_string()),
+                            cancel_rx,
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) if e.contains("CANCELLED_BY_USER") => {
+                                anyhow::bail!("CANCELLED_BY_USER");
+                            }
+                            Err(e) => {
+                                tool_had_failure = true;
+                                all_tool_results.push(ToolExecutionResult {
+                                    tool: "run_command".to_string(),
+                                    success: false,
+                                    message: format!("Erreur validation run_command : {e}"),
+                                    path: None,
+                                });
+                                tool_outputs.push(format!("[Erreur run_command] {e}"));
+                                break 'exec_tc Some((false, false));
+                            }
+                        };
+
+                        if !approved {
+                            tool_had_failure = true;
+                            let deny_msg = format!(
+                                "Exécution de la commande `{}` refusée par l'utilisateur.",
+                                truncate_chars(cmd_str, 80)
+                            );
+                            let _ = app.emit(
+                                "aider:stream",
+                                (conversation_id, &format!("[Validation] {deny_msg}")),
+                            );
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: "run_command".to_string(),
+                                success: false,
+                                message: deny_msg,
+                                path: None,
+                            });
+                            tool_outputs.push(format!(
+                                "[run_command] Exécution refusée par l'utilisateur pour `{cmd_str}`."
+                            ));
+                            break 'exec_tc Some((false, false));
+                        }
+                    }
+
+                    let cmd_line = format!("[Cmd] {}", truncate_chars(cmd_str, 120));
+                    let _ = app.emit("aider:stream", (conversation_id, &cmd_line));
+                    let running_notice = format!(
+                        "{}\n\n💻 *Exécution :* `{}`",
+                        turn_live_content.trim(),
+                        truncate_chars(cmd_str, 90)
+                    );
+                    let _ = app.emit("aider:live_chunk", (conversation_id, &running_notice));
+
+                    match crate::tools::shell::run_command_streaming(
+                        project_root,
+                        cmd_str,
+                        timeout_secs,
+                        Some(cancel_rx),
+                        |line| {
+                            let stream_msg = format!("[cmd] {line}");
+                            let _ = app.emit("aider:stream", (conversation_id, &stream_msg));
+                        },
+                    )
+                    .await
+                    {
+                        Ok(tr) => {
+                            if !tr.success {
+                                tool_had_failure = true;
+                            }
+                            let outcome_icon = if tr.success { "✓" } else { "✕" };
+                            let running_outcome = format!(
+                                "{}\n\n💻 `{}` -> {} {}",
+                                turn_live_content.trim(),
+                                truncate_chars(cmd_str, 70),
+                                outcome_icon,
+                                if tr.success { "terminé" } else { "erreur" }
+                            );
+                            let _ = app.emit("aider:live_chunk", (conversation_id, &running_outcome));
+                            let clipped = truncate_chars(&tr.message, tool_output_budget);
+                            let cmd_summary = format!(
+                                "`{}`: {}",
+                                truncate_chars(cmd_str, 70),
+                                truncate_chars(&tr.message, 600)
+                            );
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: tr.tool.clone(),
+                                success: tr.success,
+                                message: cmd_summary,
+                                path: None,
+                            });
+                            tool_outputs.push(format!(
+                                "[run_command (succès={})]\n{}",
+                                tr.success, clipped
+                            ));
+                            let is_verif = is_verification_like_command(cmd_str);
+                            if is_verif {
+                                last_post_edit_verification = Some((
+                                    cmd_str.to_string(),
+                                    tr.success,
+                                    truncate_chars(&tr.message, 450),
+                                ));
+                                break 'exec_tc Some((tr.success, false));
+                            }
+                            break 'exec_tc Some((tr.success, tr.success));
+                        }
+                        Err(e) if e.contains("CANCELLED_BY_USER") => {
+                            anyhow::bail!("CANCELLED_BY_USER");
+                        }
+                        Err(e) => {
+                            tool_had_failure = true;
+                            let err_notice = format!(
+                                "{}\n\n💻 `{}` -> ✕ ({})",
+                                turn_live_content.trim(),
+                                truncate_chars(cmd_str, 70),
+                                truncate_chars(&e, 60)
+                            );
+                            let _ = app.emit("aider:live_chunk", (conversation_id, &err_notice));
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: "run_command".to_string(),
+                                success: false,
+                                message: format!("Erreur run_command : {e}"),
+                                path: None,
+                            });
+                            tool_outputs.push(format!("[Erreur run_command] {e}"));
+                            break 'exec_tc Some((false, false));
+                        }
+                    }
+                }
+
+                let read_key_for_call = if tc.name == "read_file" {
+                    let s_opt = tc
+                        .arguments
+                        .get("start_line")
+                        .or_else(|| tc.arguments.get("startLine"))
+                        .and_then(|v| v.as_u64());
+                    let e_opt = tc
+                        .arguments
+                        .get("end_line")
+                        .or_else(|| tc.arguments.get("endLine"))
+                        .and_then(|v| v.as_u64());
+                    let has_range = s_opt.is_some() || e_opt.is_some();
+                    if let Some(raw_p) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                        let norm_p = raw_p
+                            .trim()
+                            .trim_matches('`')
+                            .trim_start_matches("./")
+                            .replace('\\', "/");
+                        let rkey = format!("{norm_p}:{s_opt:?}:{e_opt:?}");
+                        let already_cached = if has_range {
+                            already_read.contains(&rkey)
+                        } else {
+                            (!truncated_files.contains(&norm_p) && already_read.contains(&norm_p))
+                                || already_read.contains(&rkey)
+                        };
+                        if already_cached {
+                            tool_outputs.push(format!(
+                                "[read_file: {norm_p}] Déjà présent dans le contexte ci-dessus."
+                            ));
+                            break 'exec_tc None;
+                        }
+                        Some((norm_p, rkey, has_range))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let log_line = if tc.name == "web_search" {
+                    let q = tc.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("[Web] Recherche : \"{}\"...", truncate_chars(q, 60))
+                } else if tc.name == "fetch_url" {
+                    let u = tc.arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("[Web] Lecture URL : {}...", truncate_chars(u, 60))
+                } else {
+                    format!("[Outil] {}...", tc.name)
+                };
+                let _ = app.emit("aider:stream", (conversation_id, &log_line));
+                match execute_local_tool_internal(project_root, &tc.name, &tc.arguments).await {
+                    Ok(tr) => {
+                        if tc.name == "write_file" || tc.name == "create_file" || tc.name == "edit_file"
+                        {
+                            if tr.success {
+                                wrote_via_tool = true;
+                                if let Some(p) = &tr.path {
+                                    let pfx = format!("{p}:");
+                                    already_read.retain(|k| k != p && !k.starts_with(&pfx));
+                                    if seen_applied.insert(p.clone()) {
+                                        all_applied_files.push(p.clone());
+                                    }
+                                    let ok_line =
+                                        format!("[Outil] Modification appliquée sur `{p}`.");
+                                    let _ = app.emit("aider:stream", (conversation_id, &ok_line));
+                                }
+                            } else {
+                                tool_had_failure = true;
+                            }
+                            all_tool_results.push(tr.clone());
+                            tool_outputs.push(format!("[{}] {}", tc.name, tr.message));
+                            break 'exec_tc Some((tr.success, tr.success));
+                        } else if tc.name == "read_file" {
+                            if let Some((norm_p, rkey, has_range)) = read_key_for_call {
+                                already_read.insert(rkey);
+                                if !has_range && tr.message.lines().count() <= 220 {
+                                    already_read.insert(norm_p);
+                                }
+                            } else if let Some(p) = &tr.path {
+                                already_read.insert(p.clone());
+                            }
+                            let clipped = truncate_chars(&tr.message, tool_output_budget);
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: tr.tool.clone(),
+                                success: tr.success,
+                                message: format!(
+                                    "Lecture '{}' ({} octets)",
+                                    tr.path.as_deref().unwrap_or(""),
+                                    tr.message.len()
+                                ),
+                                path: tr.path.clone(),
+                            });
+                            tool_outputs.push(format!(
+                                "[read_file: {}]\n{}",
+                                tr.path.as_deref().unwrap_or(""),
+                                clipped
+                            ));
+                            break 'exec_tc Some((tr.success, false));
+                        } else {
+                            if !tr.success {
+                                tool_had_failure = true;
+                            }
+                            let clipped = truncate_chars(&tr.message, tool_output_budget);
+                            let detail = if tc.name == "web_search" {
+                                let q = tc.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                                format!("Recherche \"{q}\" : {}", truncate_chars(&tr.message, 600))
+                            } else if tc.name == "fetch_url" {
+                                let u = tc.arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                format!("Lecture {u} : {}", truncate_chars(&tr.message, 600))
+                            } else {
+                                truncate_chars(&tr.message, 600)
+                            };
+                            all_tool_results.push(ToolExecutionResult {
+                                tool: tr.tool.clone(),
+                                success: tr.success,
+                                message: detail,
+                                path: tr.path.clone(),
+                            });
+                            tool_outputs.push(format!("[{}]\n{}", tc.name, clipped));
+                            break 'exec_tc Some((tr.success, false));
+                        }
                     }
                     Err(e) => {
                         tool_had_failure = true;
-                        let err_notice = format!(
-                            "{}\n\n💻 `{}` -> ✕ ({})",
-                            turn_live_content.trim(),
-                            truncate_chars(cmd_str, 70),
-                            truncate_chars(&e, 60)
-                        );
-                        let _ = app.emit("aider:live_chunk", (conversation_id, &err_notice));
                         all_tool_results.push(ToolExecutionResult {
-                            tool: "run_command".to_string(),
+                            tool: tc.name.clone(),
                             success: false,
-                            message: format!("Erreur run_command : {e}"),
+                            message: format!("Erreur {} : {}", tc.name, e),
                             path: None,
                         });
-                        tool_outputs.push(format!("[Erreur run_command] {e}"));
+                        tool_outputs.push(format!("[Erreur {}] {}", tc.name, e));
+                        break 'exec_tc Some((false, false));
                     }
                 }
-                continue;
-            }
-
-            let read_key_for_call = if tc.name == "read_file" {
-                let s_opt = tc
-                    .arguments
-                    .get("start_line")
-                    .or_else(|| tc.arguments.get("startLine"))
-                    .and_then(|v| v.as_u64());
-                let e_opt = tc
-                    .arguments
-                    .get("end_line")
-                    .or_else(|| tc.arguments.get("endLine"))
-                    .and_then(|v| v.as_u64());
-                let has_range = s_opt.is_some() || e_opt.is_some();
-                if let Some(raw_p) = tc.arguments.get("path").and_then(|v| v.as_str()) {
-                    let norm_p = raw_p
-                        .trim()
-                        .trim_matches('`')
-                        .trim_start_matches("./")
-                        .replace('\\', "/");
-                    let rkey = format!("{norm_p}:{s_opt:?}:{e_opt:?}");
-                    let already_cached = if has_range {
-                        already_read.contains(&rkey)
-                    } else {
-                        (!truncated_files.contains(&norm_p) && already_read.contains(&norm_p))
-                            || already_read.contains(&rkey)
-                    };
-                    if already_cached {
-                        tool_outputs.push(format!(
-                            "[read_file: {norm_p}] Déjà présent dans le contexte ci-dessus."
-                        ));
-                        continue;
-                    }
-                    Some((norm_p, rkey, has_range))
-                } else {
-                    None
-                }
-            } else {
-                None
             };
 
-            let log_line = if tc.name == "web_search" {
-                let q = tc.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                format!("[Web] Recherche : \"{}\"...", truncate_chars(q, 60))
-            } else if tc.name == "fetch_url" {
-                let u = tc.arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                format!("[Web] Lecture URL : {}...", truncate_chars(u, 60))
-            } else {
-                format!("[Outil] {}...", tc.name)
-            };
-            let _ = app.emit("aider:stream", (conversation_id, &log_line));
-            match execute_local_tool_internal(project_root, &tc.name, &tc.arguments).await {
-                Ok(tr) => {
-                    if tc.name == "write_file" || tc.name == "create_file" || tc.name == "edit_file"
-                    {
-                        if tr.success {
-                            wrote_via_tool = true;
-                            if let Some(p) = &tr.path {
-                                let pfx = format!("{p}:");
-                                already_read.retain(|k| k != p && !k.starts_with(&pfx));
-                                if seen_applied.insert(p.clone()) {
-                                    all_applied_files.push(p.clone());
-                                }
-                                let ok_line =
-                                    format!("[Outil] Modification appliquée sur `{p}`.");
-                                let _ = app.emit("aider:stream", (conversation_id, &ok_line));
-                            }
-                        } else {
-                            tool_had_failure = true;
-                        }
-                        all_tool_results.push(tr.clone());
-                        tool_outputs.push(format!("[{}] {}", tc.name, tr.message));
-                    } else if tc.name == "read_file" {
-                        if let Some((norm_p, rkey, has_range)) = read_key_for_call {
-                            already_read.insert(rkey);
-                            if !has_range && tr.message.lines().count() <= 220 {
-                                already_read.insert(norm_p);
-                            }
-                        } else if let Some(p) = &tr.path {
-                            already_read.insert(p.clone());
-                        }
-                        let clipped = truncate_chars(&tr.message, tool_output_budget);
-                        all_tool_results.push(ToolExecutionResult {
-                            tool: tr.tool.clone(),
-                            success: tr.success,
-                            message: format!(
-                                "Lecture '{}' ({} octets)",
-                                tr.path.as_deref().unwrap_or(""),
-                                tr.message.len()
-                            ),
-                            path: tr.path.clone(),
-                        });
-                        tool_outputs.push(format!(
-                            "[read_file: {}]\n{}",
-                            tr.path.as_deref().unwrap_or(""),
-                            clipped
-                        ));
-                    } else {
-                        if !tr.success {
-                            tool_had_failure = true;
-                        }
-                        let clipped = truncate_chars(&tr.message, tool_output_budget);
-                        let detail = if tc.name == "web_search" {
-                            let q = tc.arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                            format!("Recherche \"{q}\" : {}", truncate_chars(&tr.message, 600))
-                        } else if tc.name == "fetch_url" {
-                            let u = tc.arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            format!("Lecture {u} : {}", truncate_chars(&tr.message, 600))
-                        } else {
-                            truncate_chars(&tr.message, 600)
-                        };
-                        all_tool_results.push(ToolExecutionResult {
-                            tool: tr.tool.clone(),
-                            success: tr.success,
-                            message: detail,
-                            path: tr.path.clone(),
-                        });
-                        tool_outputs.push(format!("[{}]\n{}", tc.name, clipped));
-                    }
+            if let Some((call_succeeded, bumped_disk)) = exec_outcome {
+                if bumped_disk {
+                    disk_revision += 1;
+                    last_post_edit_verification = None;
                 }
-                Err(e) => {
-                    tool_had_failure = true;
-                    all_tool_results.push(ToolExecutionResult {
-                        tool: tc.name.clone(),
-                        success: false,
-                        message: format!("Erreur {} : {}", tc.name, e),
-                        path: None,
-                    });
-                    tool_outputs.push(format!("[Erreur {}] {}", tc.name, e));
-                }
+                tool_call_history.insert(tc_sig, (call_succeeded, disk_revision));
             }
         }
 
-        if !current_turn_tool_signatures.is_empty() {
-            last_turn_tool_signatures = current_turn_tool_signatures;
-        } else {
-            last_turn_tool_signatures.clear();
-        }
-
-        // 2. Appliquer les blocs de fichiers / SEARCH-REPLACE
+        // 2. Appliquer les blocs de fichiers / SEARCH-REPLACE (filet de sécurité Markdown)
         let edit_outcome = patcher::apply_edits_from_response(
             project_root,
             &effective_response,
@@ -4359,6 +3063,10 @@ async fn execute_native_agent_loop(
         )
         .await;
 
+        if !edit_outcome.applied_files.is_empty() {
+            disk_revision += 1;
+            last_post_edit_verification = None;
+        }
         for f in &edit_outcome.applied_files {
             let pfx = format!("{f}:");
             already_read.retain(|k| k != f && !k.starts_with(&pfx));
@@ -4377,8 +3085,22 @@ async fn execute_native_agent_loop(
             last_non_empty_narrative = turn_cleaned;
         }
 
-        // 3. Décision de boucle
-        if turn + 1 >= strategy.max_turns {
+        // 3. Extension dynamique de budget (avant test de fin de boucle) et décision de continuation
+        if !tool_outputs.is_empty() {
+            if all_applied_files.is_empty() && !wrote_via_tool {
+                reading_turns += 1;
+                if turn + 1 >= max_loop_turns && reading_turns > 0 && max_loop_turns < 12 {
+                    max_loop_turns = (turn + 5).min(12);
+                }
+            } else if (wrote_via_tool || !edit_outcome.applied_files.is_empty())
+                && turn >= max_loop_turns
+                && max_loop_turns < 14
+            {
+                max_loop_turns = (turn + 2).min(14);
+            }
+        }
+
+        if turn >= max_loop_turns {
             break;
         }
 
@@ -4417,26 +3139,21 @@ async fn execute_native_agent_loop(
                 fail_notes.push(item);
             }
             messages.push(LlmMessage::user(format!(
-                "Un ou plusieurs blocs d'édition ont échoué :\n{}\n\nRéémets UNIQUEMENT les blocs `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` corrigés en recopiant fidèlement les lignes réelles ci-dessus.",
+                "Un ou plusieurs blocs d'édition ont échoué :\n{}\n\nCorrige ces éditions avec `edit_file` ou `write_file`.",
                 fail_notes.join("\n")
             )));
             continue;
         }
 
-        if !tool_outputs.is_empty()
-            && edit_outcome.applied_files.is_empty()
-            && (!wrote_via_tool || tool_had_failure || turn_cleaned_is_empty)
-        {
-            if all_applied_files.is_empty() && !wrote_via_tool {
-                reading_turns += 1;
-                // Si la limite de tours approche alors que l'agent n'a fait que lire sans écrire,
-                // prolonger pour garantir au moins 5 tours d'écriture dédiés.
-                if turns_run + 1 >= max_loop_turns && reading_turns > 0 && max_loop_turns < 12 {
-                    max_loop_turns = (turns_run + 5).min(12);
-                }
-            }
+        // Toujours renvoyer les résultats d'outils et poursuivre la boucle dès qu'au moins un outil a été appelé
+        if !tool_outputs.is_empty() {
+            let follow_up = if tool_had_failure {
+                "Une ou plusieurs actions précédentes ont échoué : corrige l'erreur ou change d'approche (ex. read_file ou write_file complet), puis poursuis jusqu'à résolution complète."
+            } else {
+                "Poursuis maintenant avec ces résultats : enchaîne les prochaines lectures, écritures (`write_file` / `edit_file`) ou vérifications (`run_command`) nécessaires, ou conclue brièvement sans appel d'outil si tout est terminé."
+            };
             messages.push(LlmMessage::user(format!(
-                "[Résultats des outils]\n{}\n\nPoursuis maintenant avec ces informations pour répondre précisément ou appliquer les modifications de fichiers attendues.",
+                "[Résultats des outils]\n{}\n\n{follow_up}",
                 tool_outputs.join("\n\n")
             )));
             continue;
@@ -4456,7 +3173,7 @@ async fn execute_native_agent_loop(
                 "aider:stream",
                 (
                     conversation_id,
-                    "[Auto-réparation] Aucune modification détectée sur disque — relance au format d'édition...",
+                    "[Auto-réparation] Aucune modification détectée sur disque — relance avec outils d'écriture...",
                 ),
             );
             let candidate_paths: Vec<String> = if !target_files.is_empty() {
@@ -4469,16 +3186,9 @@ async fn execute_native_agent_loop(
             } else {
                 candidate_paths.join(", ")
             };
-            let format_example = if effective_edit_format == "diff" {
-                "### chemin/exact.ext\n```lang\n<<<<<<< SEARCH\nlignes exactes\n=======\nnouvelles lignes\n>>>>>>> REPLACE\n```"
-            } else {
-                "### chemin/exact.ext\n```lang\n// Contenu complet du fichier\n```"
-            };
             messages.push(LlmMessage::user(format!(
                 "ATTENTION : ta réponse précédente n'a modifié AUCUN fichier sur le disque.\n\
-                Tu DOIS appliquer concrètement la demande sur les fichiers réels du projet ({files_hint}).\n\
-                Si le fichier exact te manque, appelle `<tool_call>{{\"name\":\"read_file\",\"arguments\":{{\"path\":\"...\"}}}}</tool_call>` ; sinon émets IMMEDIATEMENT un bloc précédé du chemin relatif brut :\n\
-                {format_example}"
+                Tu DOIS appliquer concrètement la demande sur le projet ({files_hint}) en appelant l'outil `write_file` (création / réécriture complète) ou `edit_file` (patch court), ou `read_file` s'il te manque le contenu réel."
             )));
             continue;
         }
@@ -4502,6 +3212,7 @@ async fn execute_native_agent_loop(
         },
         tool_results: all_tool_results,
         applied_files: all_applied_files,
+        last_post_edit_verification,
         prompt_tokens: total_prompt_tokens,
         completion_tokens: total_completion_tokens,
         turns_run,
@@ -4542,6 +3253,7 @@ fn build_files_summary(modified_files: &[ModifiedFileDiff]) -> Vec<FileChangeSum
             added: f.added,
             removed: f.removed,
             modified: f.modified,
+            status: f.status.clone(),
         })
         .collect()
 }
@@ -4957,6 +3669,77 @@ fn has_callable_candidate(
     })
 }
 
+#[derive(Clone, Debug)]
+struct StepHandoff {
+    step_id: String,
+    title: String,
+    role: String,
+    goal: String,
+    conclusion: String,
+    key_tool_outputs: Vec<String>,
+    modified_files: Vec<String>,
+    status: String,
+}
+
+#[derive(Clone, Debug)]
+struct MissionBlackboard {
+    original_user_prompt: String,
+    plan_summary: String,
+    validation_command: Option<String>,
+    workspace_snapshot: WorkspaceSnapshot,
+    step_handoffs: Vec<StepHandoff>,
+    tool_facts: Vec<String>,
+    applied_files: Vec<String>,
+}
+
+impl MissionBlackboard {
+    fn new(original_user_prompt: String, workspace_snapshot: WorkspaceSnapshot) -> Self {
+        Self {
+            original_user_prompt,
+            plan_summary: String::new(),
+            validation_command: None,
+            workspace_snapshot,
+            step_handoffs: Vec::new(),
+            tool_facts: Vec::new(),
+            applied_files: Vec::new(),
+        }
+    }
+
+    fn format_handoffs_block(&self) -> String {
+        if self.step_handoffs.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("[Acquis & diagnostics des étapes précédentes]\n");
+        for (idx, h) in self.step_handoffs.iter().enumerate() {
+            out.push_str(&format!(
+                "### Étape {} — {} (rôle: {}, statut: {}, id: {})\n- Objectif: {}\n",
+                idx + 1,
+                h.title,
+                h.role,
+                h.status,
+                h.step_id,
+                truncate_chars(&h.goal, 240)
+            ));
+            if !h.modified_files.is_empty() {
+                out.push_str(&format!("- Fichiers modifiés: {}\n", h.modified_files.join(", ")));
+            }
+            if !h.key_tool_outputs.is_empty() {
+                out.push_str("- Constats d'outils:\n");
+                for obs in h.key_tool_outputs.iter().take(4) {
+                    out.push_str(&format!("  * {}\n", truncate_chars(obs, 220)));
+                }
+            }
+            if !h.conclusion.trim().is_empty() {
+                out.push_str(&format!(
+                    "- Conclusion / diagnostic: {}\n",
+                    truncate_chars(h.conclusion.trim(), 700)
+                ));
+            }
+        }
+        out
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn synthesize_final_response(
     app: &AppHandle,
@@ -4974,6 +3757,7 @@ async fn synthesize_final_response(
     turn_applied_files: &[String],
     extra_stage_edits: bool,
     verifier_note: &str,
+    blackboard: &MissionBlackboard,
 ) -> (String, usize) {
     let can_call_synth =
         has_callable_candidate(synth_provider, synth_model, "synthesizer", settings, ollama_running);
@@ -4982,6 +3766,7 @@ async fn synthesize_final_response(
         && can_call_synth
         && (cleaned_narrative.trim().is_empty()
             || !tool_results.is_empty()
+            || !modified_files.is_empty()
             || cleaned_narrative.chars().count() > 700
             || narrative_needs_structured_synthesis(
                 cleaned_narrative,
@@ -4992,7 +3777,9 @@ async fn synthesize_final_response(
 
     let mut synth_tokens = 0usize;
     let core_narrative = if needs_llm_synthesis {
-        let scoped_diffs: Vec<ModifiedFileDiff> = if !turn_applied_files.is_empty() {
+        let scoped_diffs: Vec<ModifiedFileDiff> = if !modified_files.is_empty() {
+            modified_files.to_vec()
+        } else if !turn_applied_files.is_empty() {
             modified_files
                 .iter()
                 .filter(|f| turn_applied_files.iter().any(|p| paths_match(&f.path, p)))
@@ -5007,11 +3794,22 @@ async fn synthesize_final_response(
             "total_modified_files": scoped_diffs.len(),
             "modified_files": scoped_diffs.iter().map(|f| serde_json::json!({
                 "path": f.path,
+                "status": f.status.clone().unwrap_or_else(|| "modified".to_string()),
                 "added_lines": f.added,
                 "removed_lines": f.removed,
+                "modified_lines": f.modified,
                 "diff_summary": build_compact_diff_summary(&[f.clone()], 800)
             })).collect::<Vec<_>>(),
             "turn_applied_files": turn_applied_files,
+            "step_handoffs": blackboard.step_handoffs.iter().map(|h| serde_json::json!({
+                "step_id": h.step_id,
+                "title": h.title,
+                "role": h.role,
+                "status": h.status,
+                "modified_files": h.modified_files,
+                "key_tool_outputs": h.key_tool_outputs,
+                "conclusion": h.conclusion
+            })).collect::<Vec<_>>(),
             "executed_tools": tool_results.iter().take(15).map(|r| serde_json::json!({
                 "tool": r.tool,
                 "success": r.success,
@@ -5031,9 +3829,9 @@ async fn synthesize_final_response(
         ### 🔍 Cause du problème & Diagnostic\n\
         Explique succinctement la cause technique ayant motivé l'intervention d'après les faits d'exécution (ex. fichier manquant, configuration absente, syntaxe erronée).\n\n\
         ### 🛠️ Solution réelle & Fichiers modifiés\n\
-        Résume STRICTEMENT les modifications réelles indiquées dans le JSON d'état.\n\
-        RÈGLE ABSOLUE : Cite OBLIGATOIREMENT chaque fichier réellement créé ou modifié avec son lien Markdown cliquable exact `[NomFichier](chemin/relatif/NomFichier)` (ex: `[vite.config.ts](vite.config.ts)`).\n\
-        Détaille les modifications logiques (lignes ajoutées/supprimées, options modifiées, imports corrigés).\n\
+        Résume STRICTEMENT les modifications réelles indiquées dans le JSON d'état (`modified_files` et `step_handoffs`).\n\
+        RÈGLE ABSOLUE : Cite OBLIGATOIREMENT chaque fichier réellement créé ou modifié avec son lien Markdown cliquable exact `[NomFichier](chemin/relatif/NomFichier)`.\n\
+        Détaille les modifications logiques (création, lignes ajoutées/supprimées, options modifiées, imports corrigés).\n\
         Si aucun fichier n'a été modifié (has_modified_files = false), indique clairement qu'aucune modification de fichier n'a été écrite sur le disque et n'invente AUCUNE commande manuelle.\n\n\
         ### ✅ Vérifications & État final\n\
         Résume les outils réellement exécutés (installations, builds, tests) et leur résultat (succès/échec) d'après le JSON d'état. Indique l'état final vérifié de l'application.\n\n\
@@ -5103,10 +3901,12 @@ async fn synthesize_final_response(
 
     let non_empty_core = if core_narrative.trim().is_empty() {
         let mut lines = Vec::new();
-        if !turn_applied_files.is_empty() {
+        let mut fallback_paths: Vec<String> = modified_files.iter().map(|f| f.path.clone()).collect();
+        push_unique_paths(&mut fallback_paths, turn_applied_files);
+        if !fallback_paths.is_empty() {
             lines.push("### 🛠️ Solution & Fichiers modifiés".to_string());
-            for f in turn_applied_files {
-                let base = file_basename(f);
+            for f in fallback_paths {
+                let base = file_basename(&f);
                 lines.push(format!("- [{base}]({f}) : modifications appliquées."));
             }
         }
@@ -5277,6 +4077,8 @@ async fn finish_cancelled_pipeline(
             lines_added,
             lines_removed,
             files_summary: build_files_summary(&modified_files),
+            turn_diffs: Vec::new(),
+            pre_turn_tree: None,
             agent_trace: agent_trace.clone(),
             commit_id: None,
             commit_summary: None,
@@ -5352,6 +4154,8 @@ pub async fn run_prompt_pipeline(
             lines_added: 0,
             lines_removed: 0,
             files_summary: Vec::new(),
+            turn_diffs: Vec::new(),
+            pre_turn_tree: None,
             agent_trace: Vec::new(),
             commit_id: None,
             commit_summary: None,
@@ -5462,11 +4266,13 @@ pub async fn run_prompt_pipeline(
 
     // SUB-AGENT 1/5: Architecte & Orchestrateur (Planification DAG Multi-Agent)
     let all_project_files = list_source_files_for_cartographer(&project_root_path);
-    let frontend_stack = detect_frontend_stack(&project_root_path, &all_project_files);
 
     let (arch_prov, arch_model) = resolve_agent_slot("architect", &settings);
     let is_agent_mode =
         settings.active_target.trim().is_empty() || settings.active_target.trim() == "agent";
+
+    let initial_snapshot = workspace::build_workspace_snapshot(&project_root_path, arch_prov != "ollama");
+    let mut blackboard = MissionBlackboard::new(user_prompt.clone(), initial_snapshot);
 
     emit_stage(
         app,
@@ -5511,48 +4317,15 @@ pub async fn run_prompt_pipeline(
         stack.ollama_running,
     );
 
-    let missing_deps =
-        prompt_mentions_uninstalled_library(&user_prompt, frontend_stack.as_ref());
-
     let task_plan: crate::orchestrator::TaskPlan = if is_agent_mode && arch_can_run {
-        let mut arch_prioritized = Vec::new();
-        let mut arch_others = Vec::new();
-        for f in &all_project_files {
-            if f.starts_with("src/") || f.starts_with("src-tauri/src/") || !f.contains('/') {
-                arch_prioritized.push(f.clone());
-            } else {
-                arch_others.push(f.clone());
-            }
-        }
-        arch_prioritized.extend(arch_others);
-        let arch_files_preview: Vec<String> = arch_prioritized.into_iter().take(30).collect();
-        let stack_block = frontend_stack
-            .as_ref()
-            .map(|s| format!("\nStack frontend détectée :\n{}", s.format_summary()))
-            .unwrap_or_default();
-        let files_block = if arch_files_preview.is_empty() {
-            "aucun fichier indexé".to_string()
-        } else {
-            arch_files_preview.join(", ")
-        };
         let arch_mem_block = load_project_architecture_memory(&project_root_path, 1200)
             .map(|(src, txt)| format!("\n\n[Architecture & Conventions ({src})]\n{txt}"))
             .unwrap_or_default();
-        let missing_deps_block = if missing_deps.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\n[Dépendances manquantes détectées]\n- {}",
-                missing_deps.join("\n- ")
-            )
-        };
 
         let project_summary = format!(
-            "Fichiers principaux : {}\n{}{}{}{}",
-            files_block,
-            stack_block,
+            "{}{}{}",
+            blackboard.workspace_snapshot.format_for_prompt(arch_prov != "ollama"),
             arch_mem_block,
-            missing_deps_block,
             if project.global_context.trim().is_empty() {
                 String::new()
             } else {
@@ -5638,6 +4411,9 @@ pub async fn run_prompt_pipeline(
         crate::orchestrator::TaskPlan::fallback(&user_prompt)
     };
 
+    blackboard.plan_summary = task_plan.summary.clone();
+    blackboard.validation_command = task_plan.validation_command().map(str::to_string);
+
     let execution_waves = task_plan
         .compute_execution_waves()
         .unwrap_or_else(|_| vec![task_plan.tasks.iter().map(|t| t.id.clone()).collect()]);
@@ -5647,16 +4423,14 @@ pub async fn run_prompt_pipeline(
     }
 
     let exec_role = if let Some(first_task) = task_plan.tasks.first() {
-        let role_str = match crate::orchestrator::TaskRole::from_str_loose(&first_task.role).as_str() {
+        match crate::orchestrator::TaskRole::from_str_loose(&first_task.role).as_str() {
             "designer" => "designer",
             "refactoring" => "refactoring",
             "tester" => "tester",
             "terminal" => "terminal",
             "research" => "research",
             _ => "coder",
-        };
-        architect_spec = Some(format!("Objectif : {}\nCadrage : {}", first_task.goal, task_plan.summary));
-        role_str
+        }
     } else {
         "coder"
     };
@@ -5783,7 +4557,7 @@ pub async fn run_prompt_pipeline(
         },
     );
 
-    let mut carto = tokio::select! {
+    let carto = tokio::select! {
         biased;
         _ = wait_cancelled(&mut cancel_rx) => {
             if let Some(h) = title_handle.take() {
@@ -5808,24 +4582,8 @@ pub async fn run_prompt_pipeline(
             &carto_model,
             &exec_prov,
             stack.ollama_running,
-            exec_role == "designer",
-            frontend_stack.as_ref(),
         ) => p,
     };
-
-    if !missing_deps.is_empty() {
-        if let Some(ref st) = frontend_stack {
-            if let Some(ref entry) = st.entry_file {
-                if !carto
-                    .target_files
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(entry))
-                {
-                    carto.target_files.push(entry.clone());
-                }
-            }
-        }
-    }
 
     if let Some((p_tok, c_tok)) = carto.cartographer_tokens {
         if p_tok + c_tok > 0 {
@@ -5914,9 +4672,11 @@ pub async fn run_prompt_pipeline(
     let mut had_repairs = false;
     let mut raw_exec_output = String::new();
     let mut turn_applied_files: Vec<String> = Vec::new();
-    let (pre_turn_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
+    let pre_turn_tree = git_diff::capture_workspace_tree(&project.root_path).await;
     let mut extra_stage_edits = false;
     let mut init_images_opt = Some(image_base64_list);
+    let mut last_post_edit_verification: Option<(String, bool, String)> = None;
+    let mut dag_completed_tasks = 0usize;
 
     let (cleaned_narrative, stage_note) = if is_multi_step {
         git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
@@ -5976,373 +4736,7 @@ pub async fn run_prompt_pipeline(
                         Some(t) => t.clone(),
                         None => continue,
                     };
-            if is_cancelled(&cancel_rx) {
-                if let Some(h) = title_handle.take() {
-                    h.abort();
-                }
-                return finish_cancelled_pipeline(
-                    app,
-                    state_lock,
-                    &conversation_id,
-                    &project.root_path,
-                    &mut agent_trace,
-                )
-                .await;
-            }
-
-            let step_role_static: &'static str = match crate::orchestrator::TaskRole::from_str_loose(&step.role).as_str() {
-                "designer" => "designer",
-                "refactoring" => "refactoring",
-                "tester" => "tester",
-                "terminal" => "terminal",
-                "research" => "research",
-                _ => "coder",
-            };
-            let (step_prov, step_model) = resolve_agent_slot(step_role_static, &settings);
-            let trace_role_key = format!("{}_step_{}", step_role_static, task_counter);
-            let step_label = format!(
-                "Étape {}/{} (Vague {}/{}) · {}",
-                task_counter,
-                total_tasks,
-                wave_idx + 1,
-                total_waves,
-                truncate_chars(&step.title, 34)
-            );
-
-            let step_all_files = list_source_files_for_cartographer(&project_root_path);
-            let step_frontend_stack =
-                detect_frontend_stack(&project_root_path, &step_all_files);
-
-            let mut step_targets: Vec<String> = Vec::new();
-            for raw_f in &step.files {
-                if let Some(clean) = patcher::sanitize_rel_path(raw_f) {
-                    if !step_targets.iter().any(|x| x == &clean) {
-                        step_targets.push(clean);
-                    }
-                    if step_targets.len() >= 4 {
-                        break;
-                    }
-                }
-            }
-            if step_targets.is_empty() {
-                let query = format!("{} {}", step.title, step.goal);
-                let (det_matched, _) =
-                    match_files_deterministically(&query, None, &step_all_files);
-                step_targets = if det_matched.is_empty() {
-                    carto.target_files.iter().take(4).cloned().collect()
-                } else {
-                    det_matched.into_iter().take(4).collect()
-                };
-            }
-
-            let step_strategy = choose_execution_strategy(
-                &project_root_path,
-                &step_targets,
-                !step_targets.is_empty(),
-                &step_prov,
-                &settings,
-            );
-
-            emit_stage(
-                app,
-                &conversation_id,
-                3,
-                &format!("3. {} ({} · {})", step_label, step_prov, step_model),
-                &format!(
-                    "Tâche {}/{} : {}",
-                    task_counter,
-                    total_tasks,
-                    truncate_chars(&step.title, 80)
-                ),
-                "running",
-            );
-            record_trace_step(
-                app,
-                &conversation_id,
-                &mut agent_trace,
-                AgentTraceStep {
-                    role: trace_role_key.clone(),
-                    role_label: step_label.clone(),
-                    provider: step_prov.clone(),
-                    model: step_model.clone(),
-                    summary: truncate_chars(&step.goal, 110),
-                    status: "running".to_string(),
-                    tokens: 0,
-                },
-            );
-
-            let stream_hdr = format!(
-                "\n\n── Vague {}/{} · Étape {}/{} : {} ({}) ──\n",
-                wave_idx + 1,
-                total_waves,
-                task_counter,
-                total_tasks,
-                step.title,
-                role_display_name(step_role_static)
-            );
-            let _ = app.emit("aider:stream", (&conversation_id, &stream_hdr));
-
-            let done_block = if completed_steps_summary.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n[Étapes déjà terminées]\n{}\n",
-                    completed_steps_summary.join("\n")
-                )
-            };
-            let target_list_note = if step_targets.is_empty() {
-                "à créer/déterminer selon l'étape".to_string()
-            } else {
-                step_targets.join(", ")
-            };
-            let step_prompt = format!(
-                "[Objectif global : {}]\n{}\n[Tâche courante {}/{} (Vague {}/{}) : {} ({})]\nFichiers cibles : {}\nConsignes précises d'exécution :\n{}\n\nRègle : Reste strictement concentré sur cette étape et utilise les outils mis à disposition (run_command, read_file, edit_file, web_search...).",
-                task_plan.summary,
-                done_block,
-                task_counter,
-                total_tasks,
-                wave_idx + 1,
-                total_waves,
-                step.title,
-                step.id,
-                target_list_note,
-                step.goal
-            );
-
-            let step_conv_ctx = if task_counter == 1 { conv_ctx.as_str() } else { "" };
-            let step_attachments = if task_counter == 1 { attachments.as_deref() } else { None };
-            let step_images = if task_counter == 1 {
-                init_images_opt.take().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            match execute_native_agent_loop(
-                app,
-                state_lock,
-                &conversation_id,
-                &project,
-                step_conv_ctx,
-                &step_prompt,
-                step_attachments,
-                step_images,
-                architect_spec.as_deref(),
-                &step_prov,
-                &step_model,
-                step_role_static,
-                stack.ollama_running,
-                &settings,
-                &step_all_files,
-                &step_targets,
-                &carto.read_only_files,
-                &step_strategy,
-                step_frontend_stack.as_ref(),
-                &mcp_servers,
-                &mut cancel_rx,
-            )
-            .await
-            {
-                Ok(mut step_res) => {
-                    engine_ran = true;
-                    let mut step_tokens = step_res.prompt_tokens + step_res.completion_tokens;
-                    exec_tokens_used += step_tokens;
-                    if let Some(ref th) = step_res.thinking {
-                        if !th.trim().is_empty() {
-                            let mode_tag = if sub_wave.is_parallel {
-                                "⚡ [Exécution Parallèle sans conflit]"
-                            } else {
-                                "▶ [Exécution Séquentielle]"
-                            };
-                            all_thinking.push(format!(
-                                "### {} Étape {}/{} (Vague {}) : {}\n{}",
-                                mode_tag,
-                                task_counter,
-                                total_tasks,
-                                wave_idx + 1,
-                                step.title,
-                                th.trim()
-                            ));
-                        }
-                    }
-                    tool_results.extend(step_res.tool_results.drain(..));
-                    had_repairs |= step_res.had_repairs;
-                    raw_exec_output = step_res.raw_last_response.clone();
-                    push_unique_paths(&mut turn_applied_files, &step_res.applied_files);
-                    exec_prov = step_res.actual_provider.clone();
-                    exec_model = step_res.actual_model.clone();
-
-                    let step_explanation = if !step_res.narrative.trim().is_empty() {
-                        truncate_chars(step_res.narrative.trim(), 800)
-                    } else if !step_res.applied_files.is_empty() {
-                        format!("Modifications appliquées dans : {}", step_res.applied_files.join(", "))
-                    } else if !step_res.tool_results.is_empty() {
-                        step_res
-                            .tool_results
-                            .iter()
-                            .map(|t| format!("{}: {}", t.tool, truncate_chars(&t.message, 140)))
-                            .collect::<Vec<_>>()
-                            .join(" ; ")
-                    } else {
-                        "Analyse terminée".to_string()
-                    };
-                    let mode_note = if sub_wave.is_parallel { " *(⚡ exécuté en parallèle)*" } else { "" };
-                    step_narratives.push(format!(
-                        "- **Étape {} ({})**{} : {}",
-                        task_counter,
-                        step.title,
-                        mode_note,
-                        step_explanation
-                    ));
-
-                    let mut step_files = step_res.applied_files.clone();
-                    let applied_code_files: Vec<String> = step_res
-                        .applied_files
-                        .iter()
-                        .filter(|p| {
-                            matches!(
-                                Path::new(p)
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|s| s.to_ascii_lowercase())
-                                    .as_deref(),
-                                Some("rs" | "ts" | "tsx" | "vue" | "js" | "jsx" | "py")
-                            )
-                        })
-                        .take(3)
-                        .cloned()
-                        .collect();
-
-                    if task_counter < total_tasks
-                        && !applied_code_files.is_empty()
-                        && !is_cancelled(&cancel_rx)
-                    {
-                        let vr = run_test_verifier(&project_root_path).await;
-                        if vr.ran && !vr.success {
-                            let vr_msg = format!(
-                                "[Étape {}/{}] Erreur `{}` détectée — auto-correction ciblée...",
-                                task_counter,
-                                total_tasks,
-                                vr.command
-                            );
-                            let _ = app.emit("aider:stream", (&conversation_id, &vr_msg));
-                            let fix_prompt = format!(
-                                "La vérification `{}` a échoué après l'étape « {} » :\n```\n{}\n```\nCorrige uniquement ces erreurs dans les fichiers cibles avec `SEARCH/REPLACE`.",
-                                vr.command, step.title, vr.output_summary
-                            );
-                            let fix_strategy = ExecutionStrategy {
-                                edit_format: "diff".to_string(),
-                                map_tokens: 0,
-                                max_turns: 2,
-                                max_file_lines: 0,
-                            };
-                            let refreshed_files =
-                                list_source_files_for_cartographer(&project_root_path);
-                            let refreshed_stack =
-                                detect_frontend_stack(&project_root_path, &refreshed_files);
-                            match execute_native_agent_loop(
-                                app,
-                                state_lock,
-                                &conversation_id,
-                                &project,
-                                "",
-                                &fix_prompt,
-                                None,
-                                Vec::new(),
-                                None,
-                                &exec_prov,
-                                &exec_model,
-                                step_role_static,
-                                stack.ollama_running,
-                                &settings,
-                                &refreshed_files,
-                                &applied_code_files,
-                                &[],
-                                &fix_strategy,
-                                refreshed_stack.as_ref(),
-                                &mcp_servers,
-                                &mut cancel_rx,
-                            )
-                            .await
-                            {
-                                Ok(fix_res) => {
-                                    let fix_tok =
-                                        fix_res.prompt_tokens + fix_res.completion_tokens;
-                                    step_tokens += fix_tok;
-                                    exec_tokens_used += fix_tok;
-                                    tool_results.extend(fix_res.tool_results);
-                                    if !fix_res.applied_files.is_empty() {
-                                        push_unique_paths(
-                                            &mut turn_applied_files,
-                                            &fix_res.applied_files,
-                                        );
-                                        push_unique_paths(&mut step_files, &fix_res.applied_files);
-                                        had_repairs = true;
-                                    }
-                                }
-                                Err(e) => {
-                                    if is_cancelled(&cancel_rx)
-                                        || e.to_string().contains("CANCELLED_BY_USER")
-                                    {
-                                        if let Some(h) = title_handle.take() {
-                                            h.abort();
-                                        }
-                                        return finish_cancelled_pipeline(
-                                            app,
-                                            state_lock,
-                                            &conversation_id,
-                                            &project.root_path,
-                                            &mut agent_trace,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let files_note = if step_files.is_empty() {
-                        "aucun fichier modifié".to_string()
-                    } else {
-                        step_files.join(", ")
-                    };
-                    let mode_tag = if sub_wave.is_parallel { " [⚡ Parallèle]" } else { " [▶ Séquentiel]" };
-                    completed_steps_summary.push(format!(
-                        "- Étape {} ({}){} : {}",
-                        task_counter,
-                        step.title,
-                        mode_tag,
-                        files_note
-                    ));
-
-                    let fb_note = if let Some(ref r) = step_res.fallback_reason {
-                        format!(" · Repli (`{}`)", truncate_chars(&r.replace('`', "'"), 55))
-                    } else {
-                        String::new()
-                    };
-                    record_trace_step(
-                        app,
-                        &conversation_id,
-                        &mut agent_trace,
-                        AgentTraceStep {
-                            role: trace_role_key,
-                            role_label: step_label,
-                            provider: step_res.actual_provider,
-                            model: step_res.actual_model,
-                            summary: format!(
-                                "{} · {} tour(s){}",
-                                files_note, step_res.turns_run, fb_note
-                            ),
-                            status: if step_res.fallback_reason.is_some() {
-                                "fallback".to_string()
-                            } else {
-                                "done".to_string()
-                            },
-                            tokens: step_tokens,
-                        },
-                    );
-                }
-                Err(err) => {
-                    if is_cancelled(&cancel_rx) || err.to_string().contains("CANCELLED_BY_USER") {
+                    if is_cancelled(&cancel_rx) {
                         if let Some(h) = title_handle.take() {
                             h.abort();
                         }
@@ -6355,33 +4749,503 @@ pub async fn run_prompt_pipeline(
                         )
                         .await;
                     }
-                    let clean_err = synthesize_error_log(&err.to_string());
-                    had_step_error = true;
+
+                    let step_role_static: &'static str =
+                        match crate::orchestrator::TaskRole::from_str_loose(&step.role).as_str() {
+                            "designer" => "designer",
+                            "refactoring" => "refactoring",
+                            "tester" => "tester",
+                            "terminal" => "terminal",
+                            "research" => "research",
+                            _ => "coder",
+                        };
+                    let (step_prov, step_model) = resolve_agent_slot(step_role_static, &settings);
+                    let step_is_cloud = step_prov != "ollama";
+                    if (task_counter == 1 && step_is_cloud != (arch_prov != "ollama"))
+                        || (task_counter > 1 && !turn_applied_files.is_empty())
+                    {
+                        blackboard.workspace_snapshot =
+                            workspace::build_workspace_snapshot(&project_root_path, step_is_cloud);
+                    }
+
+                    let trace_role_key = format!("{}_step_{}", step_role_static, task_counter);
+                    let step_label = format!(
+                        "Étape {}/{} (Vague {}/{}) · {}",
+                        task_counter,
+                        total_tasks,
+                        wave_idx + 1,
+                        total_waves,
+                        truncate_chars(&step.title, 34)
+                    );
+
+                    let step_all_files = list_source_files_for_cartographer(&project_root_path);
+
+                    let mut step_targets: Vec<String> = Vec::new();
+                    for raw_f in &step.files {
+                        if let Some(clean) = patcher::sanitize_rel_path(raw_f) {
+                            if !step_targets.iter().any(|x| x == &clean) {
+                                step_targets.push(clean);
+                            }
+                            if step_targets.len() >= 4 {
+                                break;
+                            }
+                        }
+                    }
+                    if step_targets.is_empty() {
+                        let query = format!("{} {}", step.title, step.goal);
+                        let (det_matched, _) =
+                            match_files_deterministically(&query, None, &step_all_files);
+                        step_targets = if det_matched.is_empty() {
+                            carto.target_files.iter().take(4).cloned().collect()
+                        } else {
+                            det_matched.into_iter().take(4).collect()
+                        };
+                    }
+
+                    let step_strategy = choose_execution_strategy(
+                        &project_root_path,
+                        &step_targets,
+                        !step_targets.is_empty(),
+                        &step_prov,
+                        &settings,
+                    );
+
+                    emit_stage(
+                        app,
+                        &conversation_id,
+                        3,
+                        &format!("3. {} ({} · {})", step_label, step_prov, step_model),
+                        &format!(
+                            "Tâche {}/{} : {}",
+                            task_counter,
+                            total_tasks,
+                            truncate_chars(&step.title, 80)
+                        ),
+                        "running",
+                    );
                     record_trace_step(
                         app,
                         &conversation_id,
                         &mut agent_trace,
                         AgentTraceStep {
-                            role: trace_role_key,
-                            role_label: step_label,
-                            provider: step_prov,
-                            model: step_model,
-                            summary: format!("Erreur : `{clean_err}`"),
-                            status: "error".to_string(),
+                            role: trace_role_key.clone(),
+                            role_label: step_label.clone(),
+                            provider: step_prov.clone(),
+                            model: step_model.clone(),
+                            summary: truncate_chars(&step.goal, 110),
+                            status: "running".to_string(),
                             tokens: 0,
                         },
                     );
-                    step_narratives.push(format!(
-                        "- **Étape {} ({})** : ⚠️ Erreur (`{clean_err}`)",
+
+                    let stream_hdr = format!(
+                        "\n\n── Vague {}/{} · Étape {}/{} : {} ({}) ──\n",
+                        wave_idx + 1,
+                        total_waves,
                         task_counter,
-                        step.title
-                    ));
-                    break 'dag_loop;
+                        total_tasks,
+                        step.title,
+                        role_display_name(step_role_static)
+                    );
+                    let _ = app.emit("aider:stream", (&conversation_id, &stream_hdr));
+
+                    let handoffs_block = blackboard.format_handoffs_block();
+                    let target_list_note = if step_targets.is_empty() {
+                        "à créer/déterminer selon l'étape".to_string()
+                    } else {
+                        step_targets.join(", ")
+                    };
+                    let step_architect_spec = format!(
+                        "Demande initiale utilisateur (à ne jamais perdre de vue) :\n{}\n\nPlan global : {}\nÉtape courante {}/{} ({}) : {}\nConsigne de l'étape :\n{}",
+                        truncate_chars(blackboard.original_user_prompt.trim(), 900),
+                        blackboard.plan_summary,
+                        task_counter,
+                        total_tasks,
+                        step.id,
+                        step.title,
+                        step.goal
+                    );
+                    let step_prompt = format!(
+                        "[Demande initiale utilisateur]\n{}\n\n[Plan global : {}]\n{}\n[Tâche courante {}/{} (Vague {}/{}) : {} ({})]\nFichiers cibles : {}\nConsignes précises d'exécution :\n{}\n\nRègle : Reste concentré sur cette étape tout en respectant la demande initiale complète et les constats précédents. Utilise directement tes outils natifs (`read_file`, `write_file`, `edit_file`, `run_command`, `search_web`).",
+                        truncate_chars(blackboard.original_user_prompt.trim(), 900),
+                        blackboard.plan_summary,
+                        if handoffs_block.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n{handoffs_block}\n")
+                        },
+                        task_counter,
+                        total_tasks,
+                        wave_idx + 1,
+                        total_waves,
+                        step.title,
+                        step.id,
+                        target_list_note,
+                        step.goal
+                    );
+
+                    let step_conv_ctx = conv_ctx.as_str();
+                    let step_attachments = attachments.as_deref();
+                    let step_images = if task_counter == 1 {
+                        init_images_opt.take().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
+                    match execute_native_agent_loop(
+                        app,
+                        state_lock,
+                        &conversation_id,
+                        &project,
+                        step_conv_ctx,
+                        &step_prompt,
+                        step_attachments,
+                        step_images,
+                        Some(step_architect_spec.as_str()),
+                        &step_prov,
+                        &step_model,
+                        step_role_static,
+                        stack.ollama_running,
+                        &settings,
+                        &blackboard.workspace_snapshot,
+                        &step_targets,
+                        &carto.read_only_files,
+                        &step_strategy,
+                        &mcp_servers,
+                        &mut cancel_rx,
+                    )
+                    .await
+                    {
+                        Ok(mut step_res) => {
+                            engine_ran = true;
+                            let mut step_tokens = step_res.prompt_tokens + step_res.completion_tokens;
+                            exec_tokens_used += step_tokens;
+                            if let Some(ref th) = step_res.thinking {
+                                if !th.trim().is_empty() {
+                                    let mode_tag = if sub_wave.is_parallel {
+                                        "⚡ [Exécution Parallèle sans conflit]"
+                                    } else {
+                                        "▶ [Exécution Séquentielle]"
+                                    };
+                                    all_thinking.push(format!(
+                                        "### {} Étape {}/{} (Vague {}) : {}\n{}",
+                                        mode_tag,
+                                        task_counter,
+                                        total_tasks,
+                                        wave_idx + 1,
+                                        step.title,
+                                        th.trim()
+                                    ));
+                                }
+                            }
+
+                            let mut key_tool_outputs: Vec<String> = step_res
+                                .tool_results
+                                .iter()
+                                .filter(|t| {
+                                    !t.success
+                                        || matches!(
+                                            t.tool.as_str(),
+                                            "run_command" | "search_web" | "edit_file" | "write_file"
+                                        )
+                                })
+                                .take(5)
+                                .map(|t| {
+                                    let status_tag = if t.success { "OK" } else { "ERR" };
+                                    format!(
+                                        "[{}] {}: {}",
+                                        status_tag,
+                                        t.tool,
+                                        truncate_chars(&t.message, 200)
+                                    )
+                                })
+                                .collect();
+                            let step_explanation = if !step_res.narrative.trim().is_empty() {
+                                truncate_chars(step_res.narrative.trim(), 800)
+                            } else if !step_res.applied_files.is_empty() {
+                                format!(
+                                    "Modifications appliquées dans : {}",
+                                    step_res.applied_files.join(", ")
+                                )
+                            } else if !step_res.tool_results.is_empty() {
+                                step_res
+                                    .tool_results
+                                    .iter()
+                                    .map(|t| format!("{}: {}", t.tool, truncate_chars(&t.message, 140)))
+                                    .collect::<Vec<_>>()
+                                    .join(" ; ")
+                            } else {
+                                "Analyse terminée".to_string()
+                            };
+
+                            if let Some(ref pv) = step_res.last_post_edit_verification {
+                                last_post_edit_verification = Some(pv.clone());
+                            } else if !step_res.applied_files.is_empty() {
+                                last_post_edit_verification = None;
+                            }
+
+                            tool_results.extend(step_res.tool_results.drain(..));
+                            had_repairs |= step_res.had_repairs;
+                            raw_exec_output = step_res.raw_last_response.clone();
+                            push_unique_paths(&mut turn_applied_files, &step_res.applied_files);
+                            push_unique_paths(&mut blackboard.applied_files, &step_res.applied_files);
+                            exec_prov = step_res.actual_provider.clone();
+                            exec_model = step_res.actual_model.clone();
+
+                            let mode_note = if sub_wave.is_parallel {
+                                " *(⚡ exécuté en parallèle)*"
+                            } else {
+                                ""
+                            };
+                            step_narratives.push(format!(
+                                "- **Étape {} ({})**{} : {}",
+                                task_counter,
+                                step.title,
+                                mode_note,
+                                step_explanation
+                            ));
+
+                            let mut step_files = step_res.applied_files.clone();
+                            let mut step_status = if step_files.is_empty() && key_tool_outputs.iter().any(|k| k.starts_with("[ERR]")) {
+                                "partial".to_string()
+                            } else {
+                                "done".to_string()
+                            };
+
+                            if task_counter < total_tasks
+                                && !step_files.is_empty()
+                                && !is_cancelled(&cancel_rx)
+                            {
+                                blackboard.workspace_snapshot =
+                                    workspace::build_workspace_snapshot(
+                                        &project_root_path,
+                                        exec_prov != "ollama",
+                                    );
+                                let vr = run_project_verifier(
+                                    &project_root_path,
+                                    blackboard.validation_command.as_deref(),
+                                    last_post_edit_verification.as_ref(),
+                                )
+                                .await;
+                                if vr.ran && vr.success {
+                                    last_post_edit_verification = Some((
+                                        vr.command.clone(),
+                                        true,
+                                        vr.output_summary.clone(),
+                                    ));
+                                } else if vr.ran && !vr.success {
+                                    let vr_msg = format!(
+                                        "[Étape {}/{}] Erreur `{}` détectée — auto-correction ciblée...",
+                                        task_counter, total_tasks, vr.command
+                                    );
+                                    let _ = app.emit("aider:stream", (&conversation_id, &vr_msg));
+                                    let fix_prompt = format!(
+                                        "[Demande initiale utilisateur]\n{}\n\nLa vérification `{}` a échoué après l'étape « {} » :\n```\n{}\n```\nCorrige ces erreurs avec `edit_file` (ou `write_file` pour un nouveau fichier/réécriture complète) tout en respectant la demande initiale.",
+                                        truncate_chars(blackboard.original_user_prompt.trim(), 700),
+                                        vr.command,
+                                        step.title,
+                                        vr.output_summary
+                                    );
+                                    let fix_strategy = ExecutionStrategy {
+                                        edit_format: "diff".to_string(),
+                                        map_tokens: 0,
+                                        max_turns: 4,
+                                        max_file_lines: 0,
+                                    };
+                                    let fix_targets: Vec<String> =
+                                        step_files.iter().take(4).cloned().collect();
+                                    match execute_native_agent_loop(
+                                        app,
+                                        state_lock,
+                                        &conversation_id,
+                                        &project,
+                                        conv_ctx.as_str(),
+                                        &fix_prompt,
+                                        attachments.as_deref(),
+                                        Vec::new(),
+                                        Some(step_architect_spec.as_str()),
+                                        &exec_prov,
+                                        &exec_model,
+                                        step_role_static,
+                                        stack.ollama_running,
+                                        &settings,
+                                        &blackboard.workspace_snapshot,
+                                        &fix_targets,
+                                        &[],
+                                        &fix_strategy,
+                                        &mcp_servers,
+                                        &mut cancel_rx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(fix_res) => {
+                                            let fix_tok =
+                                                fix_res.prompt_tokens + fix_res.completion_tokens;
+                                            step_tokens += fix_tok;
+                                            exec_tokens_used += fix_tok;
+                                            if let Some(ref pv) = fix_res.last_post_edit_verification {
+                                                last_post_edit_verification = Some(pv.clone());
+                                            } else if !fix_res.applied_files.is_empty() {
+                                                last_post_edit_verification = None;
+                                            }
+                                            tool_results.extend(fix_res.tool_results);
+                                            if !fix_res.applied_files.is_empty() {
+                                                push_unique_paths(
+                                                    &mut turn_applied_files,
+                                                    &fix_res.applied_files,
+                                                );
+                                                push_unique_paths(
+                                                    &mut blackboard.applied_files,
+                                                    &fix_res.applied_files,
+                                                );
+                                                push_unique_paths(&mut step_files, &fix_res.applied_files);
+                                                had_repairs = true;
+                                                key_tool_outputs.push(format!(
+                                                    "[OK] auto-fix ({}): {}",
+                                                    vr.command,
+                                                    fix_res.applied_files.join(", ")
+                                                ));
+                                            } else {
+                                                step_status = "partial".to_string();
+                                                key_tool_outputs.push(format!(
+                                                    "[ERR] {} échoué: {}",
+                                                    vr.command,
+                                                    truncate_chars(&vr.output_summary, 180)
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if is_cancelled(&cancel_rx)
+                                                || e.to_string().contains("CANCELLED_BY_USER")
+                                            {
+                                                if let Some(h) = title_handle.take() {
+                                                    h.abort();
+                                                }
+                                                return finish_cancelled_pipeline(
+                                                    app,
+                                                    state_lock,
+                                                    &conversation_id,
+                                                    &project.root_path,
+                                                    &mut agent_trace,
+                                                )
+                                                .await;
+                                            }
+                                            step_status = "partial".to_string();
+                                        }
+                                    }
+                                }
+                            }
+
+                            blackboard.tool_facts.extend(key_tool_outputs.iter().cloned());
+                            blackboard.step_handoffs.push(StepHandoff {
+                                step_id: step.id.clone(),
+                                title: step.title.clone(),
+                                role: step_role_static.to_string(),
+                                goal: step.goal.clone(),
+                                conclusion: truncate_chars(&step_explanation, 700),
+                                key_tool_outputs,
+                                modified_files: step_files.clone(),
+                                status: step_status,
+                            });
+
+                            let files_note = if step_files.is_empty() {
+                                "aucun fichier modifié".to_string()
+                            } else {
+                                step_files.join(", ")
+                            };
+                            let mode_tag = if sub_wave.is_parallel {
+                                " [⚡ Parallèle]"
+                            } else {
+                                " [▶ Séquentiel]"
+                            };
+                            completed_steps_summary.push(format!(
+                                "- Étape {} ({}){} : {}",
+                                task_counter, step.title, mode_tag, files_note
+                            ));
+                            dag_completed_tasks += 1;
+
+                            let fb_note = if let Some(ref r) = step_res.fallback_reason {
+                                format!(
+                                    " · Repli (`{}`)",
+                                    truncate_chars(&r.replace('`', "'"), 55)
+                                )
+                            } else {
+                                String::new()
+                            };
+                            record_trace_step(
+                                app,
+                                &conversation_id,
+                                &mut agent_trace,
+                                AgentTraceStep {
+                                    role: trace_role_key,
+                                    role_label: step_label,
+                                    provider: step_res.actual_provider,
+                                    model: step_res.actual_model,
+                                    summary: format!(
+                                        "{} · {} tour(s){}",
+                                        files_note, step_res.turns_run, fb_note
+                                    ),
+                                    status: if step_res.fallback_reason.is_some() {
+                                        "fallback".to_string()
+                                    } else {
+                                        "done".to_string()
+                                    },
+                                    tokens: step_tokens,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            if is_cancelled(&cancel_rx)
+                                || err.to_string().contains("CANCELLED_BY_USER")
+                            {
+                                if let Some(h) = title_handle.take() {
+                                    h.abort();
+                                }
+                                return finish_cancelled_pipeline(
+                                    app,
+                                    state_lock,
+                                    &conversation_id,
+                                    &project.root_path,
+                                    &mut agent_trace,
+                                )
+                                .await;
+                            }
+                            let clean_err = synthesize_error_log(&err.to_string());
+                            had_step_error = true;
+                            blackboard.step_handoffs.push(StepHandoff {
+                                step_id: step.id.clone(),
+                                title: step.title.clone(),
+                                role: step_role_static.to_string(),
+                                goal: step.goal.clone(),
+                                conclusion: format!("Échec d'exécution : {clean_err}"),
+                                key_tool_outputs: vec![format!("[ERR] {clean_err}")],
+                                modified_files: Vec::new(),
+                                status: "failed".to_string(),
+                            });
+                            record_trace_step(
+                                app,
+                                &conversation_id,
+                                &mut agent_trace,
+                                AgentTraceStep {
+                                    role: trace_role_key,
+                                    role_label: step_label,
+                                    provider: step_prov,
+                                    model: step_model,
+                                    summary: format!("Erreur : `{clean_err}`"),
+                                    status: "error".to_string(),
+                                    tokens: 0,
+                                },
+                            );
+                            step_narratives.push(format!(
+                                "- **Étape {} ({})** : ⚠️ Erreur (`{clean_err}`)",
+                                task_counter, step.title
+                            ));
+                            break 'dag_loop;
+                        }
+                    }
                 }
             }
         }
-    }
-}
 
         if !all_thinking.is_empty() {
             extracted_thinking = Some(all_thinking.join("\n\n"));
@@ -6460,6 +5324,20 @@ pub async fn run_prompt_pipeline(
 
         if can_run_exec {
             git_diff::sanitize_corrupted_diff_files(&project.root_path).await;
+            if (exec_prov != "ollama") != (arch_prov != "ollama") {
+                blackboard.workspace_snapshot = workspace::build_workspace_snapshot(
+                    &project_root_path,
+                    exec_prov != "ollama",
+                );
+            }
+            if architect_spec.is_none() {
+                if let Some(first_task) = task_plan.tasks.first() {
+                    architect_spec = Some(format!(
+                        "Objectif : {}\nCadrage : {}",
+                        first_task.goal, task_plan.summary
+                    ));
+                }
+            }
             let single_images = init_images_opt.take().unwrap_or_default();
             match execute_native_agent_loop(
                 app,
@@ -6476,11 +5354,10 @@ pub async fn run_prompt_pipeline(
                 exec_role,
                 stack.ollama_running,
                 &settings,
-                &all_project_files,
+                &blackboard.workspace_snapshot,
                 &carto.target_files,
                 &carto.read_only_files,
                 &strategy,
-                frontend_stack.as_ref(),
                 &mcp_servers,
                 &mut cancel_rx,
             )
@@ -6490,12 +5367,66 @@ pub async fn run_prompt_pipeline(
                     engine_ran = true;
                     exec_tokens_used = loop_res.prompt_tokens + loop_res.completion_tokens;
                     extracted_thinking = loop_res.thinking;
+                    let key_tool_outputs: Vec<String> = loop_res
+                        .tool_results
+                        .iter()
+                        .filter(|t| {
+                            !t.success
+                                || matches!(
+                                    t.tool.as_str(),
+                                    "run_command" | "search_web" | "edit_file" | "write_file"
+                                )
+                        })
+                        .take(5)
+                        .map(|t| {
+                            let status_tag = if t.success { "OK" } else { "ERR" };
+                            format!(
+                                "[{}] {}: {}",
+                                status_tag,
+                                t.tool,
+                                truncate_chars(&t.message, 200)
+                            )
+                        })
+                        .collect();
+                    blackboard.tool_facts.extend(key_tool_outputs.iter().cloned());
+                    last_post_edit_verification = loop_res.last_post_edit_verification.clone();
                     tool_results = loop_res.tool_results;
                     had_repairs = loop_res.had_repairs;
                     raw_exec_output = loop_res.raw_last_response;
                     exec_prov = loop_res.actual_provider.clone();
                     exec_model = loop_res.actual_model.clone();
                     push_unique_paths(&mut turn_applied_files, &loop_res.applied_files);
+                    push_unique_paths(&mut blackboard.applied_files, &loop_res.applied_files);
+
+                    let conclusion_summary = if !loop_res.narrative.trim().is_empty() {
+                        truncate_chars(loop_res.narrative.trim(), 700)
+                    } else if !loop_res.applied_files.is_empty() {
+                        format!(
+                            "Modifications appliquées : {}",
+                            loop_res.applied_files.join(", ")
+                        )
+                    } else {
+                        "Exécution terminée".to_string()
+                    };
+                    blackboard.step_handoffs.push(StepHandoff {
+                        step_id: task_plan
+                            .tasks
+                            .first()
+                            .map(|t| t.id.clone())
+                            .unwrap_or_else(|| "single".to_string()),
+                        title: task_plan
+                            .tasks
+                            .first()
+                            .map(|t| t.title.clone())
+                            .unwrap_or_else(|| role_display_name(exec_role).to_string()),
+                        role: exec_role.to_string(),
+                        goal: user_prompt.clone(),
+                        conclusion: conclusion_summary,
+                        key_tool_outputs,
+                        modified_files: loop_res.applied_files.clone(),
+                        status: "done".to_string(),
+                    });
+
                     let fb_note = if let Some(ref r) = loop_res.fallback_reason {
                         exec_status = "fallback".to_string();
                         format!(", repli auto: {}", truncate_chars(&r.replace('`', "'"), 60))
@@ -6602,6 +5533,86 @@ pub async fn run_prompt_pipeline(
         .await;
     }
 
+    // Arrêt propre immédiat si le Codeur a échoué sans repli possible (0 appel réussi)
+    let coder_fatally_failed = (is_multi_step
+        && exec_status == "error"
+        && dag_completed_tasks == 0
+        && tool_results.is_empty())
+        || (!is_multi_step && !engine_ran && exec_status == "error");
+
+    if coder_fatally_failed {
+        if let Some(h) = title_handle.take() {
+            h.abort();
+        }
+        let fatal_err_text = if cleaned_narrative.trim().is_empty() {
+            format!("⚠️ Échec bloquant de l'exécution : {exec_note}")
+        } else {
+            cleaned_narrative.clone()
+        };
+
+        let _ = app.emit("aider:stream", (&conversation_id, &fatal_err_text));
+        emit_stage(
+            app,
+            &conversation_id,
+            3,
+            "3. Exécution Codeur",
+            "Échec bloquant — aucun appel réussi.",
+            "error",
+        );
+
+        let result = {
+            let mut guard = state_lock.lock().await;
+            let now = Utc::now().to_rfc3339();
+
+            let conv_idx = guard
+                .conversations
+                .iter()
+                .position(|c| c.id == conversation_id)
+                .ok_or_else(|| anyhow::anyhow!("Conversation introuvable"))?;
+
+            let assistant_msg_id = Uuid::new_v4().to_string();
+            guard.conversations[conv_idx].messages.push(ChatMessage {
+                id: assistant_msg_id.clone(),
+                role: "assistant".to_string(),
+                content: fatal_err_text,
+                thinking: None,
+                attachments: None,
+                created_at: now.clone(),
+                stage_summary: Some("Erreur bloquante".to_string()),
+                files_changed: 0,
+                lines_added: 0,
+                lines_removed: 0,
+                files_summary: Vec::new(),
+                turn_diffs: Vec::new(),
+                pre_turn_tree: pre_turn_tree.clone(),
+                agent_trace,
+                commit_id: None,
+                commit_summary: None,
+            });
+
+            guard.conversations[conv_idx].updated_at = now.clone();
+
+            let proj_id = guard.conversations[conv_idx].project_id.clone();
+            let proj_idx = guard
+                .projects
+                .iter()
+                .position(|p| p.id == proj_id)
+                .ok_or_else(|| anyhow::anyhow!("Projet introuvable"))?;
+            guard.projects[proj_idx].updated_at = now;
+
+            let updated_conv = guard.conversations[conv_idx].clone();
+            let updated_proj = guard.projects[proj_idx].clone();
+            let _ = storage::save_state(&guard).await;
+
+            SendPromptResult {
+                conversation: updated_conv,
+                project: updated_proj,
+            }
+        };
+
+        return Ok(result);
+    }
+
     // SUB-AGENT 4/5: Testeur & Vérifieur + Auto-fix build (1 tour max)
     emit_stage(
         app,
@@ -6673,7 +5684,7 @@ pub async fn run_prompt_pipeline(
                 &test_prov,
                 &settings,
             );
-            test_strategy.max_turns = 2;
+            test_strategy.max_turns = 4;
 
             match execute_native_agent_loop(
                 app,
@@ -6690,11 +5701,10 @@ pub async fn run_prompt_pipeline(
                 "tester",
                 stack.ollama_running,
                 &settings,
-                &all_project_files,
+                &blackboard.workspace_snapshot,
                 &changed_paths,
                 &[],
                 &test_strategy,
-                frontend_stack.as_ref(),
                 &mcp_servers,
                 &mut cancel_rx,
             )
@@ -6708,9 +5718,15 @@ pub async fn run_prompt_pipeline(
                     if t_res.fallback_reason.is_some() {
                         tester_status = "fallback".to_string();
                     }
+                    if let Some(ref pv) = t_res.last_post_edit_verification {
+                        last_post_edit_verification = Some(pv.clone());
+                    } else if !t_res.applied_files.is_empty() {
+                        last_post_edit_verification = None;
+                    }
                     tool_results.extend(t_res.tool_results);
                     if !t_res.applied_files.is_empty() {
                         push_unique_paths(&mut turn_applied_files, &t_res.applied_files);
+                        push_unique_paths(&mut blackboard.applied_files, &t_res.applied_files);
                         extra_stage_edits = true;
                     }
                     tester_summary = format!(
@@ -6749,230 +5765,9 @@ pub async fn run_prompt_pipeline(
         }
     }
 
-    // Garde-fou CSS statique & auto-correction ciblée (Stage 4)
-    let mut css_verifier_note = String::new();
-    let mut latest_all_files = if is_multi_step {
-        list_source_files_for_cartographer(&project_root_path)
-    } else {
-        all_project_files.clone()
-    };
-    let mut latest_frontend_stack = if is_multi_step {
-        detect_frontend_stack(&project_root_path, &latest_all_files)
-    } else {
-        frontend_stack.clone()
-    };
-
-    if engine_ran && can_run_exec && !is_install_or_setup_prompt(&user_prompt) && !is_cancelled(&cancel_rx) {
-        // Le vérifieur CSS ne doit s'exécuter QUE si des fichiers ont réellement été modifiés sur ce tour
-        // ET que ces modifications impactent directement le frontend (composants UI ou feuilles de style).
-        let has_frontend_touched = !turn_applied_files.is_empty()
-            && turn_applied_files
-                .iter()
-                .any(|p| is_ui_component_or_page(p) || is_stylesheet_path(p));
-
-        if has_frontend_touched {
-            let post_exec_touched = turn_applied_files.clone();
-            latest_all_files = list_source_files_for_cartographer(&project_root_path);
-            latest_frontend_stack = detect_frontend_stack(&project_root_path, &latest_all_files);
-
-            let css_audit = audit_frontend_css_issues(
-                &project_root_path,
-                &latest_all_files,
-                &post_exec_touched,
-                exec_role == "designer",
-            );
-
-            if !css_audit.issues.is_empty() {
-                let _ = app.emit(
-                    "aider:stream",
-                    (
-                        &conversation_id,
-                        "[Vérifieur CSS] Anomalie de style détectée — auto-correction ciblée...",
-                    ),
-                );
-                emit_stage(
-                    app,
-                    &conversation_id,
-                    4,
-                    "4. Testeur & Vérifieur",
-                    "Anomalie CSS détectée — auto-correction ciblée...",
-                    "running",
-                );
-
-                let mut css_fix_targets = css_audit.flagged_files.clone();
-                if let Some(ref entry) = css_audit.needs_entry_import {
-                    if css_fix_targets.len() < 5
-                        && !css_fix_targets.iter().any(|f| f.eq_ignore_ascii_case(entry))
-                    {
-                        css_fix_targets.push(entry.clone());
-                    }
-                }
-                if let Some(ref st) = latest_frontend_stack {
-                    if (css_audit.needs_entry_import.is_some() || !st.tailwind_active)
-                        && css_fix_targets.len() < 5
-                    {
-                        if let Some(first_css) = st.global_css_files.first() {
-                            if !css_fix_targets
-                                .iter()
-                                .any(|f| f.eq_ignore_ascii_case(first_css))
-                            {
-                                css_fix_targets.push(first_css.clone());
-                            }
-                        }
-                    }
-                }
-                css_fix_targets.truncate(5);
-
-                if !css_fix_targets.is_empty() {
-                    let all_small = css_fix_targets.iter().all(|rel| {
-                        std::fs::read_to_string(project_root_path.join(rel))
-                            .map(|c| c.lines().count() <= 220)
-                            .unwrap_or(true)
-                    });
-                    let css_fix_strategy = ExecutionStrategy {
-                        edit_format: if all_small {
-                            "whole".to_string()
-                        } else {
-                            "diff".to_string()
-                        },
-                        map_tokens: 0,
-                        max_turns: 2,
-                        max_file_lines: 0,
-                    };
-                    let css_fix_prompt = format!(
-                        "AUDIT CSS — Anomalies bloquantes détectées juste après l'exécution :\n- {}\n\n\
-                        Rappel de la demande utilisateur :\n« {} »\n\n\
-                        Corrige IMPÉRATIVEMENT ces anomalies dans les fichiers cibles (écris du vrai CSS natif complet et explicite avec reset `html, body, #app`, et/ou importe la feuille CSS dans le point d'entrée).",
-                        css_audit.issues.join("\n- "),
-                        truncate_chars(user_prompt.trim(), 600)
-                    );
-
-                    match execute_native_agent_loop(
-                        app,
-                        state_lock,
-                        &conversation_id,
-                        &project,
-                        "",
-                        &css_fix_prompt,
-                        None,
-                        Vec::new(),
-                        None,
-                        &exec_prov,
-                        &exec_model,
-                        "designer",
-                        stack.ollama_running,
-                        &settings,
-                        &latest_all_files,
-                        &css_fix_targets,
-                        &[],
-                        &css_fix_strategy,
-                        latest_frontend_stack.as_ref(),
-                        &mcp_servers,
-                        &mut cancel_rx,
-                    )
-                    .await
-                    {
-                        Ok(css_res) => {
-                            let css_fix_tokens =
-                                css_res.prompt_tokens + css_res.completion_tokens;
-                            exec_tokens_used += css_fix_tokens;
-                            tool_results.extend(css_res.tool_results);
-                            if !css_res.applied_files.is_empty() {
-                                push_unique_paths(&mut turn_applied_files, &css_res.applied_files);
-                                extra_stage_edits = true;
-                                had_repairs = true;
-                            }
-
-                            latest_all_files =
-                                list_source_files_for_cartographer(&project_root_path);
-                            latest_frontend_stack =
-                                detect_frontend_stack(&project_root_path, &latest_all_files);
-                            let (re_diffs, _, _) =
-                                git_diff::collect_project_diffs(&project.root_path).await;
-                            let mut re_touched = turn_applied_files.clone();
-                            let re_diff_paths: Vec<String> =
-                                re_diffs.into_iter().map(|d| d.path).collect();
-                            push_unique_paths(&mut re_touched, &re_diff_paths);
-
-                            let re_audit = audit_frontend_css_issues(
-                                &project_root_path,
-                                &latest_all_files,
-                                &re_touched,
-                                exec_role == "designer",
-                            );
-                            if re_audit.issues.is_empty() {
-                                css_verifier_note =
-                                    "• ✅ **Vérifieur CSS** : anomalies de style auto-corrigées."
-                                        .to_string();
-                                record_trace_step(
-                                    app,
-                                    &conversation_id,
-                                    &mut agent_trace,
-                                    AgentTraceStep {
-                                        role: "tester".to_string(),
-                                        role_label: "Vérifieur CSS".to_string(),
-                                        provider: exec_prov.clone(),
-                                        model: exec_model.clone(),
-                                        summary: "✅ Anomalies de style auto-corrigées"
-                                            .to_string(),
-                                        status: "done".to_string(),
-                                        tokens: css_fix_tokens,
-                                    },
-                                );
-                            } else {
-                                css_verifier_note = format!(
-                                    "• ⚠️ **Vérifieur CSS** : {}",
-                                    re_audit.issues.join(" ; ")
-                                );
-                                record_trace_step(
-                                    app,
-                                    &conversation_id,
-                                    &mut agent_trace,
-                                    AgentTraceStep {
-                                        role: "tester".to_string(),
-                                        role_label: "Vérifieur CSS".to_string(),
-                                        provider: exec_prov.clone(),
-                                        model: exec_model.clone(),
-                                        summary: format!(
-                                            "⚠️ {}",
-                                            truncate_chars(&re_audit.issues.join(" ; "), 110)
-                                        ),
-                                        status: "error".to_string(),
-                                        tokens: css_fix_tokens,
-                                    },
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if is_cancelled(&cancel_rx)
-                                || e.to_string().contains("CANCELLED_BY_USER")
-                            {
-                                if let Some(h) = title_handle.take() {
-                                    h.abort();
-                                }
-                                return finish_cancelled_pipeline(
-                                    app,
-                                    state_lock,
-                                    &conversation_id,
-                                    &project.root_path,
-                                    &mut agent_trace,
-                                )
-                                .await;
-                            }
-                            css_verifier_note = format!(
-                                "• ⚠️ **Vérifieur CSS** : {}",
-                                css_audit.issues.join(" ; ")
-                            );
-                        }
-                    }
-                } else {
-                    css_verifier_note = format!(
-                        "• ⚠️ **Vérifieur CSS** : {}",
-                        css_audit.issues.join(" ; ")
-                    );
-                }
-            }
-        }
+    if engine_ran && !turn_applied_files.is_empty() {
+        blackboard.workspace_snapshot =
+            workspace::build_workspace_snapshot(&project_root_path, exec_prov != "ollama");
     }
 
     let mut test_res = tokio::select! {
@@ -6990,19 +5785,33 @@ pub async fn run_prompt_pipeline(
             )
             .await;
         }
-        res = run_test_verifier(&project_root_path) => res,
+        res = run_project_verifier(
+            &project_root_path,
+            blackboard.validation_command.as_deref(),
+            last_post_edit_verification.as_ref(),
+        ) => res,
     };
 
-    // Auto-fix compilation (1 tour max) si des fichiers ont été modifiés et la compilation échoue
-    let (pre_fix_diffs, _, _) = git_diff::collect_project_diffs(&project.root_path).await;
-    if !pre_fix_diffs.is_empty()
+    // Auto-fix si ce tour a modifié des fichiers et que la vérification déclarée/active échoue
+    let pre_fix_paths: Vec<String> = if let Some(ref pre_tree) = pre_turn_tree {
+        git_diff::collect_turn_diffs(&project.root_path, pre_tree)
+            .await
+            .0
+            .into_iter()
+            .map(|d| d.path)
+            .collect()
+    } else {
+        turn_applied_files.clone()
+    };
+
+    if !pre_fix_paths.is_empty()
         && test_res.ran
         && !test_res.success
         && !is_cancelled(&cancel_rx)
         && is_agent_mode
         && can_run_exec
     {
-        let broken_paths: Vec<String> = pre_fix_diffs.into_iter().map(|d| d.path).take(3).collect();
+        let broken_paths: Vec<String> = pre_fix_paths.into_iter().take(4).collect();
         let _ = app.emit(
             "aider:stream",
             (
@@ -7022,25 +5831,32 @@ pub async fn run_prompt_pipeline(
             "running",
         );
 
+        let handoffs_block = blackboard.format_handoffs_block();
         let fix_prompt = format!(
-            "La vérification `{}` a échoué après nos modifications avec les erreurs suivantes :\n```\n{}\n```\nCorrige uniquement ces erreurs dans les fichiers cibles avec des blocs `SEARCH/REPLACE` précis.",
-            test_res.command, test_res.output_summary
+            "[Demande initiale utilisateur]\n{}\n{}\nLa vérification `{}` a échoué après nos modifications avec les erreurs suivantes :\n```\n{}\n```\nCorrige ces erreurs dans le projet en utilisant `edit_file` (ou `write_file` pour un nouveau fichier / réécriture complète), puis re-vérifie avec `run_command` si utile.",
+            truncate_chars(blackboard.original_user_prompt.trim(), 700),
+            if handoffs_block.is_empty() {
+                String::new()
+            } else {
+                format!("\n{handoffs_block}")
+            },
+            test_res.command,
+            test_res.output_summary
         );
         let fix_strategy = ExecutionStrategy {
             edit_format: "diff".to_string(),
             map_tokens: 0,
-            max_turns: 1,
+            max_turns: 4,
             max_file_lines: 0,
         };
-
         if let Ok(fix_res) = execute_native_agent_loop(
             app,
             state_lock,
             &conversation_id,
             &project,
-            "",
+            &conv_ctx,
             &fix_prompt,
-            None,
+            attachments.as_deref(),
             Vec::new(),
             None,
             &exec_prov,
@@ -7048,23 +5864,57 @@ pub async fn run_prompt_pipeline(
             exec_role,
             stack.ollama_running,
             &settings,
-            &latest_all_files,
+            &blackboard.workspace_snapshot,
             &broken_paths,
             &[],
             &fix_strategy,
-            latest_frontend_stack.as_ref(),
             &mcp_servers,
             &mut cancel_rx,
         )
         .await
         {
             exec_tokens_used += fix_res.prompt_tokens + fix_res.completion_tokens;
+            let fixed_files = fix_res.applied_files.clone();
             tool_results.extend(fix_res.tool_results);
-            if !fix_res.applied_files.is_empty() {
-                push_unique_paths(&mut turn_applied_files, &fix_res.applied_files);
+            if !fixed_files.is_empty() {
+                push_unique_paths(&mut turn_applied_files, &fixed_files);
+                push_unique_paths(&mut blackboard.applied_files, &fixed_files);
                 extra_stage_edits = true;
                 had_repairs = true;
-                test_res = run_test_verifier(&project_root_path).await;
+                blackboard.workspace_snapshot = workspace::build_workspace_snapshot(
+                    &project_root_path,
+                    exec_prov != "ollama",
+                );
+                test_res = run_project_verifier(
+                    &project_root_path,
+                    blackboard.validation_command.as_deref(),
+                    None,
+                )
+                .await;
+                blackboard.step_handoffs.push(StepHandoff {
+                    step_id: "auto_fix".to_string(),
+                    title: format!("Auto-correction ({})", test_res.command),
+                    role: exec_role.to_string(),
+                    goal: format!("Corriger les erreurs de `{}`", test_res.command),
+                    conclusion: if test_res.success {
+                        format!(
+                            "Erreurs corrigées et validation `{}` réussie.",
+                            test_res.command
+                        )
+                    } else {
+                        format!(
+                            "Corrections appliquées mais `{}` signale encore des erreurs.",
+                            test_res.command
+                        )
+                    },
+                    key_tool_outputs: vec![truncate_chars(&test_res.output_summary, 200)],
+                    modified_files: fixed_files,
+                    status: if test_res.success {
+                        "done".to_string()
+                    } else {
+                        "partial".to_string()
+                    },
+                });
             }
         }
     }
@@ -7100,7 +5950,7 @@ pub async fn run_prompt_pipeline(
             }
         } else {
             build_verifier_note = format!(
-                "• ⚠️ **Vérifieur ({})** : Compilation en erreur :\n```\n{}\n```",
+                "• ⚠️ **Vérifieur ({})** : Vérification en erreur :\n```\n{}\n```",
                 test_res.command, test_res.output_summary
             );
             let verif_short = format!("⚠️ `{}` en erreur", test_res.command);
@@ -7128,14 +5978,7 @@ pub async fn run_prompt_pipeline(
             }
         }
     }
-    let mut verifier_parts = Vec::new();
-    if !css_verifier_note.is_empty() {
-        verifier_parts.push(css_verifier_note);
-    }
-    if !build_verifier_note.is_empty() {
-        verifier_parts.push(build_verifier_note);
-    }
-    let verifier_note = verifier_parts.join("\n");
+    let verifier_note = build_verifier_note;
     if tester_ran {
         record_trace_step(
             app,
@@ -7185,39 +6028,23 @@ pub async fn run_prompt_pipeline(
     let (modified_files, lines_added, lines_removed) =
         git_diff::collect_project_diffs(&project.root_path).await;
 
-    // Calcul du diff exclusif à ce tour (fichiers touchés durant ce tour uniquement, avec delta de lignes)
-    let turn_modified_files: Vec<ModifiedFileDiff> = if !turn_applied_files.is_empty() {
-        let mut diffs: Vec<ModifiedFileDiff> = Vec::new();
-        for f in &modified_files {
-            if turn_applied_files.iter().any(|p| paths_match(&f.path, p)) {
-                let mut turn_f = f.clone();
-                if let Some(pre) = pre_turn_diffs.iter().find(|p| paths_match(&p.path, &f.path)) {
-                    turn_f.added = f.added.saturating_sub(pre.added);
-                    turn_f.removed = f.removed.saturating_sub(pre.removed);
-                    turn_f.modified = f.modified.saturating_sub(pre.modified);
-                }
-                diffs.push(turn_f);
-            }
-        }
-        for app_p in &turn_applied_files {
-            let norm = normalize_diff_path(app_p);
-            if !diffs.iter().any(|d| paths_match(&d.path, &norm)) {
-                diffs.push(ModifiedFileDiff {
-                    path: norm,
-                    added: 1,
-                    removed: 0,
-                    modified: 0,
-                    lines: Vec::new(),
-                });
-            }
-        }
-        diffs
-    } else {
-        Vec::new()
-    };
+    // Calcul du diff isolé à ce tour via snapshot Git temporaire (pre_turn_tree -> état courant)
+    let (turn_modified_files, turn_added, turn_removed) =
+        if let Some(ref pre_tree) = pre_turn_tree {
+            git_diff::collect_turn_diffs(&project.root_path, pre_tree).await
+        } else if !turn_applied_files.is_empty() {
+            let scoped: Vec<ModifiedFileDiff> = modified_files
+                .iter()
+                .filter(|f| turn_applied_files.iter().any(|p| paths_match(&f.path, p)))
+                .cloned()
+                .collect();
+            let add: usize = scoped.iter().map(|f| f.added + f.modified).sum();
+            let rem: usize = scoped.iter().map(|f| f.removed + f.modified).sum();
+            (scoped, add, rem)
+        } else {
+            (Vec::new(), 0, 0)
+        };
     let turn_files_summary = build_files_summary(&turn_modified_files);
-    let turn_added: usize = turn_modified_files.iter().map(|f| f.added + f.modified).sum();
-    let turn_removed: usize = turn_modified_files.iter().map(|f| f.removed + f.modified).sum();
 
     if !is_multi_step && !turn_modified_files.is_empty() && exec_status != "error" {
         let enriched_summary = format!(
@@ -7248,16 +6075,25 @@ pub async fn run_prompt_pipeline(
         && turn_modified_files.is_empty();
 
     let (synthesized_text, synth_tokens) = if code_task_uncompleted {
-        let missing_preview = if !carto.target_files.is_empty() {
-            carto.target_files.join(", ")
+        let broken_preview: Vec<String> = blackboard
+            .workspace_snapshot
+            .broken_declared_paths
+            .iter()
+            .take(5)
+            .map(|b| format!("`{}` (déclaré dans `{}`)", b.declared_path, b.source_file))
+            .collect();
+        let diag_detail = if !broken_preview.is_empty() {
+            format!("références déclarées manquantes : {}", broken_preview.join(", "))
+        } else if !carto.target_files.is_empty() {
+            format!("cibles : {}", carto.target_files.join(", "))
         } else {
-            "index.html, src/main.ts, src/App.vue".to_string()
+            "fichiers à créer ou modifier".to_string()
         };
         let alert_msg = format!(
-            "⚠️ **Le Codeur a diagnostiqué le problème (manque : {}) mais a atteint sa limite de tours avant d'écrire les fichiers.**\n\n\
+            "⚠️ **L'agent a atteint sa limite de tours avant d'appliquer les modifications ({}).**\n\n\
             *Aucune modification n'a encore été écrite sur le disque.*\n\n\
             [👉 Cliquez pour relancer l'écriture](#rerun-write)",
-            missing_preview
+            diag_detail
         );
         (alert_msg, 0usize)
     } else {
@@ -7292,6 +6128,7 @@ pub async fn run_prompt_pipeline(
                 &turn_applied_files,
                 extra_stage_edits,
                 &verifier_note,
+                &blackboard,
             ) => res,
         }
     };
@@ -7404,6 +6241,8 @@ pub async fn run_prompt_pipeline(
             lines_added: turn_added,
             lines_removed: turn_removed,
             files_summary: turn_files_summary,
+            turn_diffs: turn_modified_files.clone(),
+            pre_turn_tree: pre_turn_tree.clone(),
             agent_trace,
             commit_id: commit_id.clone(),
             commit_summary: commit_summary.clone(),
@@ -7436,12 +6275,36 @@ pub async fn run_prompt_pipeline(
         guard.conversations[conv_idx].updated_at = now.clone();
 
         let text_without_code = strip_code_blocks(&synthesized_text);
-        let summary_snippet = truncate_chars(text_without_code.replace('\n', " ").trim(), 180);
-        let conv_entry = format!(
-            "• [{}] Demande: {} → Résumé: {}",
-            user_msg_time.get(..16).unwrap_or(&user_msg_time),
-            truncate_chars(user_prompt.trim(), 90),
-            summary_snippet
+        let summary_snippet = truncate_chars(text_without_code.replace('\n', " ").trim(), 120);
+        let files_ctx = if turn_modified_files.is_empty() {
+            "aucun".to_string()
+        } else {
+            turn_modified_files
+                .iter()
+                .take(4)
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let verif_ctx = if test_res.ran {
+            format!(
+                "{} ({})",
+                test_res.command,
+                if test_res.success { "OK" } else { "ERR" }
+            )
+        } else {
+            "aucune".to_string()
+        };
+        let conv_entry = truncate_chars(
+            &format!(
+                "• [{}] Demande: {} | Fichiers: {} | Vérif: {} | Résumé: {}",
+                user_msg_time.get(..16).unwrap_or(&user_msg_time),
+                truncate_chars(user_prompt.trim(), 80),
+                truncate_chars(&files_ctx, 80),
+                truncate_chars(&verif_ctx, 45),
+                summary_snippet
+            ),
+            360,
         );
         let prev_conv_ctx = guard.conversations[conv_idx].conversation_context.clone();
         guard.conversations[conv_idx].conversation_context =
@@ -7520,7 +6383,7 @@ mod tests {
             &all_files,
         );
         assert!(!exp3);
-        assert_eq!(m3, vec!["vite.config.js", "package.json"]);
+        assert!(m3.is_empty());
     }
 
     #[test]
@@ -7650,31 +6513,6 @@ mod tests {
     }
 
     #[test]
-    fn test_designer_auto_includes_global_css() {
-        let all_files = vec![
-            "src/components/Sidebar.vue".to_string(),
-            "src/style.css".to_string(),
-            "src/App.vue".to_string(),
-            "package.json".to_string(),
-        ];
-        let mut matched = vec!["src/components/Sidebar.vue".to_string()];
-        augment_design_target_files(&all_files, &mut matched);
-        assert!(matched.contains(&"src/style.css".to_string()));
-        assert!(matched.contains(&"src/App.vue".to_string()));
-        assert!(matched.len() <= 3);
-
-        let all_files_alt = vec![
-            "index.html".to_string(),
-            "src/styles/main.css".to_string(),
-            "package.json".to_string(),
-        ];
-        let mut matched_alt = Vec::new();
-        augment_design_target_files(&all_files_alt, &mut matched_alt);
-        assert!(matched_alt.contains(&"src/styles/main.css".to_string()));
-        assert!(matched_alt.contains(&"index.html".to_string()));
-    }
-
-    #[test]
     fn test_prompt_expects_code_changes() {
         assert!(prompt_expects_code_changes("mets un fond gris anthracite sur la page"));
         assert!(prompt_expects_code_changes("ajoute un bouton"));
@@ -7745,7 +6583,6 @@ mod tests {
             "diff",
             &[&srv],
             "Outil `read_query`",
-            None,
         );
         assert!(p_diff.contains("SEARCH/REPLACE"));
         assert!(p_diff.contains("mcp_call"));
@@ -7753,8 +6590,9 @@ mod tests {
         assert!(p_diff.contains("read_query"));
         assert!(p_diff.contains("CONSIGNES DU RÔLE (`Codeur`)"));
 
-        let p_whole = build_native_system_prompt("coder", "whole", &[], "", None);
-        assert!(p_whole.contains("FORMAT D'ÉDITION (`whole`)"));
+        let p_whole = build_native_system_prompt("coder", "whole", &[], "");
+        assert!(p_whole.contains("write_file"));
+        assert!(p_whole.contains("SANS AUCUNE LIMITE DE LIGNES"));
         assert!(!p_whole.contains("mcp_call"));
     }
 
@@ -7845,6 +6683,7 @@ export function cleanHelper(x: number): number {
                 added: 12,
                 removed: 2,
                 modified: 5,
+                status: None,
                 lines: Vec::new(),
             },
             ModifiedFileDiff {
@@ -7852,6 +6691,7 @@ export function cleanHelper(x: number): number {
                 added: 10,
                 removed: 0,
                 modified: 0,
+                status: None,
                 lines: Vec::new(),
             },
             ModifiedFileDiff {
@@ -7859,6 +6699,7 @@ export function cleanHelper(x: number): number {
                 added: 0,
                 removed: 8,
                 modified: 0,
+                status: None,
                 lines: Vec::new(),
             },
         ];
@@ -7941,6 +6782,7 @@ export function cleanHelper(x: number): number {
                 added: 4,
                 removed: 1,
                 modified: 0,
+                status: None,
                 lines: Vec::new(),
             },
             ModifiedFileDiff {
@@ -7948,6 +6790,7 @@ export function cleanHelper(x: number): number {
                 added: 2,
                 removed: 0,
                 modified: 1,
+                status: None,
                 lines: Vec::new(),
             },
             ModifiedFileDiff {
@@ -7955,6 +6798,7 @@ export function cleanHelper(x: number): number {
                 added: 1,
                 removed: 0,
                 modified: 0,
+                status: None,
                 lines: Vec::new(),
             },
             ModifiedFileDiff {
@@ -7962,6 +6806,7 @@ export function cleanHelper(x: number): number {
                 added: 1,
                 removed: 0,
                 modified: 0,
+                status: None,
                 lines: Vec::new(),
             },
         ];
@@ -8016,223 +6861,11 @@ const p = "LeHud.vue";
     }
 
     #[test]
-    fn test_detect_frontend_stack_native_vs_tailwind_broken_vs_active() {
-        // 1. Projet Rust pur -> None
-        let rust_dir = make_temp_dir("stack_rust");
-        std::fs::write(rust_dir.join("Cargo.toml"), "[package]\nname = \"cli\"\n").unwrap();
-        assert!(detect_frontend_stack(&rust_dir, &["Cargo.toml".to_string()]).is_none());
-        let _ = std::fs::remove_dir_all(&rust_dir);
-
-        // 2. Projet Vue + Vite CSS natif avec import CSS manquant
-        let native_dir = make_temp_dir("stack_native");
-        std::fs::create_dir_all(native_dir.join("src")).unwrap();
-        std::fs::write(
-            native_dir.join("package.json"),
-            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            native_dir.join("src/main.js"),
-            "import { createApp } from 'vue';\nimport App from './App.vue';\ncreateApp(App).mount('#app');\n",
-        )
-        .unwrap();
-        std::fs::write(native_dir.join("src/index.css"), "body { margin: 0; }\n").unwrap();
-        std::fs::write(native_dir.join("src/App.vue"), "<template><div></div></template>\n").unwrap();
-
-        let files_native = vec![
-            "package.json".to_string(),
-            "src/main.js".to_string(),
-            "src/index.css".to_string(),
-            "src/App.vue".to_string(),
-        ];
-        let info_native = detect_frontend_stack(&native_dir, &files_native).unwrap();
-        assert_eq!(info_native.framework.as_deref(), Some("Vue"));
-        assert_eq!(info_native.bundler.as_deref(), Some("Vite"));
-        assert!(!info_native.tailwind_in_pkg);
-        assert!(!info_native.tailwind_active);
-        assert!(info_native.css_entry_missing_import);
-        assert!(info_native.format_summary().contains("Tailwind CSS et styles CSS natifs"));
-        assert!(info_native.format_summary().contains("ALERTE CSS"));
-        let _ = std::fs::remove_dir_all(&native_dir);
-
-        // 3. Tailwind dans package.json mais vite.config.js sans plugin tailwindcss -> cassé
-        let broken_tw_dir = make_temp_dir("stack_broken_tw");
-        std::fs::create_dir_all(broken_tw_dir.join("src")).unwrap();
-        std::fs::write(
-            broken_tw_dir.join("package.json"),
-            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0","tailwindcss":"^4.0.0","@tailwindcss/vite":"^4.0.0"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            broken_tw_dir.join("vite.config.js"),
-            "import vue from '@vitejs/plugin-vue';\nexport default { plugins: [vue()] };\n",
-        )
-        .unwrap();
-        std::fs::write(
-            broken_tw_dir.join("src/main.js"),
-            "import './index.css';\nimport App from './App.vue';\n",
-        )
-        .unwrap();
-        std::fs::write(
-            broken_tw_dir.join("src/index.css"),
-            "@import \"tailwindcss\";\n",
-        )
-        .unwrap();
-        let files_broken = vec![
-            "package.json".to_string(),
-            "vite.config.js".to_string(),
-            "src/main.js".to_string(),
-            "src/index.css".to_string(),
-        ];
-        let info_broken = detect_frontend_stack(&broken_tw_dir, &files_broken).unwrap();
-        assert!(info_broken.tailwind_in_pkg);
-        assert!(!info_broken.tailwind_active);
-        assert!(!info_broken.css_entry_missing_import);
-        assert!(info_broken
-            .tailwind_broken_reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("plugin Vite/PostCSS manquant"));
-
-        // 4. Activation Tailwind via vite.config.js + directive + import CSS
-        std::fs::write(
-            broken_tw_dir.join("vite.config.js"),
-            "import vue from '@vitejs/plugin-vue';\nimport tailwindcss from '@tailwindcss/vite';\nexport default { plugins: [vue(), tailwindcss()] };\n",
-        )
-        .unwrap();
-        let info_active = detect_frontend_stack(&broken_tw_dir, &files_broken).unwrap();
-        assert!(info_active.tailwind_active);
-        assert!(info_active.tailwind_broken_reason.is_none());
-        let _ = std::fs::remove_dir_all(&broken_tw_dir);
-    }
-
-    #[test]
-    fn test_extract_relative_imports_and_expand_design_targets() {
-        let dir = make_temp_dir("expand_imports");
-        std::fs::create_dir_all(dir.join("src/components")).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/main.js"),
-            "import { createApp } from 'vue';\nimport App from './App.vue';\ncreateApp(App).mount('#app');\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("src/index.css"), "body { margin: 0; }\n").unwrap();
-        std::fs::write(
-            dir.join("src/App.vue"),
-            "<script setup>\nimport ConversationList from './components/ConversationList.vue';\nimport ChatDiscussion from '@/components/ChatDiscussion';\n</script>\n<template><ConversationList /><ChatDiscussion /></template>\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/components/ConversationList.vue"),
-            "<template><aside></aside></template>\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/components/ChatDiscussion.vue"),
-            "<template><main></main></template>\n",
-        )
-        .unwrap();
-
-        let all_files = vec![
-            "package.json".to_string(),
-            "src/main.js".to_string(),
-            "src/index.css".to_string(),
-            "src/App.vue".to_string(),
-            "src/components/ConversationList.vue".to_string(),
-            "src/components/ChatDiscussion.vue".to_string(),
-        ];
-
-        let app_content = std::fs::read_to_string(dir.join("src/App.vue")).unwrap();
-        let imps = extract_relative_imports("src/App.vue", &app_content, &all_files);
-        assert_eq!(
-            imps,
-            vec![
-                "src/components/ConversationList.vue",
-                "src/components/ChatDiscussion.vue"
-            ]
-        );
-
-        let stack = detect_frontend_stack(&dir, &all_files);
-        let mut targets = Vec::new();
-        expand_design_targets_with_imports(&dir, &all_files, &mut targets, stack.as_ref(), 6);
-        assert!(targets.contains(&"src/index.css".to_string()));
-        assert!(targets.contains(&"src/App.vue".to_string()));
-        assert!(targets.contains(&"src/components/ConversationList.vue".to_string()));
-        assert!(targets.contains(&"src/components/ChatDiscussion.vue".to_string()));
-        assert!(targets.contains(&"src/main.js".to_string()));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn test_build_native_system_prompt_designer_css_rules() {
-        let mut stack_native = FrontendStackInfo::default();
-        stack_native.tailwind_active = false;
-        let p_native =
-            build_native_system_prompt("designer", "whole", &[], "", Some(&stack_native));
-        assert!(p_native.contains("CONSIGNES DU RÔLE (`Designer UI/UX`)"));
-        assert!(p_native.contains("Tu peux utiliser librement Tailwind CSS"));
-        assert!(p_native.contains("box-sizing: border-box"));
-
-        let mut stack_tw = FrontendStackInfo::default();
-        stack_tw.tailwind_active = true;
-        let p_tw = build_native_system_prompt("designer", "whole", &[], "", Some(&stack_tw));
-        assert!(p_tw.contains("Tu peux utiliser librement Tailwind CSS"));
-    }
-
-    #[test]
-    fn test_audit_frontend_css_issues_catches_orphan_tailwind_and_missing_import() {
-        let dir = make_temp_dir("css_audit");
-        std::fs::create_dir_all(dir.join("src/components")).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/main.js"),
-            "import App from './App.vue';\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("src/index.css"), "body { margin: 0; }\n").unwrap();
-        std::fs::write(
-            dir.join("src/App.vue"),
-            "<template><div class=\"flex-col h-screen w-[170px] bg-[#2b2d31] bg-gradient-to-r from-blue-900 to-blue-400\"></div></template>\n",
-        )
-        .unwrap();
-
-        let all_files = vec![
-            "package.json".to_string(),
-            "src/main.js".to_string(),
-            "src/index.css".to_string(),
-            "src/App.vue".to_string(),
-        ];
-
-        let report = audit_frontend_css_issues(&dir, &all_files, &["src/App.vue".to_string()], true);
-        assert_eq!(report.needs_entry_import.as_deref(), Some("src/main.js"));
-        assert!(report.issues.iter().any(|i| i.contains("n'est importée ni dans `src/main.js`")));
-
-        // Une fois import CSS ajouté et vrai CSS natif écrit dans App.vue, plus aucune anomalie
-        std::fs::write(
-            dir.join("src/main.js"),
-            "import './index.css';\nimport App from './App.vue';\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/App.vue"),
-            "<template><div class=\"layout\"><aside class=\"sidebar\"></aside></div></template>\n<style scoped>\n.layout { display: flex; height: 100vh; }\n.sidebar { width: 170px; background: #2b2d31; }\n</style>\n",
-        )
-        .unwrap();
-        let clean = audit_frontend_css_issues(&dir, &all_files, &["src/App.vue".to_string()], true);
-        assert!(clean.issues.is_empty());
-        assert!(clean.flagged_files.is_empty());
-        assert!(clean.needs_entry_import.is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let p_designer = build_native_system_prompt("designer", "whole", &[], "");
+        assert!(p_designer.contains("CONSIGNES DU RÔLE (`Designer UI/UX`)"));
+        assert!(p_designer.contains("Respecte la stack, les conventions de style"));
+        assert!(!p_designer.to_lowercase().contains("interdiction tailwind"));
     }
 
     #[test]
@@ -8349,70 +6982,7 @@ const p = "LeHud.vue";
         let (matched, explicit) =
             match_files_deterministically("Installe tailwindcss et iconify-vue", None, &all_files);
         assert!(!explicit);
-        assert_eq!(
-            matched,
-            vec![
-                "package.json".to_string(),
-                "vite.config.js".to_string(),
-                "src/index.css".to_string(),
-            ]
-        );
-        assert!(!matched.iter().any(|f| f.ends_with(".vue")));
-    }
-
-    #[test]
-    fn test_detect_installed_packages_and_missing_library() {
-        let dir = make_temp_dir("missing_lib");
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"dependencies":{"vue":"^3.5.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("src/main.js"),
-            "import { createApp } from 'vue';\nimport App from './App.vue';\ncreateApp(App).mount('#app');\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("src/App.vue"), "<template><div></div></template>\n").unwrap();
-
-        let all_files = vec![
-            "package.json".to_string(),
-            "src/main.js".to_string(),
-            "src/App.vue".to_string(),
-        ];
-
-        let stack = detect_frontend_stack(&dir, &all_files).unwrap();
-        assert!(stack.installed_packages.contains(&"vue".to_string()));
-        assert!(stack.installed_packages.contains(&"vite".to_string()));
-        assert!(stack.format_summary().contains("Paquets installés (package.json)"));
-
-        let missing = prompt_mentions_uninstalled_library(
-            "Ajoute une icône Remix-Icon sur le bouton Envoyer",
-            Some(&stack),
-        );
-        assert_eq!(missing.len(), 1);
-        assert!(missing[0].contains("remixicon"));
-
-        let no_false_pos = prompt_mentions_uninstalled_library(
-            "Ajoute une priorité haute sur les cartes",
-            Some(&stack),
-        );
-        assert!(no_false_pos.is_empty());
-
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"dependencies":{"vue":"^3.5.0","remixicon":"^4.6.0"},"devDependencies":{"vite":"^6.0.0"}}"#,
-        )
-        .unwrap();
-        let stack_after = detect_frontend_stack(&dir, &all_files).unwrap();
-        assert!(prompt_mentions_uninstalled_library(
-            "Ajoute une icône Remix-Icon sur le bouton Envoyer",
-            Some(&stack_after),
-        )
-        .is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matched.is_empty());
     }
 
     #[test]
@@ -8445,5 +7015,33 @@ const p = "LeHud.vue";
         assert_eq!(facts["has_modified_files"], true);
         assert_eq!(facts["total_modified_files"], 1);
         assert_eq!(facts["modified_files"][0]["path"], "src/App.vue");
+    }
+
+    #[test]
+    fn test_run_project_verifier_agnostic_contract() {
+        let dir = make_temp_dir("verifier_contract");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let already = ("custom check".to_string(), true, "OK".to_string());
+
+        // 1. Déjà validé avec la même commande
+        let r1 = rt.block_on(run_project_verifier(&dir, Some("custom check"), Some(&already)));
+        assert!(r1.ran);
+        assert!(r1.success);
+        assert_eq!(r1.command, "custom check");
+
+        // 2. validationCommand null -> rien d'exécuté
+        let r2 = rt.block_on(run_project_verifier(&dir, None, None));
+        assert!(!r2.ran);
+        assert!(r2.success);
+        assert!(r2.output_summary.contains("validationCommand est null"));
+
+        // 3. validationCommand explicite non bloquante -> exécution déterministe
+        let r3 = rt.block_on(run_project_verifier(&dir, Some("echo validation_ok"), None));
+        assert!(r3.ran);
+        assert!(r3.success);
+        assert_eq!(r3.command, "echo validation_ok");
+        assert!(r3.output_summary.contains("validation_ok"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -100,6 +100,7 @@ export interface ModifiedFileDiff {
   added: number;
   removed: number;
   modified: number;
+  status?: "created" | "modified" | "deleted" | string | null;
   lines: DiffLine[];
 }
 
@@ -108,6 +109,7 @@ export interface FileChangeSummary {
   added: number;
   removed: number;
   modified: number;
+  status?: "created" | "modified" | "deleted" | string | null;
 }
 
 export interface AttachedFile {
@@ -154,6 +156,8 @@ export interface ChatMessage {
   linesAdded?: number;
   linesRemoved?: number;
   filesSummary?: FileChangeSummary[];
+  turnDiffs?: ModifiedFileDiff[];
+  preTurnTree?: string | null;
   agentTrace?: AgentTraceStep[];
   commitId?: string;
   commitSummary?: string;

@@ -14,11 +14,9 @@ pub fn default_providers() -> Vec<ProviderConfig> {
             base_url: None,
             validated: false,
             available_models: vec![
-                "gemini-3.8-flash".to_string(),
-                "gemini-3.8-pro".to_string(),
-                "gemini-2.0-flash".to_string(),
                 "gemini-2.5-flash".to_string(),
                 "gemini-2.5-pro".to_string(),
+                "gemini-2.0-flash".to_string(),
             ],
             daily_token_limit: 500_000,
         },
@@ -188,14 +186,11 @@ pub fn find_provider_key(settings: &AppSettings, provider_id: &str) -> Option<St
 
 pub fn map_gemini_model_alias(model: &str) -> String {
     let low = model.to_lowercase();
-    if low == "gemini-2.5-flash" {
-        return "gemini-3.8-flash".to_string();
-    }
     if low == "gemini-pro-latest" || low == "gemini-pro" {
         return "gemini-2.5-pro".to_string();
     }
     if low == "gemini-flash" || low == "gemini-flash-latest" {
-        return "gemini-2.0-flash".to_string();
+        return "gemini-2.5-flash".to_string();
     }
     model.to_string()
 }
@@ -2440,26 +2435,78 @@ pub fn ensure_mandatory_french_prefix(system_prompt: &str) -> String {
     }
 }
 
-/// Garde uniquement Synthèse de l'état actuel + Tour N-1 + Requête N sur le modèle local (Ollama).
-pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage> {
-    if messages.len() <= 3 {
-        return messages.to_vec();
+fn clip_chars_utf8(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in s.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
     }
+    out
+}
 
-    let sys_msg = messages.first().cloned();
+/// Ancrage du prompt initial + synthèse compacte des tours intermédiaires + dernier tour + requête courante sur modèle local (Ollama).
+pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+    let sys_msg = messages.iter().find(|m| m.role == "system").cloned();
     let non_sys: Vec<&LlmMessage> = messages.iter().filter(|m| m.role != "system").collect();
 
-    let kept_non_sys: Vec<LlmMessage> = if non_sys.len() > 3 {
-        non_sys[non_sys.len() - 3..].iter().map(|&m| m.clone()).collect()
+    if non_sys.len() <= 4 {
+        let mut out = Vec::with_capacity(non_sys.len() + usize::from(sys_msg.is_some()));
+        if let Some(sys) = sys_msg {
+            out.push(sys);
+        }
+        out.extend(non_sys.into_iter().cloned());
+        return out;
+    }
+
+    let initial_user = non_sys[0].clone();
+    let tail_start = non_sys.len() - 2;
+    let middle_slice = &non_sys[1..tail_start];
+
+    let mut summary_lines: Vec<String> = Vec::new();
+    let mut summary_chars = 0usize;
+    let header = "[Synthèse des étapes intermédiaires déjà exécutées]";
+    for msg in middle_slice {
+        if summary_chars >= 540 {
+            break;
+        }
+        let tag = if msg.role == "assistant" {
+            "Agent"
+        } else {
+            "Outils"
+        };
+        let snippet_raw: String = msg
+            .content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let snippet = clip_chars_utf8(&snippet_raw, 140);
+        if !snippet.is_empty() {
+            let line = format!("- {tag} : {snippet}");
+            summary_chars += line.chars().count();
+            summary_lines.push(line);
+        }
+    }
+
+    let middle_summary = if summary_lines.is_empty() {
+        format!("{header}\n- ({} échange(s) intermédiaire(s) compacté(s))", middle_slice.len())
     } else {
-        non_sys.into_iter().cloned().collect()
+        clip_chars_utf8(&format!("{header}\n{}", summary_lines.join("\n")), 600)
     };
 
-    let mut out = Vec::with_capacity(1 + kept_non_sys.len());
+    let mut out = Vec::with_capacity(5);
     if let Some(sys) = sys_msg {
         out.push(sys);
     }
-    out.extend(kept_non_sys);
+    out.push(initial_user);
+    out.push(LlmMessage::assistant(middle_summary));
+    out.push(non_sys[tail_start].clone());
+    out.push(non_sys[tail_start + 1].clone());
     out
 }
 
@@ -2468,19 +2515,51 @@ pub fn is_quota_or_fallback_error(err_msg: &str) -> bool {
         return false;
     }
     let low = err_msg.to_lowercase();
+
+    // Toute erreur réseau, timeout, connexion ou transport HTTP
+    let is_network_or_http = low.contains("http")
+        || low.contains("status")
+        || low.contains("error sending request")
+        || low.contains("connection")
+        || low.contains("connect")
+        || low.contains("timeout")
+        || low.contains("timed out")
+        || low.contains("network")
+        || low.contains("dns")
+        || low.contains("refused")
+        || low.contains("reset by peer")
+        || low.contains("reqwest")
+        || low.contains("hyper")
+        || low.contains("ssl")
+        || low.contains("tls")
+        || low.contains("handshake")
+        || low.contains("unreachable")
+        || low.contains("failed to send")
+        || low.contains("io error")
+        || low.contains("os error")
+        || low.contains("stream closed");
+
     let markers = [
+        "400",
+        "401",
+        "402",
+        "403",
+        "404",
+        "408",
         "429",
+        "500",
+        "502",
+        "503",
+        "504",
         "too many requests",
         "resource_exhausted",
         "quota",
         "rate limit",
         "rate_limit",
-        "402",
         "insufficient_quota",
         "insufficient balance",
         "billing",
         "credits",
-        "503",
         "overloaded",
         "capacity",
         "temporarily unavailable",
@@ -2492,11 +2571,19 @@ pub fn is_quota_or_fallback_error(err_msg: &str) -> bool {
         "max_tokens must be less than",
         "not available",
         "not found",
-        "404",
         "no longer available",
         "invalid_request_error",
+        "unauthorized",
+        "forbidden",
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "permission_denied",
+        "api key not found",
+        "authentication_error",
     ];
-    markers.iter().any(|m| low.contains(m))
+
+    is_network_or_http || markers.iter().any(|m| low.contains(m))
 }
 
 fn pick_preferred_model_for_fallback(cfg: &ProviderConfig) -> Option<String> {
@@ -2941,12 +3028,23 @@ mod tests {
     }
 
     #[test]
+    fn test_gemini_model_alias_exact() {
+        assert_eq!(map_gemini_model_alias("gemini-2.5-flash"), "gemini-2.5-flash");
+        assert_eq!(map_gemini_model_alias("gemini-2.5-pro"), "gemini-2.5-pro");
+        assert_eq!(map_gemini_model_alias("gemini-flash"), "gemini-2.5-flash");
+        assert_eq!(map_gemini_model_alias("gemini-pro"), "gemini-2.5-pro");
+    }
+
+    #[test]
     fn test_is_quota_or_fallback_error() {
         assert!(is_quota_or_fallback_error("gemini HTTP 429 Too Many Requests : RESOURCE_EXHAUSTED"));
         assert!(is_quota_or_fallback_error("openrouter HTTP 402 : Insufficient credits"));
         assert!(is_quota_or_fallback_error("groq HTTP 503 : Service overloaded"));
+        assert!(is_quota_or_fallback_error("Gemini HTTP 404 models/gemini-3.8-flash is not found"));
+        assert!(is_quota_or_fallback_error("error sending request for url: connection closed"));
+        assert!(is_quota_or_fallback_error("dns error: failed to resolve host"));
+        assert!(is_quota_or_fallback_error("timed out waiting for response"));
         assert!(!is_quota_or_fallback_error("CANCELLED_BY_USER"));
-        assert!(!is_quota_or_fallback_error("JSON syntax error at line 3"));
     }
 
     #[test]
@@ -3052,7 +3150,7 @@ mod tests {
     fn test_prune_messages_for_local_model() {
         let msgs = vec![
             LlmMessage::system("System instructions"),
-            LlmMessage::user("Question 1"),
+            LlmMessage::user("Demande initiale"),
             LlmMessage::assistant("Reponse 1"),
             LlmMessage::user("Question 2 (Tour N-1)"),
             LlmMessage::assistant("Reponse 2 (Tour N-1)"),
@@ -3060,11 +3158,39 @@ mod tests {
         ];
 
         let pruned = prune_messages_for_local_model(&msgs);
-        assert_eq!(pruned.len(), 4);
+        assert_eq!(pruned.len(), 5);
         assert_eq!(pruned[0].role, "system");
         assert_eq!(pruned[0].content, "System instructions");
-        assert_eq!(pruned[1].content, "Question 2 (Tour N-1)");
-        assert_eq!(pruned[2].content, "Reponse 2 (Tour N-1)");
-        assert_eq!(pruned[3].content, "Question 3 (Requete N)");
+        assert_eq!(pruned[1].content, "Demande initiale");
+        assert!(pruned[2].content.contains("Synthèse des étapes intermédiaires"));
+        assert_eq!(pruned[3].content, "Reponse 2 (Tour N-1)");
+        assert_eq!(pruned[4].content, "Question 3 (Requete N)");
+    }
+
+    #[test]
+    fn test_prune_messages_for_local_model_keeps_initial_anchor_over_four_turns() {
+        let msgs = vec![
+            LlmMessage::system("System"),
+            LlmMessage::user("WorkspaceSnapshot + Demande utilisateur initiale"),
+            LlmMessage::assistant("[Appel d'outils natifs : read_file]"),
+            LlmMessage::user("[Résultats des outils] contenu manifest"),
+            LlmMessage::assistant("[Appel d'outils natifs : write_file]"),
+            LlmMessage::user("[Résultats des outils] fichier A écrit"),
+            LlmMessage::assistant("[Appel d'outils natifs : write_file]"),
+            LlmMessage::user("[Résultats des outils] fichier B écrit"),
+            LlmMessage::assistant("[Appel d'outils natifs : run_command]"),
+            LlmMessage::user("[Résultats des outils] build OK"),
+        ];
+
+        let pruned = prune_messages_for_local_model(&msgs);
+        assert_eq!(pruned.len(), 5);
+        assert_eq!(pruned[0].role, "system");
+        assert_eq!(
+            pruned[1].content,
+            "WorkspaceSnapshot + Demande utilisateur initiale"
+        );
+        assert!(pruned[2].content.contains("read_file"));
+        assert_eq!(pruned[3].content, "[Appel d'outils natifs : run_command]");
+        assert_eq!(pruned[4].content, "[Résultats des outils] build OK");
     }
 }

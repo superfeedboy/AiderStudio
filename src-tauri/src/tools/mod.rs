@@ -54,7 +54,7 @@ pub fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Crée un nouveau fichier ou remplace intégralement le contenu d'un fichier existant sans aucune limite de lignes. Utiliser impérativement cet outil pour toute création de nouveau fichier ou réécriture complète (ex: index.html, main.ts, App.vue).",
+                "description": "Crée un nouveau fichier ou remplace intégralement le contenu d'un fichier existant sans aucune limite de lignes. Utiliser cet outil pour toute création de nouveau fichier ou réécriture complète.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -69,7 +69,7 @@ pub fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Patch court : modifie chirurgicalement un fichier existant via un ou plusieurs blocs SEARCH/REPLACE exacts et atomiques. Ne jamais utiliser pour créer un nouveau fichier (utiliser write_file).",
+                "description": "Patch court : modifie chirurgicalement un fichier existant via un ou plusieurs blocs SEARCH/REPLACE exacts et atomiques. Ne jamais utiliser pour créer un fichier inexistant (utiliser write_file).",
                 "parameters": {
                     "type": "object",
                     "properties": {
