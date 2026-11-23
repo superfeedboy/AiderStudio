@@ -2566,7 +2566,11 @@ pub fn is_quota_or_fallback_error(err_msg: &str) -> bool {
         || low.contains("failed to send")
         || low.contains("io error")
         || low.contains("os error")
-        || low.contains("stream closed");
+        || low.contains("stream closed")
+        || low.contains("decode")
+        || low.contains("decoding")
+        || low.contains("response body")
+        || low.contains("broken pipe");
 
     let markers = [
         "400",
@@ -3099,6 +3103,7 @@ mod tests {
         assert!(is_quota_or_fallback_error("error sending request for url: connection closed"));
         assert!(is_quota_or_fallback_error("dns error: failed to resolve host"));
         assert!(is_quota_or_fallback_error("timed out waiting for response"));
+        assert!(is_quota_or_fallback_error("error decoding response body"));
         assert!(!is_quota_or_fallback_error("CANCELLED_BY_USER"));
     }
 

@@ -76,6 +76,20 @@ function handleDeleteProject(proj: Project) {
 
       <!-- Projects & Conversations Tree -->
       <div class="tree-scroll custom-scroll">
+        <div v-if="store.projects.length === 0" class="menu-empty-state">
+          <p class="menu-empty-title">Aucun projet</p>
+          <p class="menu-empty-desc">
+            Ouvrez un dossier local pour commencer à coder avec l'assistant.
+          </p>
+          <button
+            type="button"
+            class="menu-empty-btn"
+            @click="store.newProjectModalOpen = true"
+          >
+            + Nouveau projet
+          </button>
+        </div>
+
         <div
           v-for="project in store.projects"
           :key="project.id"
@@ -266,6 +280,50 @@ function handleDeleteProject(proj: Project) {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.menu-empty-state {
+  margin: 12px 2px;
+  padding: 14px 12px;
+  border-radius: 10px;
+  border: 1px dashed var(--border-subtle);
+  background: var(--hover-bg);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.menu-empty-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.menu-empty-desc {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.menu-empty-btn {
+  margin-top: 4px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--accent);
+  border-radius: 7px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background-color 0.14s ease;
+}
+
+.menu-empty-btn:hover {
+  border-color: var(--accent);
+  background: var(--active-bg);
 }
 
 .project-group {

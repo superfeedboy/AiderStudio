@@ -3,6 +3,8 @@ pub mod fs;
 pub mod shell;
 pub mod web;
 
+pub use shell::{create_hidden_command, CREATE_NO_WINDOW};
+
 use crate::models::ToolExecutionResult;
 use std::path::Path;
 

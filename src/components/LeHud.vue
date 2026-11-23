@@ -34,6 +34,7 @@ const roleColors: Record<string, string> = {
   coder: "#3b82f6",
   refactoring: "#f59e0b",
   tester: "#10b981",
+  reviewer: "#10b981",
   synthesizer: "#94a3b8",
 };
 
@@ -44,6 +45,7 @@ const roleShortLabels: Record<string, string> = {
   coder: "Codeur",
   refactoring: "Refactoring",
   tester: "Testeur",
+  reviewer: "Reviewer & QA",
   synthesizer: "Synthétiseur",
 };
 
@@ -54,6 +56,7 @@ function resolveRoleKey(step: TokenUsageEvent): string {
   if (low.includes("cartograph")) return "cartographer";
   if (low.includes("design")) return "designer";
   if (low.includes("refact")) return "refactoring";
+  if (low.includes("review") || low.includes("qa")) return "reviewer";
   if (low.includes("test") || low.includes("vérif")) return "tester";
   if (low.includes("synth")) return "synthesizer";
   return "coder";

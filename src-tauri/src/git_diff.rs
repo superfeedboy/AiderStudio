@@ -3,6 +3,10 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+pub fn git_cmd() -> Command {
+    crate::tools::create_hidden_command("git")
+}
+
 pub const GIT_EXCLUDE_PATHSPECS: &[&str] = &[
     ":(exclude)node_modules",
     ":(exclude)target",
@@ -119,7 +123,7 @@ pub async fn sanitize_corrupted_diff_files(project_root: &str) {
         return;
     }
 
-    if let Ok(out) = Command::new("git")
+    if let Ok(out) = git_cmd()
         .args(["-C", project_root, "status", "--porcelain"])
         .output()
         .await
@@ -160,13 +164,13 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
 
     // Ensure git repo is initialized with a valid HEAD commit
     if !root.join(".git").exists() {
-        let _ = Command::new("git")
+        let _ = git_cmd()
             .args(["-C", project_root, "init"])
             .output()
             .await;
     }
 
-    let mut has_head = Command::new("git")
+    let mut has_head = git_cmd()
         .args(["-C", project_root, "rev-parse", "--verify", "HEAD"])
         .output()
         .await
@@ -174,18 +178,18 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
         .unwrap_or(false);
 
     if !has_head {
-        let _ = Command::new("git")
+        let _ = git_cmd()
             .args([
                 "-C",
                 project_root,
                 "commit",
                 "--allow-empty",
                 "-m",
-                "AiderStudio repo initialization",
+                ">AIx Studio repo initialization",
             ])
             .output()
             .await;
-        has_head = Command::new("git")
+        has_head = git_cmd()
             .args(["-C", project_root, "rev-parse", "--verify", "HEAD"])
             .output()
             .await
@@ -196,7 +200,7 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
     let mut diff_text = if has_head {
         let mut args = vec!["-C", project_root, "diff", "HEAD", "--unified=3", "--no-color", "--", "."];
         args.extend(GIT_EXCLUDE_PATHSPECS);
-        Command::new("git")
+        git_cmd()
             .args(&args)
             .output()
             .await
@@ -212,7 +216,7 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
         // Fallback: combine unstaged diff + cached staged diff
         let mut unstaged_args = vec!["-C", project_root, "diff", "--unified=3", "--no-color", "--", "."];
         unstaged_args.extend(GIT_EXCLUDE_PATHSPECS);
-        let unstaged = Command::new("git")
+        let unstaged = git_cmd()
             .args(&unstaged_args)
             .output()
             .await
@@ -223,7 +227,7 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
 
         let mut staged_args = vec!["-C", project_root, "diff", "--cached", "--unified=3", "--no-color", "--", "."];
         staged_args.extend(GIT_EXCLUDE_PATHSPECS);
-        let staged = Command::new("git")
+        let staged = git_cmd()
             .args(&staged_args)
             .output()
             .await
@@ -240,7 +244,7 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
     // Include untracked files as pure additions (up to 150 lines per file, strictly inside project_root)
     let mut ls_args = vec!["-C", project_root, "ls-files", "--others", "--exclude-standard", "--", "."];
     ls_args.extend(GIT_EXCLUDE_PATHSPECS);
-    if let Ok(status_out) = Command::new("git")
+    if let Ok(status_out) = git_cmd()
         .args(&ls_args)
         .output()
         .await
@@ -295,7 +299,7 @@ pub async fn capture_workspace_tree(project_root: &str) -> Option<String> {
     }
 
     if !root.join(".git").exists() {
-        let _ = Command::new("git")
+        let _ = git_cmd()
             .args(["-C", project_root, "init"])
             .output()
             .await;
@@ -304,7 +308,7 @@ pub async fn capture_workspace_tree(project_root: &str) -> Option<String> {
     let tmp_idx = std::env::temp_dir().join(format!("vaix-idx-{}.idx", uuid::Uuid::new_v4()));
     let mut add_args = vec!["-C", project_root, "add", "-A", "--", "."];
     add_args.extend(GIT_EXCLUDE_PATHSPECS);
-    let add_res = Command::new("git")
+    let add_res = git_cmd()
         .args(&add_args)
         .env("GIT_INDEX_FILE", &tmp_idx)
         .output()
@@ -312,7 +316,7 @@ pub async fn capture_workspace_tree(project_root: &str) -> Option<String> {
 
     let tree_sha = match add_res {
         Ok(out) if out.status.success() => {
-            let write_res = Command::new("git")
+            let write_res = git_cmd()
                 .args(["-C", project_root, "write-tree"])
                 .env("GIT_INDEX_FILE", &tmp_idx)
                 .output()
@@ -351,7 +355,7 @@ pub async fn collect_turn_diffs(
         return (Vec::new(), 0, 0);
     }
 
-    let diff_out = Command::new("git")
+    let diff_out = git_cmd()
         .args([
             "-C",
             project_root,
@@ -550,7 +554,7 @@ pub async fn undo_file_to_tree(
     let target = root.join(&clean_path);
     let spec = format!("{tree_sha}:{clean_path}");
 
-    let exists_in_tree = Command::new("git")
+    let exists_in_tree = git_cmd()
         .args(["-C", project_root, "cat-file", "-e", &spec])
         .output()
         .await
@@ -558,7 +562,7 @@ pub async fn undo_file_to_tree(
         .unwrap_or(false);
 
     if exists_in_tree {
-        let out = Command::new("git")
+        let out = git_cmd()
             .args(["-C", project_root, "show", &spec])
             .output()
             .await
@@ -611,7 +615,7 @@ pub async fn undo_file_modification(project_root: &str, file_path: &str) -> Resu
     let target = root.join(file_path);
 
     // 1. Try checkout from HEAD for tracked files
-    let checkout_out = Command::new("git")
+    let checkout_out = git_cmd()
         .args(["-C", project_root, "checkout", "HEAD", "--", file_path])
         .output()
         .await;
@@ -619,7 +623,7 @@ pub async fn undo_file_modification(project_root: &str, file_path: &str) -> Resu
     if let Ok(output) = checkout_out {
         if output.status.success() {
             // Also unstage just in case it was staged
-            let _ = Command::new("git")
+            let _ = git_cmd()
                 .args(["-C", project_root, "restore", "--staged", "--", file_path])
                 .output()
                 .await;
@@ -628,7 +632,7 @@ pub async fn undo_file_modification(project_root: &str, file_path: &str) -> Resu
     }
 
     // 2. Also unstage if staged as a new file
-    let _ = Command::new("git")
+    let _ = git_cmd()
         .args(["-C", project_root, "rm", "-f", "--cached", "--", file_path])
         .output()
         .await;
@@ -650,19 +654,19 @@ pub async fn undo_file_modification(project_root: &str, file_path: &str) -> Resu
 /// - Cleans untracked files and directories (respects .gitignore and .aiderignore)
 pub async fn undo_all_modifications(project_root: &str) -> Result<(), String> {
     // 1. Unstage any staged files
-    let _ = Command::new("git")
+    let _ = git_cmd()
         .args(["-C", project_root, "restore", "--staged", "--worktree", "."])
         .output()
         .await;
 
     // 2. Revert tracked files to HEAD
-    let _ = Command::new("git")
+    let _ = git_cmd()
         .args(["-C", project_root, "checkout", "HEAD", "--", "."])
         .output()
         .await;
 
     // 3. Remove untracked files & directories (clean -fd respects .gitignore)
-    let _ = Command::new("git")
+    let _ = git_cmd()
         .args(["-C", project_root, "clean", "-fd"])
         .output()
         .await;
@@ -680,12 +684,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let root_str = dir.to_string_lossy().to_string();
 
-        let _ = Command::new("git")
+        let _ = git_cmd()
             .args(["-C", &root_str, "init"])
             .output()
             .await
             .unwrap();
-        let _ = Command::new("git")
+        let _ = git_cmd()
             .args([
                 "-C",
                 &root_str,

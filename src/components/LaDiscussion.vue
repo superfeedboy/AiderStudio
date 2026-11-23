@@ -478,6 +478,7 @@ const roleTraceColors: Record<string, string> = {
   coder: "#3b82f6",
   refactoring: "#f59e0b",
   tester: "#10b981",
+  reviewer: "#10b981",
   terminal: "#f97316",
   research: "#14b8a6",
   synthesizer: "#94a3b8",
@@ -536,6 +537,8 @@ function roleIcon(role: string): string {
       return "⚡";
     case "tester":
       return "🧪";
+    case "reviewer":
+      return "🛡️";
     case "architect":
       return "📐";
     case "cartographer":
@@ -545,6 +548,89 @@ function roleIcon(role: string): string {
     default:
       return "🤖";
   }
+}
+
+interface CoderFacetBadge {
+  key: "code" | "ui" | "refacto";
+  label: string;
+  icon: string;
+}
+
+function isCoderFamilyRole(role: string): boolean {
+  const base = role.split("_step_")[0].toLowerCase();
+  return base === "coder" || base === "designer" || base === "refactoring";
+}
+
+function stripFacetTags(summary: string): string {
+  return (summary || "").replace(/^(?:\[(?:Code|UI\/UX|Refacto)\]\s*)+/i, "").trim();
+}
+
+function getCoderTraceFacets(step: AgentTraceStep, msg?: ChatMessage): CoderFacetBadge[] {
+  if (!isCoderFamilyRole(step.role)) return [];
+  const rawSummary = step.summary || "";
+  const lowText = `${step.roleLabel} ${rawSummary}`.toLowerCase();
+  const baseRole = step.role.split("_step_")[0].toLowerCase();
+
+  let hasCode = /\[code\]/i.test(rawSummary) || baseRole === "coder";
+  let hasUi = /\[ui\/ux\]/i.test(rawSummary) || baseRole === "designer";
+  let hasRefacto = /\[refacto\]/i.test(rawSummary) || baseRole === "refactoring";
+
+  const diffPaths = (msg?.turnDiffs ?? []).map((d) => d.path.toLowerCase());
+  for (const p of diffPaths) {
+    if (/\.(css|scss|sass|less|svg)$/.test(p) || p.includes("tailwind.config")) {
+      hasUi = true;
+    } else if (/\.(vue|svelte|jsx|tsx|html|astro)$/.test(p)) {
+      hasUi = true;
+      hasCode = true;
+    } else if (/\.(rs|ts|js|py|go|java|kt|cs|php|c|cpp)$/.test(p)) {
+      hasCode = true;
+    }
+  }
+
+  if (/\b(ui|ux|design|redesign|refonte|style|css|layout|scroll|theme|thème|responsive)\b/i.test(lowText)) {
+    hasUi = true;
+  }
+  if (/\b(refacto|nettoyage|découpage|typage|clean|restructur)\b/i.test(lowText)) {
+    hasRefacto = true;
+  }
+  if (/\b(store|api|persiste|localstorage|logique|code|bug|corrige)\b/i.test(lowText)) {
+    hasCode = true;
+  }
+
+  const out: CoderFacetBadge[] = [];
+  if (hasCode) out.push({ key: "code", label: "Code", icon: "🛠️" });
+  if (hasUi) out.push({ key: "ui", label: "UI/UX", icon: "🎨" });
+  if (hasRefacto) out.push({ key: "refacto", label: "Refacto", icon: "⚡" });
+  if (out.length === 0) out.push({ key: "code", label: "Code", icon: "🛠️" });
+  return out;
+}
+
+function getProcessStepFacets(step: ProcessStep): CoderFacetBadge[] {
+  const tool = (step.tool || "").toLowerCase();
+  if (tool !== "write_file" && tool !== "edit_file") return [];
+  const p = (step.title || "").toLowerCase();
+  const detail = (step.detail || "").toLowerCase();
+  let hasCode = false;
+  let hasUi = false;
+  let hasRefacto = false;
+
+  if (/\.(css|scss|sass|less|svg)$/.test(p) || p.includes("tailwind.config")) {
+    hasUi = true;
+  } else if (/\.(vue|svelte|jsx|tsx|html|astro)$/.test(p)) {
+    hasUi = true;
+    hasCode = true;
+  } else if (p.includes(".")) {
+    hasCode = true;
+  }
+  if (tool === "edit_file" && /\b(refacto|clean|rename)\b/i.test(detail)) {
+    hasRefacto = true;
+  }
+
+  const out: CoderFacetBadge[] = [];
+  if (hasCode) out.push({ key: "code", label: "Code", icon: "🛠️" });
+  if (hasUi) out.push({ key: "ui", label: "UI/UX", icon: "🎨" });
+  if (hasRefacto) out.push({ key: "refacto", label: "Refacto", icon: "⚡" });
+  return out;
 }
 
 const traceGroupsCache = new WeakMap<AgentTraceStep[], TraceGroup[]>();
@@ -951,6 +1037,12 @@ type MarkdownBlock =
   | { kind: "quote"; tokens: InlineToken[] }
   | { kind: "ul"; items: { indent: number; tokens: InlineToken[] }[] }
   | { kind: "ol"; items: InlineToken[][] }
+  | {
+      kind: "table";
+      headers: InlineToken[][];
+      rows: InlineToken[][][];
+      alignments?: ("left" | "center" | "right")[];
+    }
   | { kind: "code"; lang: string; body: string; filename?: string; streaming?: boolean };
 
 function parseMarkdownProse(prose: string): MarkdownBlock[] {
@@ -994,6 +1086,51 @@ function parseMarkdownProse(prose: string): MarkdownBlock[] {
       continue;
     }
 
+    // Markdown Table
+    if (line.includes("|") && i + 1 < lines.length) {
+      const nextLine = lines[i + 1].trim();
+      const isSep = /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?$/.test(nextLine);
+      if (isSep) {
+        const splitRow = (rowStr: string): string[] => {
+          let s = rowStr.trim();
+          if (s.startsWith("|")) s = s.slice(1);
+          if (s.endsWith("|")) s = s.slice(0, -1);
+          return s.split("|").map((c) => c.trim());
+        };
+
+        const rawHeaders = splitRow(line);
+        const rawSeps = splitRow(nextLine);
+        const alignments: ("left" | "center" | "right")[] = rawSeps.map((sep) => {
+          const leftColon = sep.startsWith(":");
+          const rightColon = sep.endsWith(":");
+          if (leftColon && rightColon) return "center";
+          if (rightColon) return "right";
+          return "left";
+        });
+
+        const headers = rawHeaders.map((h) => tokenizeInline(h.replace(/\\n/g, " ")));
+        const rows: InlineToken[][][] = [];
+        i += 2;
+
+        while (i < lines.length) {
+          const rowLine = lines[i].trim();
+          if (!rowLine || !rowLine.includes("|")) break;
+          const cells = splitRow(rowLine);
+          if (cells.length === 0 || (cells.length === 1 && !cells[0])) break;
+          rows.push(cells.map((c) => tokenizeInline(c.replace(/\\n/g, " "))));
+          i++;
+        }
+
+        blocks.push({
+          kind: "table",
+          headers,
+          rows,
+          alignments,
+        });
+        continue;
+      }
+    }
+
     // Unordered list
     if (/^\s*[-*•◦▪]\s+/.test(line)) {
       const items: { indent: number; tokens: InlineToken[] }[] = [];
@@ -1030,7 +1167,12 @@ function parseMarkdownProse(prose: string): MarkdownBlock[] {
       !/^#{1,3}\s+/.test(lines[i].trim()) &&
       !lines[i].trim().startsWith(">") &&
       !/^\s*[-*•◦▪]\s+/.test(lines[i]) &&
-      !/^\s*\d+\.\s+/.test(lines[i])
+      !/^\s*\d+\.\s+/.test(lines[i]) &&
+      !(
+        lines[i].includes("|") &&
+        i + 1 < lines.length &&
+        /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?$/.test(lines[i + 1].trim())
+      )
     ) {
       paraLines.push(lines[i].trim());
       i++;
@@ -2157,46 +2299,57 @@ async function copyCodeBlock(key: string, code: string) {
     <!-- Top bar -->
     <header class="disc-header">
       <div class="disc-header-left">
-        <button
-          type="button"
-          class="breadcrumb-project"
-          title="Paramètres et contexte global du projet"
-          @click="store.openProjectSettings(store.activeProject)"
-        >
-          {{ store.activeProject?.name || "Projet" }}
-        </button>
-        <span class="breadcrumb-sep">/</span>
-        <input
-          v-if="isRenamingTitle"
-          ref="titleInputRef"
-          v-model="titleDraft"
-          type="text"
-          class="breadcrumb-title-input"
-          aria-label="Renommer la discussion"
-          @keydown.enter.prevent="commitRenameTitle"
-          @keydown.escape.prevent="cancelRenameTitle"
-          @blur="commitRenameTitle"
-        />
+        <template v-if="store.activeProject">
+          <button
+            type="button"
+            class="breadcrumb-project"
+            title="Paramètres et contexte global du projet"
+            @click="store.openProjectSettings(store.activeProject)"
+          >
+            {{ store.activeProject.name }}
+          </button>
+          <span class="breadcrumb-sep">/</span>
+          <input
+            v-if="isRenamingTitle"
+            ref="titleInputRef"
+            v-model="titleDraft"
+            type="text"
+            class="breadcrumb-title-input"
+            aria-label="Renommer la discussion"
+            @keydown.enter.prevent="commitRenameTitle"
+            @keydown.escape.prevent="cancelRenameTitle"
+            @blur="commitRenameTitle"
+          />
+          <button
+            v-else
+            type="button"
+            class="breadcrumb-title-btn"
+            title="Cliquer pour renommer la discussion"
+            @click="startRenameTitle"
+          >
+            <span class="disc-title">{{ conv?.title || "Nouvelle session" }}</span>
+            <svg
+              class="rename-pencil-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4Z" />
+            </svg>
+          </button>
+        </template>
         <button
           v-else
           type="button"
-          class="breadcrumb-title-btn"
-          title="Cliquer pour renommer la discussion"
-          @click="startRenameTitle"
+          class="breadcrumb-project"
+          title="Créer un nouveau projet"
+          @click="store.newProjectModalOpen = true"
         >
-          <span class="disc-title">{{ conv?.title || "Nouvelle session" }}</span>
-          <svg
-            class="rename-pencil-icon"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M12 20h9" />
-            <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4Z" />
-          </svg>
+          Aucun projet
         </button>
       </div>
 
@@ -2253,7 +2406,7 @@ async function copyCodeBlock(key: string, code: string) {
         </div>
         <h1 class="welcome-title">Qu'est-ce qu'on code patron?</h1>
         <div class="welcome-meta">
-          <span class="meta-chip">{{ store.activeProject?.name }}</span>
+          <span v-if="store.activeProject" class="meta-chip">{{ store.activeProject.name }}</span>
           <span class="meta-chip">
             {{
               store.activeTargetLabel.isAgent
@@ -2264,6 +2417,18 @@ async function copyCodeBlock(key: string, code: string) {
           <span class="meta-chip">
             {{ store.stackStatus.nativeEngineReady ? "Moteur natif prêt" : "Moteur en attente" }}
           </span>
+        </div>
+        <div v-if="!store.activeProject" class="welcome-empty-project">
+          <p class="welcome-empty-hint">
+            Ajoutez un dossier de projet pour démarrer votre première session.
+          </p>
+          <button
+            type="button"
+            class="welcome-new-project-btn"
+            @click="store.newProjectModalOpen = true"
+          >
+            + Nouveau projet
+          </button>
         </div>
       </div>
 
@@ -2513,6 +2678,15 @@ async function copyCodeBlock(key: string, code: string) {
                                 :style="{ backgroundColor: roleTraceDotColor(step.role) }"
                               />
                               <strong class="trace-role-label">{{ step.roleLabel }}</strong>
+                              <span
+                                v-for="facet in getCoderTraceFacets(step, msg)"
+                                :key="facet.key"
+                                class="trace-facet-badge"
+                                :class="`is-${facet.key}`"
+                              >
+                                <span>{{ facet.icon }}</span>
+                                <span>{{ facet.label }}</span>
+                              </span>
                             </div>
                             <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
                               <span
@@ -2540,7 +2714,7 @@ async function copyCodeBlock(key: string, code: string) {
                           </div>
                           <div class="trace-step-summary">
                             <MarkdownInline
-                              :tokens="tokenizeInline(step.summary)"
+                              :tokens="tokenizeInline(stripFacetTags(step.summary))"
                               :available-paths="getAvailableDiffPaths(msg)"
                               :project-root="store.activeProject?.rootPath"
                               variant="thinking"
@@ -2621,6 +2795,44 @@ async function copyCodeBlock(key: string, code: string) {
                       </li>
                     </ol>
                     <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang, Boolean(block.streaming))" /></pre>
+                    <div v-else-if="block.kind === 'table'" class="tmd-table-wrapper custom-scroll">
+                      <table class="tmd-table">
+                        <thead>
+                          <tr>
+                            <th
+                              v-for="(h, thIdx) in block.headers"
+                              :key="thIdx"
+                              :style="{ textAlign: block.alignments?.[thIdx] || 'left' }"
+                            >
+                              <MarkdownInline
+                                :tokens="h"
+                                :available-paths="getAvailableDiffPaths()"
+                                :project-root="store.activeProject?.rootPath"
+                                variant="thinking"
+                                @open-file="handleOpenFileInReview"
+                              />
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="(row, trIdx) in block.rows" :key="trIdx">
+                            <td
+                              v-for="(cell, tdIdx) in row"
+                              :key="tdIdx"
+                              :style="{ textAlign: block.alignments?.[tdIdx] || 'left' }"
+                            >
+                              <MarkdownInline
+                                :tokens="cell"
+                                :available-paths="getAvailableDiffPaths()"
+                                :project-root="store.activeProject?.rootPath"
+                                variant="thinking"
+                                @open-file="handleOpenFileInReview"
+                              />
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
                     <p v-else-if="block.kind === 'paragraph'" class="tmd-p">
                       <MarkdownInline
                         :tokens="block.tokens"
@@ -2727,6 +2939,14 @@ async function copyCodeBlock(key: string, code: string) {
                           {{ step.tool }}
                         </span>
                         <span class="step-card-title font-code" :title="step.title">{{ step.title }}</span>
+                        <span
+                          v-for="facet in getProcessStepFacets(step)"
+                          :key="facet.key"
+                          class="trace-facet-badge is-mini"
+                          :class="`is-${facet.key}`"
+                        >
+                          {{ facet.label }}
+                        </span>
                         <span v-if="step.status === 'error'" class="step-error-tag">Échec</span>
                       </div>
                       <div class="step-card-right">
@@ -2876,6 +3096,43 @@ async function copyCodeBlock(key: string, code: string) {
                     </div>
                   </div>
                   <pre class="code-pre custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang)" /></pre>
+                </div>
+
+                <div v-else-if="block.kind === 'table'" class="md-table-wrapper custom-scroll">
+                  <table class="md-table">
+                    <thead>
+                      <tr>
+                        <th
+                          v-for="(h, thIdx) in block.headers"
+                          :key="thIdx"
+                          :style="{ textAlign: block.alignments?.[thIdx] || 'left' }"
+                        >
+                          <MarkdownInline
+                            :tokens="h"
+                            :available-paths="getAvailableDiffPaths(msg)"
+                            :project-root="store.activeProject?.rootPath"
+                            @open-file="(p) => handleOpenFileInReview(p, msg.id)"
+                          />
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(row, trIdx) in block.rows" :key="trIdx">
+                        <td
+                          v-for="(cell, tdIdx) in row"
+                          :key="tdIdx"
+                          :style="{ textAlign: block.alignments?.[tdIdx] || 'left' }"
+                        >
+                          <MarkdownInline
+                            :tokens="cell"
+                            :available-paths="getAvailableDiffPaths(msg)"
+                            :project-root="store.activeProject?.rootPath"
+                            @open-file="(p) => handleOpenFileInReview(p, msg.id)"
+                          />
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
 
                 <p v-else-if="block.kind === 'paragraph'" class="md-p">
@@ -3124,6 +3381,15 @@ async function copyCodeBlock(key: string, code: string) {
                                   :style="{ backgroundColor: roleTraceDotColor(step.role) }"
                                 />
                                 <strong class="trace-role-label">{{ step.roleLabel }}</strong>
+                                <span
+                                  v-for="facet in getCoderTraceFacets(step)"
+                                  :key="facet.key"
+                                  class="trace-facet-badge"
+                                  :class="`is-${facet.key}`"
+                                >
+                                  <span>{{ facet.icon }}</span>
+                                  <span>{{ facet.label }}</span>
+                                </span>
                               </div>
                               <span class="trace-model-pill" :title="`${providerShortName(step.provider)} : ${step.model}`">
                                 <span
@@ -3151,7 +3417,7 @@ async function copyCodeBlock(key: string, code: string) {
                             </div>
                             <div class="trace-step-summary">
                               <MarkdownInline
-                                :tokens="tokenizeInline(step.summary)"
+                                :tokens="tokenizeInline(stripFacetTags(step.summary))"
                                 :available-paths="getAvailableDiffPaths()"
                                 :project-root="store.activeProject?.rootPath"
                                 variant="thinking"
@@ -3239,6 +3505,44 @@ async function copyCodeBlock(key: string, code: string) {
                       </li>
                     </ol>
                     <pre v-else-if="block.kind === 'code'" class="tmd-code-block custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang, Boolean(block.streaming))" /></pre>
+                    <div v-else-if="block.kind === 'table'" class="tmd-table-wrapper custom-scroll">
+                      <table class="tmd-table">
+                        <thead>
+                          <tr>
+                            <th
+                              v-for="(h, thIdx) in block.headers"
+                              :key="thIdx"
+                              :style="{ textAlign: block.alignments?.[thIdx] || 'left' }"
+                            >
+                              <MarkdownInline
+                                :tokens="h"
+                                :available-paths="getAvailableDiffPaths()"
+                                :project-root="store.activeProject?.rootPath"
+                                variant="thinking"
+                                @open-file="handleOpenFileInReview"
+                              />
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="(row, trIdx) in block.rows" :key="trIdx">
+                            <td
+                              v-for="(cell, tdIdx) in row"
+                              :key="tdIdx"
+                              :style="{ textAlign: block.alignments?.[tdIdx] || 'left' }"
+                            >
+                              <MarkdownInline
+                                :tokens="cell"
+                                :available-paths="getAvailableDiffPaths()"
+                                :project-root="store.activeProject?.rootPath"
+                                variant="thinking"
+                                @open-file="handleOpenFileInReview"
+                              />
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
                     <p v-else-if="block.kind === 'paragraph'" class="tmd-p">
                       <MarkdownInline
                         :tokens="block.tokens"
@@ -3355,6 +3659,14 @@ async function copyCodeBlock(key: string, code: string) {
                           {{ step.tool }}
                         </span>
                         <span class="step-card-title font-code" :title="step.title">{{ step.title }}</span>
+                        <span
+                          v-for="facet in getProcessStepFacets(step)"
+                          :key="facet.key"
+                          class="trace-facet-badge is-mini"
+                          :class="`is-${facet.key}`"
+                        >
+                          {{ facet.label }}
+                        </span>
                         <span v-if="step.status === 'error'" class="step-error-tag">Échec</span>
                         <span v-else-if="step.status === 'running'" class="step-running-tag">En cours...</span>
                       </div>
@@ -3457,6 +3769,43 @@ async function copyCodeBlock(key: string, code: string) {
                     </div>
                   </div>
                   <pre class="code-pre custom-scroll"><code class="hljs" v-html="renderCodeHtml(block.body, block.lang, Boolean(block.streaming))" /></pre>
+                </div>
+
+                <div v-else-if="block.kind === 'table'" class="md-table-wrapper custom-scroll">
+                  <table class="md-table">
+                    <thead>
+                      <tr>
+                        <th
+                          v-for="(h, thIdx) in block.headers"
+                          :key="thIdx"
+                          :style="{ textAlign: block.alignments?.[thIdx] || 'left' }"
+                        >
+                          <MarkdownInline
+                            :tokens="h"
+                            :available-paths="getAvailableDiffPaths()"
+                            :project-root="store.activeProject?.rootPath"
+                            @open-file="handleOpenFileInReview"
+                          />
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(row, trIdx) in block.rows" :key="trIdx">
+                        <td
+                          v-for="(cell, tdIdx) in row"
+                          :key="tdIdx"
+                          :style="{ textAlign: block.alignments?.[tdIdx] || 'left' }"
+                        >
+                          <MarkdownInline
+                            :tokens="cell"
+                            :available-paths="getAvailableDiffPaths()"
+                            :project-root="store.activeProject?.rootPath"
+                            @open-file="handleOpenFileInReview"
+                          />
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
 
                 <p v-else-if="block.kind === 'paragraph'" class="md-p">
@@ -3993,6 +4342,37 @@ async function copyCodeBlock(key: string, code: string) {
   font-size: 12px;
 }
 
+.welcome-empty-project {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.welcome-empty-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.welcome-new-project-btn {
+  border: none;
+  background: var(--accent);
+  color: #ffffff;
+  border-radius: 9px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.welcome-new-project-btn:hover {
+  opacity: 0.92;
+  transform: translateY(-1px);
+}
+
 .messages-list {
   width: 100%;
   max-width: 820px;
@@ -4509,9 +4889,46 @@ async function copyCodeBlock(key: string, code: string) {
 .trace-role-wrap {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   font-size: 11.5px;
   color: var(--text-main);
+}
+
+.trace-facet-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  line-height: 1.3;
+  flex-shrink: 0;
+}
+
+.trace-facet-badge.is-mini {
+  font-size: 9.5px;
+  padding: 0 5px;
+}
+
+.trace-facet-badge.is-code {
+  color: #60a5fa;
+  background: rgba(59, 130, 246, 0.14);
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+.trace-facet-badge.is-ui {
+  color: #f472b6;
+  background: rgba(236, 72, 153, 0.14);
+  border-color: rgba(236, 72, 153, 0.35);
+}
+
+.trace-facet-badge.is-refacto {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.35);
 }
 
 .trace-role-dot {
@@ -4766,6 +5183,57 @@ async function copyCodeBlock(key: string, code: string) {
   font-family: var(--font-code);
   font-size: 12px;
   color: var(--accent-2);
+}
+
+.md-table-wrapper,
+.tmd-table-wrapper {
+  margin: 10px 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-card);
+}
+
+.md-table,
+.tmd-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.md-table th,
+.tmd-table th {
+  padding: 8px 12px;
+  background: var(--surface-elevated);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+
+.md-table td,
+.tmd-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-main);
+  vertical-align: top;
+  word-break: break-word;
+}
+
+.md-table tbody tr:last-child td,
+.tmd-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.md-table tbody tr:hover,
+.tmd-table tbody tr:hover {
+  background: var(--hover-bg);
 }
 
 /* Code Blocks with strong contrast in dark mode */

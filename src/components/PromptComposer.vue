@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useStudioStore } from "../stores/studio";
 import type { AttachedFile, ProjectRuleItem } from "../types/studio";
 import AppLogo from "./AppLogo.vue";
@@ -11,6 +11,7 @@ const emit = defineEmits<{
 }>();
 
 const store = useStudioStore();
+const hasActiveConversation = computed(() => Boolean(store.activeConversation));
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const targetPickerRef = ref<HTMLElement | null>(null);
@@ -191,6 +192,11 @@ const mcpMentions = computed<MentionItem[]>(() => {
 });
 
 async function refreshProjectFiles() {
+  if (!store.activeProjectId) {
+    projectFiles.value = [];
+    projectRules.value = [];
+    return;
+  }
   projectFiles.value = await store.listProjectFiles();
   projectRules.value = await store.listProjectRules();
 }
@@ -676,7 +682,9 @@ function clearPromptInput() {
 async function handleSubmit() {
   const text = promptDraft.value.trim();
   const files = [...attachedFiles.value];
-  if ((!text && files.length === 0) || store.isProcessing) return;
+  if (!hasActiveConversation.value || (!text && files.length === 0) || store.isProcessing) {
+    return;
+  }
 
   promptDraft.value = "";
   attachedFiles.value = [];
@@ -710,6 +718,13 @@ defineExpose({
     textareaRef.value?.focus();
   },
 });
+
+watch(
+  () => store.activeProjectId,
+  () => {
+    void refreshProjectFiles();
+  }
+);
 
 onMounted(() => {
   void refreshProjectFiles();
@@ -889,8 +904,12 @@ onBeforeUnmount(() => {
           ref="textareaRef"
           v-model="promptDraft"
           rows="2"
-          placeholder="Décrivez ce que vous voulez coder... (Tapez @ pour outils/fichiers/MCP, collez des images)"
-          :disabled="store.isProcessing"
+          :placeholder="
+            hasActiveConversation
+              ? 'Décrivez ce que vous voulez coder... (Tapez @ pour outils/fichiers/MCP, collez des images)'
+              : 'Créez ou sélectionnez un projet pour démarrer une discussion...'
+          "
+          :disabled="store.isProcessing || !hasActiveConversation"
           @input="handleTextareaInput"
           @keydown="handleKeydown"
           @paste="handlePaste"
@@ -917,7 +936,7 @@ onBeforeUnmount(() => {
             type="button"
             class="attach-btn"
             title="Ajouter des images ou des fichiers à interpréter"
-            :disabled="store.isProcessing"
+            :disabled="store.isProcessing || !hasActiveConversation"
             @click="openFilePicker"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1063,7 +1082,7 @@ onBeforeUnmount(() => {
           <button
             v-else
             class="send-btn"
-            :disabled="!promptDraft.trim() && attachedFiles.length === 0"
+            :disabled="!hasActiveConversation || (!promptDraft.trim() && attachedFiles.length === 0)"
             title="Envoyer le prompt"
             @click="handleSubmit"
           >
@@ -1279,6 +1298,11 @@ onBeforeUnmount(() => {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--hover-bg);
+}
+
+.attach-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .attach-btn svg {

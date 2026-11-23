@@ -11,6 +11,8 @@ pub enum TaskRole {
     Refactoring,
     #[serde(rename = "tester")]
     Tester,
+    #[serde(rename = "reviewer")]
+    Reviewer,
     #[serde(rename = "terminal")]
     Terminal,
     #[serde(rename = "research")]
@@ -26,6 +28,7 @@ impl TaskRole {
             TaskRole::Designer => "designer",
             TaskRole::Refactoring => "refactoring",
             TaskRole::Tester => "tester",
+            TaskRole::Reviewer => "reviewer",
             TaskRole::Terminal => "terminal",
             TaskRole::Research => "research",
             TaskRole::General => "general",
@@ -37,7 +40,8 @@ impl TaskRole {
             "coder" | "code" | "dev" | "backend" => TaskRole::Coder,
             "designer" | "design" | "ui" | "ux" | "css" | "frontend" => TaskRole::Designer,
             "refactoring" | "refactor" | "clean" => TaskRole::Refactoring,
-            "tester" | "test" | "tests" | "qa" => TaskRole::Tester,
+            "tester" | "test" | "tests" => TaskRole::Tester,
+            "reviewer" | "review" | "qa" | "audit" => TaskRole::Reviewer,
             "terminal" | "shell" | "bash" | "command" | "cmd" | "ops" => TaskRole::Terminal,
             "research" | "search" | "web" | "doc" | "docs" => TaskRole::Research,
             _ => TaskRole::General,
@@ -50,6 +54,7 @@ impl TaskRole {
             TaskRole::Designer => "Designer UI/UX",
             TaskRole::Refactoring => "Refactoring",
             TaskRole::Tester => "Testeur QA",
+            TaskRole::Reviewer => "Reviewer & QA",
             TaskRole::Terminal => "Terminal / Shell",
             TaskRole::Research => "Recherche & Documentation",
             TaskRole::General => "Assistant Général",
