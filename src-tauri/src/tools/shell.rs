@@ -8,6 +8,21 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Crée une commande Tokio sans fenêtre de console sous Windows (CREATE_NO_WINDOW),
+/// évitant l'apparition intempestive de fenêtres CMD lors de l'exécution de Git ou de sous-processus.
+pub fn create_hidden_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64_000;
 const STREAM_LINE_MAX_CHARS: usize = 160;
 

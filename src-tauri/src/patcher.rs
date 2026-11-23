@@ -2128,7 +2128,7 @@ pub async fn apply_edits_from_response(
     if !outcome.applied_files.is_empty() && project_root.exists() {
         let mut add_args = vec!["add", "-A", "--", "."];
         add_args.extend(crate::git_diff::GIT_EXCLUDE_PATHSPECS);
-        let _ = tokio::process::Command::new("git")
+        let _ = crate::tools::create_hidden_command("git")
             .args(&add_args)
             .current_dir(project_root)
             .output()

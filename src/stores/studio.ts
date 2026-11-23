@@ -143,12 +143,8 @@ export function defaultProvidersList(): ProviderConfig[] {
 export function defaultAgentRouting(): AgentRoutingConfig {
   return {
     architect: { provider: "ollama", model: "", fallbacks: [] },
-    cartographer: { provider: "ollama", model: "", fallbacks: [] },
-    designer: { provider: "ollama", model: "", fallbacks: [] },
     coder: { provider: "ollama", model: "", fallbacks: [] },
-    refactoring: { provider: "ollama", model: "", fallbacks: [] },
-    tester: { provider: "ollama", model: "", fallbacks: [] },
-    synthesizer: { provider: "ollama", model: "", fallbacks: [] },
+    reviewer: { provider: "ollama", model: "", fallbacks: [] },
   };
 }
 
@@ -526,14 +522,22 @@ export const useStudioStore = defineStore("studio", () => {
     const resolvedHudContextView: "agent" | "global" =
       rawSettings.hudContextView === "global" ? "global" : "agent";
 
+    const baseRouting = defaultAgentRouting();
+    const rawRouting = rawSettings.agentRouting;
+
     settings.value = {
       ...defaultSettings,
       ...rawSettings,
       activeTarget: rawSettings.activeTarget || "agent",
       providers: providersList,
       agentRouting: {
-        ...defaultAgentRouting(),
-        ...(rawSettings.agentRouting ?? {}),
+        architect: rawRouting?.architect ?? rawRouting?.synthesizer ?? baseRouting.architect,
+        coder:
+          rawRouting?.coder ??
+          rawRouting?.designer ??
+          rawRouting?.refactoring ??
+          baseRouting.coder,
+        reviewer: rawRouting?.reviewer ?? rawRouting?.tester ?? baseRouting.reviewer,
       },
       hudContextView: resolvedHudContextView,
       hudShowTokenUsage: resolvedHudShowTokenUsage,
@@ -763,38 +767,12 @@ export const useStudioStore = defineStore("studio", () => {
       }, 3000);
     } else {
       // Browser preview fallback when inspecting via `npm run dev`
-      const now = new Date().toISOString();
-      const pid = "preview-project";
-      const cid = "preview-conv";
       applyStateData({
         settings: { ...defaultSettings },
-        projects: [
-          {
-            id: pid,
-            name: "vAIx STUDIO",
-            rootPath: "/Users/gilles/Documents/Dev/AiderStudio",
-            globalContext:
-              "Application Tauri v2 + Vue 3 + Rust avec moteur natif multi-agents (Ollama & fournisseurs cloud).",
-            updatedAt: now,
-          },
-        ],
-        conversations: [
-          {
-            id: cid,
-            projectId: pid,
-            title: "Nouvelle session",
-            conversationContext: "",
-            messages: [],
-            artifacts: [],
-            modifiedFiles: [],
-            linesAdded: 0,
-            linesRemoved: 0,
-            createdAt: now,
-            updatedAt: now,
-          },
-        ],
-        activeProjectId: pid,
-        activeConversationId: cid,
+        projects: [],
+        conversations: [],
+        activeProjectId: null,
+        activeConversationId: null,
       });
     }
 
@@ -978,15 +956,52 @@ export const useStudioStore = defineStore("studio", () => {
         initialPrompt,
       });
       applyStateData(next);
+    } else {
+      const now = new Date().toISOString();
+      const projectId = `preview-proj-${Date.now()}`;
+      const convId = `preview-conv-${Date.now()}`;
+      const finalGlobalContext = globalContext.trim()
+        ? globalContext
+        : initialPrompt;
+      projects.value = [
+        {
+          id: projectId,
+          name: name.trim(),
+          rootPath: rootPath.trim(),
+          globalContext: finalGlobalContext,
+          sharedDirectories: [],
+          updatedAt: now,
+        },
+        ...projects.value,
+      ];
+      conversations.value = [
+        {
+          id: convId,
+          projectId,
+          title: "Nouvelle session",
+          conversationContext: "",
+          messages: [],
+          artifacts: [],
+          modifiedFiles: [],
+          linesAdded: 0,
+          linesRemoved: 0,
+          createdAt: now,
+          updatedAt: now,
+        },
+        ...conversations.value,
+      ];
+      activeProjectId.value = projectId;
+      activeConversationId.value = convId;
     }
     newProjectModalOpen.value = false;
   }
 
   async function listProjectRules(projectId?: string): Promise<ProjectRuleItem[]> {
-    if (!isTauri()) return [];
+    const targetPid = projectId ?? activeProjectId.value;
+    if (!isTauri() || !targetPid) return [];
     try {
       return await invoke<ProjectRuleItem[]>("list_project_rules", {
-        projectId: projectId ?? activeProjectId.value,
+        projectId: targetPid,
       });
     } catch (e) {
       console.warn("Impossible de lister les règles projet:", e);
@@ -998,10 +1013,11 @@ export const useStudioStore = defineStore("studio", () => {
     projectId?: string,
     initialPrompt?: string
   ): Promise<string[]> {
-    if (!isTauri()) return [];
+    const targetPid = projectId ?? activeProjectId.value;
+    if (!isTauri() || !targetPid) return [];
     try {
       return await invoke<string[]>("init_project_agent_rules", {
-        projectId: projectId ?? activeProjectId.value,
+        projectId: targetPid,
         initialPrompt,
       });
     } catch (e) {
@@ -1130,8 +1146,11 @@ export const useStudioStore = defineStore("studio", () => {
       projects.value = projects.value.filter((p) => p.id !== projectId);
       conversations.value = conversations.value.filter((c) => c.projectId !== projectId);
       if (activeProjectId.value === projectId) {
-        activeProjectId.value = projects.value[0]?.id ?? null;
-        activeConversationId.value = conversations.value[0]?.id ?? null;
+        const nextProject = projects.value[0] ?? null;
+        activeProjectId.value = nextProject?.id ?? null;
+        activeConversationId.value = nextProject
+          ? (conversations.value.find((c) => c.projectId === nextProject.id)?.id ?? null)
+          : null;
       }
     }
   }
@@ -1181,12 +1200,14 @@ export const useStudioStore = defineStore("studio", () => {
   }
 
   async function listProjectFiles(projectId?: string): Promise<string[]> {
+    const targetPid = projectId ?? activeProjectId.value;
+    if (!targetPid) return [];
     if (!isTauri()) {
       return ["README.md", "src/main.ts", "src/utils.ts"];
     }
     try {
       return await invoke<string[]>("list_project_files", {
-        projectId: projectId ?? activeProjectId.value,
+        projectId: targetPid,
       });
     } catch {
       return [];
@@ -1196,13 +1217,14 @@ export const useStudioStore = defineStore("studio", () => {
   const hasAiderignore = ref<boolean>(true);
 
   async function checkAiderignore(projectId?: string): Promise<boolean> {
-    if (!isTauri()) {
+    const targetPid = projectId ?? activeProjectId.value;
+    if (!isTauri() || !targetPid) {
       hasAiderignore.value = true;
       return true;
     }
     try {
       const exists = await invoke<boolean>("check_project_aiderignore", {
-        projectId: projectId ?? activeProjectId.value,
+        projectId: targetPid,
       });
       hasAiderignore.value = exists;
       return exists;
@@ -1213,13 +1235,15 @@ export const useStudioStore = defineStore("studio", () => {
   }
 
   async function ensureAiderignore(projectId?: string): Promise<boolean> {
+    const targetPid = projectId ?? activeProjectId.value;
+    if (!targetPid) return false;
     if (!isTauri()) {
       hasAiderignore.value = true;
       return true;
     }
     try {
       const created = await invoke<boolean>("ensure_project_aiderignore", {
-        projectId: projectId ?? activeProjectId.value,
+        projectId: targetPid,
       });
       hasAiderignore.value = true;
       return created;

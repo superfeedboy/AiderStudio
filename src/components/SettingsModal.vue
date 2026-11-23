@@ -43,13 +43,9 @@ function cloneRouting(routing?: AgentRoutingConfig): AgentRoutingConfig {
   const base = defaultAgentRouting();
   if (!routing) return base;
   return {
-    architect: cloneSlot(routing.architect ?? base.architect),
-    cartographer: cloneSlot(routing.cartographer ?? base.cartographer),
-    designer: cloneSlot(routing.designer ?? base.designer),
-    coder: cloneSlot(routing.coder ?? base.coder),
-    refactoring: cloneSlot(routing.refactoring ?? base.refactoring),
-    tester: cloneSlot(routing.tester ?? base.tester),
-    synthesizer: cloneSlot(routing.synthesizer ?? base.synthesizer),
+    architect: cloneSlot(routing.architect ?? routing.synthesizer ?? base.architect),
+    coder: cloneSlot(routing.coder ?? routing.designer ?? routing.refactoring ?? base.coder),
+    reviewer: cloneSlot(routing.reviewer ?? routing.tester ?? base.reviewer),
   };
 }
 
@@ -320,7 +316,7 @@ function getAgentSlot(role: AgentRoleKey): AgentModelSlot {
   if (!draft.agentRouting) {
     draft.agentRouting = defaultAgentRouting();
   }
-  return draft.agentRouting[role];
+  return draft.agentRouting[role] ?? draft.agentRouting.coder;
 }
 
 function onAgentProviderChange(role: AgentRoleKey, nextProv: string) {
@@ -439,30 +435,22 @@ function applyNoCostPreset() {
     { prov: "cerebras", prefs: ["qwen-3-235b", "llama-3.3-70b"] },
     { prov: "groq", prefs: ["qwen3-32b", "llama-3.3-70b"] },
   ]);
-  draft.agentRouting.designer = assignFirstAvailableFreeSlot([
-    { prov: "gemini", prefs: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"] },
-    { prov: "openrouter", prefs: ["deepseek-chat", "qwen3-coder", ":free"] },
-    { prov: "cerebras", prefs: ["qwen-3-235b", "qwen-3-32b"] },
-    { prov: "groq", prefs: ["llama-3.3-70b", "qwen3-32b"] },
-  ]);
   draft.agentRouting.coder = assignFirstAvailableFreeSlot([
     { prov: "openrouter", prefs: ["qwen3-coder:free", "deepseek-chat", ":free"] },
     { prov: "cerebras", prefs: ["qwen-3-235b", "qwen-3-32b"] },
     { prov: "groq", prefs: ["qwen3-32b", "llama-3.3-70b"] },
     { prov: "gemini", prefs: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"] },
   ]);
-  draft.agentRouting.refactoring = { ...draft.agentRouting.coder };
 
   const fastFreeCandidates = [
     { prov: "groq", prefs: ["llama-3.3-70b", "qwen3-32b", "llama-3.1-8b"] },
     { prov: "cerebras", prefs: ["llama-3.3-70b", "qwen-3-32b"] },
+    { prov: "gemini", prefs: ["gemini-2.5-flash", "gemini-2.0-flash"] },
   ];
-  draft.agentRouting.cartographer = assignFirstAvailableFreeSlot(fastFreeCandidates);
-  draft.agentRouting.tester = assignFirstAvailableFreeSlot(fastFreeCandidates);
-  draft.agentRouting.synthesizer = assignFirstAvailableFreeSlot(fastFreeCandidates);
+  draft.agentRouting.reviewer = assignFirstAvailableFreeSlot(fastFreeCandidates);
 
   const usedFreeProviders = new Set(
-    Object.values(draft.agentRouting)
+    [draft.agentRouting.architect, draft.agentRouting.coder, draft.agentRouting.reviewer]
       .map((s) => s.provider)
       .filter((p) => freeTierProviderIds.has(p))
   );
@@ -503,48 +491,30 @@ const agentRoles: {
   label: string;
   desc: string;
   color: string;
+  facets?: { label: string; kind: "code" | "ui" | "refacto" }[];
 }[] = [
   {
     key: "architect",
-    label: "Architecte & Orchestrateur",
-    desc: "Analyse de la demande, routage des rôles et spécifications techniques",
+    label: "Architecte & Synthétiseur",
+    desc: "Planification DAG initiale, routage et synthèse finale en boucle fermée",
     color: "#8b5cf6",
   },
   {
-    key: "cartographer",
-    label: "Cartographe",
-    desc: "Ciblage des fichiers pertinents et réduction du bruit de contexte",
-    color: "#06b6d4",
-  },
-  {
-    key: "designer",
-    label: "Designer UI/UX",
-    desc: "Interfaces modernes, CSS global, mise en page et responsive",
-    color: "#ec4899",
-  },
-  {
     key: "coder",
-    label: "Codeur",
-    desc: "Implémentation de fonctionnalités, correctifs et intégrations",
+    label: "Codeur + Designer UI/UX",
+    desc: "Implémentation atomique en un prompt : logique applicative, interfaces modernes et refactoring",
     color: "#3b82f6",
+    facets: [
+      { label: "Code", kind: "code" },
+      { label: "UI/UX", kind: "ui" },
+      { label: "Refacto", kind: "refacto" },
+    ],
   },
   {
-    key: "refactoring",
-    label: "Refactoring",
-    desc: "Nettoyage, découpage, typage strict et optimisation",
-    color: "#f59e0b",
-  },
-  {
-    key: "tester",
-    label: "Testeur",
-    desc: "Génération de tests unitaires/d'intégration et vérifications",
+    key: "reviewer",
+    label: "Reviewer & QA",
+    desc: "Revue de diff Git, validation build/tests et contrôle qualité",
     color: "#10b981",
-  },
-  {
-    key: "synthesizer",
-    label: "Synthétiseur",
-    desc: "Résumé concis du travail accompli en fin de tour",
-    color: "#94a3b8",
   },
 ];
 </script>
@@ -1140,6 +1110,42 @@ const agentRoles: {
         </div>
 
         <div class="agents-list">
+          <!-- PILIER 1 : CARTOGRAPHE DÉTERMINISTE (MOTEUR NATIF RUST) -->
+          <div
+            class="agent-row-card is-native-pillar"
+            style="--role-color: #06b6d4"
+          >
+            <div class="agent-row-header is-static">
+              <div class="agent-role-info">
+                <div class="agent-role-title">
+                  <span
+                    class="role-dot"
+                    style="background-color: #06b6d4"
+                  />
+                  <strong>Cartographe Déterministe</strong>
+                  <span class="native-rust-badge">Moteur Natif Rust</span>
+                </div>
+                <span class="agent-role-desc">
+                  Indexation AST &amp; lexicale instantanée, graphe d'imports et ciblage déterministe des fichiers (Stage 1)
+                </span>
+              </div>
+
+              <div class="agent-summary-pills">
+                <span
+                  class="agent-prov-pill"
+                  style="--prov-color: #06b6d4"
+                >
+                  <span
+                    class="agent-prov-dot"
+                    style="background-color: #06b6d4"
+                  />
+                  <span>Rust Index</span>
+                </span>
+                <span class="agent-trigger-model">0 token · &lt; 15 ms</span>
+              </div>
+            </div>
+          </div>
+
           <div
             v-for="role in agentRoles"
             :key="role.key"
@@ -1156,6 +1162,14 @@ const agentRoles: {
                     :style="{ backgroundColor: role.color }"
                   />
                   <strong>{{ role.label }}</strong>
+                  <span
+                    v-for="facet in role.facets"
+                    :key="facet.kind"
+                    class="coder-facet-pill"
+                    :class="`is-${facet.kind}`"
+                  >
+                    {{ facet.label }}
+                  </span>
                 </div>
                 <span class="agent-role-desc">{{ role.desc }}</span>
               </div>
@@ -2120,6 +2134,10 @@ const agentRoles: {
   user-select: none;
 }
 
+.agent-row-header.is-static {
+  cursor: default;
+}
+
 .agent-role-info {
   display: flex;
   flex-direction: column;
@@ -2131,9 +2149,47 @@ const agentRoles: {
 .agent-role-title {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
   font-size: 12.5px;
   color: var(--text-main);
+}
+
+.native-rust-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: #22d3ee;
+  background: rgba(6, 182, 212, 0.14);
+  border: 1px solid rgba(6, 182, 212, 0.35);
+}
+
+.coder-facet-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  letter-spacing: 0.01em;
+}
+
+.coder-facet-pill.is-code {
+  color: #60a5fa;
+  background: rgba(59, 130, 246, 0.14);
+  border-color: rgba(59, 130, 246, 0.35);
+}
+
+.coder-facet-pill.is-ui {
+  color: #f472b6;
+  background: rgba(236, 72, 153, 0.14);
+  border-color: rgba(236, 72, 153, 0.35);
+}
+
+.coder-facet-pill.is-refacto {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.35);
 }
 
 .role-dot {

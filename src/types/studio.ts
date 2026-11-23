@@ -19,6 +19,7 @@ export type AgentRoleKey =
   | "coder"
   | "refactoring"
   | "tester"
+  | "reviewer"
   | "synthesizer";
 
 export interface ProviderConfig {
@@ -40,12 +41,13 @@ export interface AgentModelSlot {
 
 export interface AgentRoutingConfig {
   architect: AgentModelSlot;
-  cartographer: AgentModelSlot;
-  designer: AgentModelSlot;
   coder: AgentModelSlot;
-  refactoring: AgentModelSlot;
-  tester: AgentModelSlot;
-  synthesizer: AgentModelSlot;
+  reviewer: AgentModelSlot;
+  cartographer?: AgentModelSlot;
+  designer?: AgentModelSlot;
+  refactoring?: AgentModelSlot;
+  tester?: AgentModelSlot;
+  synthesizer?: AgentModelSlot;
 }
 
 export interface ProviderUsageEntry {

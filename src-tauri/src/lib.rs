@@ -300,7 +300,13 @@ async fn delete_project(
     guard.conversations.retain(|c| c.project_id != project_id);
     if guard.active_project_id.as_deref() == Some(&project_id) {
         guard.active_project_id = guard.projects.first().map(|p| p.id.clone());
-        guard.active_conversation_id = guard.conversations.first().map(|c| c.id.clone());
+        guard.active_conversation_id = guard.active_project_id.as_ref().and_then(|pid| {
+            guard
+                .conversations
+                .iter()
+                .find(|c| &c.project_id == pid)
+                .map(|c| c.id.clone())
+        });
     }
     storage::save_state(&guard)
         .await

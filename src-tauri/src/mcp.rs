@@ -3,13 +3,12 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 
 pub async fn list_tools_for_server(
     server: &McpServerConfig,
     project_root: &Path,
 ) -> Result<Vec<McpToolInfo>, String> {
-    let mut cmd = Command::new(&server.command);
+    let mut cmd = crate::tools::create_hidden_command(&server.command);
     cmd.args(&server.args);
     cmd.current_dir(project_root);
     for (k, v) in &server.env {
@@ -122,7 +121,7 @@ pub async fn call_tool_for_server(
     tool_name: &str,
     arguments: &Value,
 ) -> Result<String, String> {
-    let mut cmd = Command::new(&server.command);
+    let mut cmd = crate::tools::create_hidden_command(&server.command);
     cmd.args(&server.args);
     cmd.current_dir(project_root);
     for (k, v) in &server.env {

@@ -54,6 +54,15 @@ pub struct AgentModelSlot {
     pub fallbacks: Vec<AgentModelSlot>,
 }
 
+impl AgentModelSlot {
+    pub fn is_unconfigured(&self) -> bool {
+        let p = self.provider.trim();
+        (p.is_empty() || p == "ollama")
+            && self.model.trim().is_empty()
+            && self.fallbacks.is_empty()
+    }
+}
+
 impl Default for AgentModelSlot {
     fn default() -> Self {
         Self {
@@ -70,17 +79,57 @@ pub struct AgentRoutingConfig {
     #[serde(default)]
     pub architect: AgentModelSlot,
     #[serde(default)]
-    pub cartographer: AgentModelSlot,
-    #[serde(default)]
-    pub designer: AgentModelSlot,
-    #[serde(default)]
     pub coder: AgentModelSlot,
     #[serde(default)]
-    pub refactoring: AgentModelSlot,
-    #[serde(default)]
-    pub tester: AgentModelSlot,
-    #[serde(default)]
-    pub synthesizer: AgentModelSlot,
+    pub reviewer: AgentModelSlot,
+    #[serde(default, skip_serializing)]
+    pub tester: Option<AgentModelSlot>,
+    #[serde(default, skip_serializing)]
+    pub designer: Option<AgentModelSlot>,
+    #[serde(default, skip_serializing)]
+    pub refactoring: Option<AgentModelSlot>,
+    #[serde(default, skip_serializing)]
+    pub synthesizer: Option<AgentModelSlot>,
+    #[serde(default, skip_serializing)]
+    pub cartographer: Option<AgentModelSlot>,
+}
+
+impl AgentRoutingConfig {
+    pub fn sanitize_and_migrate(&mut self) {
+        if self.reviewer.is_unconfigured() {
+            if let Some(legacy_tester) = self.tester.take() {
+                if !legacy_tester.is_unconfigured() {
+                    self.reviewer = legacy_tester;
+                }
+            }
+        }
+        if self.coder.is_unconfigured() {
+            if let Some(legacy_designer) = self.designer.take() {
+                if !legacy_designer.is_unconfigured() {
+                    self.coder = legacy_designer;
+                }
+            }
+        }
+        if self.coder.is_unconfigured() {
+            if let Some(legacy_refact) = self.refactoring.take() {
+                if !legacy_refact.is_unconfigured() {
+                    self.coder = legacy_refact;
+                }
+            }
+        }
+        if self.architect.is_unconfigured() {
+            if let Some(legacy_synth) = self.synthesizer.take() {
+                if !legacy_synth.is_unconfigured() {
+                    self.architect = legacy_synth;
+                }
+            }
+        }
+        self.tester = None;
+        self.designer = None;
+        self.refactoring = None;
+        self.synthesizer = None;
+        self.cartographer = None;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,6 +159,18 @@ impl Default for ApiUsageState {
     }
 }
 
+fn default_theme() -> String {
+    "system".to_string()
+}
+
+fn default_ollama_url() -> String {
+    "http://127.0.0.1:11434".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "qwen2.5-coder:3b".to_string()
+}
+
 fn default_hud_context_view() -> String {
     "agent".to_string()
 }
@@ -121,9 +182,13 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    #[serde(default = "default_theme")]
     pub theme: String, // "system" | "dark" | "light"
+    #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    #[serde(default = "default_ollama_model")]
     pub ollama_model: String,
+    #[serde(default = "default_true")]
     pub auto_start_ollama: bool,
     #[serde(default = "default_context_window")]
     pub context_window_tokens: usize,
@@ -172,6 +237,7 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub fn sanitize(&mut self) {
+        self.agent_routing.sanitize_and_migrate();
         if self.hud_context_view.trim().is_empty() {
             self.hud_context_view = "agent".to_string();
         }
@@ -191,13 +257,9 @@ impl AppSettings {
 }
 
 pub fn slot_for_role<'a>(role: &str, settings: &'a AppSettings) -> &'a AgentModelSlot {
-    match role {
-        "architect" => &settings.agent_routing.architect,
-        "cartographer" => &settings.agent_routing.cartographer,
-        "designer" => &settings.agent_routing.designer,
-        "refactoring" => &settings.agent_routing.refactoring,
-        "tester" => &settings.agent_routing.tester,
-        "synthesizer" => &settings.agent_routing.synthesizer,
+    match role.trim().to_lowercase().as_str() {
+        "architect" | "synthesizer" | "general" | "research" => &settings.agent_routing.architect,
+        "reviewer" | "tester" => &settings.agent_routing.reviewer,
         _ => &settings.agent_routing.coder,
     }
 }
@@ -208,9 +270,11 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub root_path: String,
+    #[serde(default)]
     pub global_context: String,
     #[serde(default)]
     pub shared_directories: Vec<String>,
+    #[serde(default)]
     pub updated_at: String,
 }
 
@@ -360,13 +424,21 @@ pub struct Conversation {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    #[serde(default)]
     pub conversation_context: String,
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
     pub artifacts: Vec<ArtifactItem>,
+    #[serde(default)]
     pub modified_files: Vec<ModifiedFileDiff>,
+    #[serde(default)]
     pub lines_added: usize,
+    #[serde(default)]
     pub lines_removed: usize,
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
 }
 
@@ -397,13 +469,18 @@ pub struct McpToolInfo {
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStateData {
+    #[serde(default)]
     pub settings: AppSettings,
+    #[serde(default)]
     pub projects: Vec<Project>,
+    #[serde(default)]
     pub conversations: Vec<Conversation>,
+    #[serde(default)]
     pub active_project_id: Option<String>,
+    #[serde(default)]
     pub active_conversation_id: Option<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,

@@ -437,7 +437,7 @@ export function renderReleaseNotes({
   categorized,
   assets = [],
 }) {
-  const lines = [`## 🚀 AiderStudio ${tag}`, ""];
+  const lines = [`## 🚀 >AIx Studio ${tag}`, ""];
 
   const sectionSpecs = [
     { key: "breaking", heading: "### 💥 Breaking changes" },
