@@ -69,7 +69,7 @@ pub fn build_native_tool_definitions(has_mcp: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Patch court : modifie chirurgicalement un fichier existant via un ou plusieurs blocs SEARCH/REPLACE exacts et atomiques. Ne jamais utiliser pour créer un fichier inexistant (utiliser write_file).",
+                "description": "Patch court : modifie chirurgicalement un fichier existant via un ou plusieurs blocs SEARCH/REPLACE exacts et atomiques. Pour les fichiers de configuration ou courts (<= 80 lignes), préférer `write_file` pour réécrire tout le fichier sans risque d'erreur SEARCH. Ne jamais utiliser pour créer un fichier inexistant.",
                 "parameters": {
                     "type": "object",
                     "properties": {

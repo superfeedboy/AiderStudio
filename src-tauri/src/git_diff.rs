@@ -3,6 +3,34 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+pub const GIT_EXCLUDE_PATHSPECS: &[&str] = &[
+    ":(exclude)node_modules",
+    ":(exclude)target",
+    ":(exclude)dist",
+    ":(exclude)build",
+    ":(exclude).next",
+    ":(exclude).nuxt",
+    ":(exclude)vendor",
+    ":(exclude).venv",
+    ":(exclude)venv",
+    ":(exclude)__pycache__",
+    ":(exclude).svelte-kit",
+    ":(exclude).turbo",
+    ":(exclude)coverage",
+    ":(exclude)package-lock.json",
+    ":(exclude)pnpm-lock.yaml",
+    ":(exclude)yarn.lock",
+    ":(exclude)bun.lock",
+    ":(exclude)bun.lockb",
+    ":(exclude)Cargo.lock",
+    ":(exclude)composer.lock",
+    ":(exclude)Gemfile.lock",
+    ":(exclude)poetry.lock",
+    ":(exclude)uv.lock",
+    ":(exclude)go.sum",
+    ":(exclude)*.lock",
+];
+
 /// Repairs files and directories mistakenly prefixed/suffixed with backticks (e.g. `` `src/App.vue ``)
 /// that small local LLMs occasionally emit inside file headers.
 pub async fn sanitize_backtick_paths(project_root: &str) {
@@ -166,8 +194,10 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
     }
 
     let mut diff_text = if has_head {
+        let mut args = vec!["-C", project_root, "diff", "HEAD", "--unified=3", "--no-color", "--", "."];
+        args.extend(GIT_EXCLUDE_PATHSPECS);
         Command::new("git")
-            .args(["-C", project_root, "diff", "HEAD", "--unified=3", "--no-color", "--", "."])
+            .args(&args)
             .output()
             .await
             .ok()
@@ -180,8 +210,10 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
 
     if diff_text.is_empty() {
         // Fallback: combine unstaged diff + cached staged diff
+        let mut unstaged_args = vec!["-C", project_root, "diff", "--unified=3", "--no-color", "--", "."];
+        unstaged_args.extend(GIT_EXCLUDE_PATHSPECS);
         let unstaged = Command::new("git")
-            .args(["-C", project_root, "diff", "--unified=3", "--no-color", "--", "."])
+            .args(&unstaged_args)
             .output()
             .await
             .ok()
@@ -189,8 +221,10 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
 
+        let mut staged_args = vec!["-C", project_root, "diff", "--cached", "--unified=3", "--no-color", "--", "."];
+        staged_args.extend(GIT_EXCLUDE_PATHSPECS);
         let staged = Command::new("git")
-            .args(["-C", project_root, "diff", "--cached", "--unified=3", "--no-color", "--", "."])
+            .args(&staged_args)
             .output()
             .await
             .ok()
@@ -204,8 +238,10 @@ pub async fn collect_project_diffs(project_root: &str) -> (Vec<ModifiedFileDiff>
     let mut files = parse_unified_diff(&diff_text);
 
     // Include untracked files as pure additions (up to 150 lines per file, strictly inside project_root)
+    let mut ls_args = vec!["-C", project_root, "ls-files", "--others", "--exclude-standard", "--", "."];
+    ls_args.extend(GIT_EXCLUDE_PATHSPECS);
     if let Ok(status_out) = Command::new("git")
-        .args(["-C", project_root, "ls-files", "--others", "--exclude-standard", "--", "."])
+        .args(&ls_args)
         .output()
         .await
     {
@@ -266,8 +302,10 @@ pub async fn capture_workspace_tree(project_root: &str) -> Option<String> {
     }
 
     let tmp_idx = std::env::temp_dir().join(format!("vaix-idx-{}.idx", uuid::Uuid::new_v4()));
+    let mut add_args = vec!["-C", project_root, "add", "-A", "--", "."];
+    add_args.extend(GIT_EXCLUDE_PATHSPECS);
     let add_res = Command::new("git")
-        .args(["-C", project_root, "add", "-A"])
+        .args(&add_args)
         .env("GIT_INDEX_FILE", &tmp_idx)
         .output()
         .await;

@@ -1,7 +1,7 @@
 export type InlineToken =
   | { kind: "text"; text: string }
   | { kind: "bold"; children: InlineToken[] }
-  | { kind: "italic"; text: string }
+  | { kind: "italic"; children: InlineToken[] }
   | { kind: "code"; text: string }
   | { kind: "link"; label: string; href: string }
   | { kind: "tool-call"; toolName: string; tools: string[]; raw: string };
@@ -35,16 +35,8 @@ export function tokenizeInline(input: string): InlineToken[] {
     if (raw.startsWith("[")) {
       const toolMatch = /^\[Appel d'outils?(?:\s+natifs?)?\s*:\s*([^\]]+)\]$/i.exec(raw);
       if (toolMatch) {
-        const tools = toolMatch[1]
-          .split(",")
-          .map((t) => t.trim().replace(/^`+|`+$/g, ""))
-          .filter(Boolean);
-        tokens.push({
-          kind: "tool-call",
-          toolName: tools[0] || "tool",
-          tools,
-          raw,
-        });
+        // Les appels d'outils sont déjà entièrement représentés dans la Process Timeline au-dessus.
+        // On ne génère aucun token visible dans le corps du texte pour éviter le doublon visuel.
       } else {
         const linkMatch = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(raw);
         if (linkMatch) {
@@ -63,7 +55,7 @@ export function tokenizeInline(input: string): InlineToken[] {
     } else if (raw.startsWith("**") && raw.endsWith("**")) {
       tokens.push({ kind: "bold", children: tokenizeInline(raw.slice(2, -2)) });
     } else if (raw.startsWith("*") && raw.endsWith("*")) {
-      tokens.push({ kind: "italic", text: raw.slice(1, -1) });
+      tokens.push({ kind: "italic", children: tokenizeInline(raw.slice(1, -1)) });
     }
 
     lastIdx = regex.lastIndex;

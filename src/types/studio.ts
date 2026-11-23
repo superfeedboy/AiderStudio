@@ -29,11 +29,13 @@ export interface ProviderConfig {
   validated: boolean;
   availableModels: string[];
   dailyTokenLimit: number;
+  color?: string | null;
 }
 
 export interface AgentModelSlot {
   provider: ProviderId | string;
   model: string;
+  fallbacks?: AgentModelSlot[];
 }
 
 export interface AgentRoutingConfig {
@@ -68,6 +70,11 @@ export interface AppSettings {
   activeTarget?: string;
   providers?: ProviderConfig[];
   agentRouting?: AgentRoutingConfig;
+  hudContextView?: "agent" | "global";
+  hudShowTokenUsage?: boolean;
+  hudShowLocalResources?: boolean;
+  hudShowGlobalDiff?: boolean;
+  hudAutoArtifactEvolutionReport?: boolean;
 }
 
 export interface Project {
@@ -144,6 +151,20 @@ export interface AgentTraceEvent {
   step: AgentTraceStep;
 }
 
+export interface ProcessStep {
+  id: string;
+  tool: string;
+  title: string;
+  status: "running" | "success" | "error";
+  durationMs?: number;
+  detail?: string;
+}
+
+export interface ProcessStepEvent {
+  conversationId: string;
+  step: ProcessStep;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
@@ -161,6 +182,7 @@ export interface ChatMessage {
   agentTrace?: AgentTraceStep[];
   commitId?: string;
   commitSummary?: string;
+  processSteps?: ProcessStep[];
 }
 
 export interface Conversation {

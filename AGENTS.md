@@ -6,7 +6,7 @@ Ce fichier définit les directives fondamentales, l'architecture globale et les 
 
 ## 1. Vue d'ensemble du Projet
 
-**>AIx STUDIO** est un IDE desktop natif de pair-programming IA et multi-agents (macOS Universal & Windows x64).
+**>AIx STUDIO** est un IDE desktop natif de pair-programming IA agnostique et multi-agents (macOS Universal & Windows x64).
 - **Frontend** : Vue 3.5 (Composition API avec `<script setup lang="ts">`), Pinia 2.3, Vite 6, Highlight.js.
 - **Backend / Desktop** : Tauri v2, Rust 2021 (moteur multi-agents 100 % natif, zéro dépendance Python/Aider).
 - **Communication & LLM** : Moteur hybride combinant Ollama en local et fournisseurs Cloud (Gemini, OpenAI, Anthropic, DeepSeek, OpenRouter, Mistral), streaming unifié SSE/NDJSON, Model Context Protocol (MCP).

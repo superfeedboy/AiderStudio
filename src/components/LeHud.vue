@@ -172,29 +172,20 @@ function selectArtifact(id: string) {
     </div>
 
     <!-- BARRE 1: CONSOMMATION API EXTERNES -->
-    <div
-      class="hud-api-section"
-      @mouseenter="apiHovered = true"
-      @mouseleave="apiHovered = false"
-    >
-      <div class="hud-context-header">
-        <span class="hud-context-title">
-          <svg class="hud-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
-          </svg>
-          <span>API Externes</span>
-        </span>
-        <div class="hud-api-right">
-          <button
-            v-if="store.validatedExternalProviders.length === 0 && store.externalApiTokensTotal === 0"
-            type="button"
-            class="hud-config-link"
-            title="Configurer une clé API externe"
-            @click="store.openSettingsTab('providers')"
-          >
-            Configurer
-          </button>
-          <template v-else>
+    <template v-if="store.hudShowTokenUsageEffective">
+      <div
+        class="hud-api-section"
+        @mouseenter="apiHovered = true"
+        @mouseleave="apiHovered = false"
+      >
+        <div class="hud-context-header">
+          <span class="hud-context-title">
+            <svg class="hud-icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />
+            </svg>
+            <span>API Externes</span>
+          </span>
+          <div class="hud-api-right">
             <strong
               class="hud-context-percent"
               :class="{
@@ -214,11 +205,18 @@ function selectArtifact(id: string) {
             >
               ↺
             </button>
-          </template>
+            <button
+              v-else-if="store.validatedExternalProviders.length === 0"
+              type="button"
+              class="hud-config-link"
+              title="Configurer une clé API externe"
+              @click="store.openSettingsTab('providers')"
+            >
+              Configurer
+            </button>
+          </div>
         </div>
-      </div>
 
-      <template v-if="store.validatedExternalProviders.length > 0 || store.externalApiTokensTotal > 0">
         <div class="context-bar-track">
           <div
             class="context-bar-fill"
@@ -234,36 +232,35 @@ function selectArtifact(id: string) {
           <span>{{ formatCompactTokens(store.externalApiTokensTotal) }} / {{ formatCompactTokens(store.externalApiTokenLimit) }} tok</span>
           <span>{{ store.validatedExternalProviders.length }} actif(s)</span>
         </div>
-      </template>
 
-      <!-- Hover breakdown card for External APIs -->
-      <div
-        v-if="apiHovered && (providerUsageRows.length > 0 || store.validatedExternalProviders.length > 0)"
-        class="hud-hover-card halo-hud"
-      >
-        <div class="hover-card-title">
-          <span>Consommation du {{ store.apiUsage.date }}</span>
-        </div>
-        <div v-if="providerUsageRows.length === 0" class="hover-card-empty">
-          0 token externe consommé aujourd'hui
-        </div>
+        <!-- Hover breakdown card for External APIs -->
         <div
-          v-for="row in providerUsageRows"
-          :key="row.id"
-          class="hover-card-row"
+          v-if="apiHovered && (providerUsageRows.length > 0 || store.validatedExternalProviders.length > 0)"
+          class="hud-hover-card halo-hud"
         >
-          <span>{{ row.name }} ({{ row.calls }} app.)</span>
-          <strong>{{ row.totalTokens.toLocaleString() }} tok</strong>
+          <div class="hover-card-title">
+            <span>Consommation du {{ store.apiUsage.date }}</span>
+          </div>
+          <div v-if="providerUsageRows.length === 0" class="hover-card-empty">
+            0 token externe consommé aujourd'hui
+          </div>
+          <div
+            v-for="row in providerUsageRows"
+            :key="row.id"
+            class="hover-card-row"
+          >
+            <span>{{ row.name }} ({{ row.calls }} app.)</span>
+            <strong>{{ row.totalTokens.toLocaleString() }} tok</strong>
+          </div>
         </div>
       </div>
-    </div>
+      <div class="hud-divider" />
+    </template>
 
-    <div class="hud-divider" />
-
-    <!-- BARRE 2: CONTEXTE HORIZONTAL STACKÉ MULTI-AGENTS -->
+    <!-- BARRE 2: CONTEXTE HORIZONTAL (STACKÉ MULTI-AGENTS OU GLOBAL) -->
     <div
       class="hud-context-section"
-      :title="store.turnTokenSteps.length === 0 ? contextTooltip : undefined"
+      :title="store.hudContextViewEffective === 'global' || store.turnTokenSteps.length === 0 ? contextTooltip : undefined"
     >
       <div class="hud-context-header">
         <span class="hud-context-title">
@@ -272,10 +269,10 @@ function selectArtifact(id: string) {
             <path d="M6 6h10" />
             <path d="M6 10h10" />
           </svg>
-          <span>Contexte</span>
+          <span>Contexte {{ store.hudContextViewEffective === 'global' ? 'Global' : '' }}</span>
         </span>
         <strong
-          v-if="store.turnTokenSteps.length > 0"
+          v-if="store.hudContextViewEffective === 'agent' && store.turnTokenSteps.length > 0"
           class="hud-context-tokens"
         >
           {{ store.turnTotalTokens.toLocaleString() }} tok
@@ -292,60 +289,81 @@ function selectArtifact(id: string) {
         </strong>
       </div>
 
-      <!-- Barre horizontale stackée par sous-agent (1 couleur par rôle) -->
-      <div
-        v-if="store.turnTokenSteps.length > 0"
-        class="stacked-bar-track"
-      >
+      <!-- Mode Multi-Agents : Barre horizontale stackée par sous-agent (1 couleur par rôle) -->
+      <template v-if="store.hudContextViewEffective === 'agent'">
         <div
-          v-for="(step, idx) in store.turnTokenSteps"
-          :key="`${step.subagent}-${idx}`"
-          class="stacked-segment"
-          :class="{
-            'is-hovered': hoveredAgentStep && hoveredAgentStep.subagent === step.subagent,
-          }"
-          :style="{
-            width: `${segmentWidthPercent(step)}%`,
-            backgroundColor: roleColor(step),
-          }"
-          @mouseenter="hoveredAgentStep = step"
-          @mouseleave="hoveredAgentStep = null"
-        />
-      </div>
-      <!-- Repli à l'état initial avant tout appel sous-agent -->
-      <div v-else class="context-bar-track">
-        <div
-          class="context-bar-fill"
-          :style="{ width: `${store.contextPercent}%` }"
-          :class="{
-            'fill-ok': store.contextPercent < 70,
-            'fill-warn': store.contextPercent >= 70 && store.contextPercent < 85,
-            'fill-danger': store.contextPercent >= 85,
-          }"
-        />
-      </div>
-
-      <!-- Mini pastilles légende interactives (déclenchent aussi la bulle détaillée) -->
-      <div v-if="store.turnTokenSteps.length > 0" class="stacked-legend">
-        <button
-          v-for="(step, idx) in store.turnTokenSteps"
-          :key="`leg-${step.subagent}-${idx}`"
-          type="button"
-          class="legend-pill"
-          :class="{
-            'is-active': hoveredAgentStep && hoveredAgentStep.subagent === step.subagent,
-          }"
-          @mouseenter="hoveredAgentStep = step"
-          @mouseleave="hoveredAgentStep = null"
+          v-if="store.turnTokenSteps.length > 0"
+          class="stacked-bar-track"
         >
-          <span
-            class="legend-dot"
-            :style="{ backgroundColor: roleColor(step) }"
+          <div
+            v-for="(step, idx) in store.turnTokenSteps"
+            :key="`${step.subagent}-${idx}`"
+            class="stacked-segment"
+            :class="{
+              'is-hovered': hoveredAgentStep && hoveredAgentStep.subagent === step.subagent,
+            }"
+            :style="{
+              width: `${segmentWidthPercent(step)}%`,
+              backgroundColor: roleColor(step),
+            }"
+            @mouseenter="hoveredAgentStep = step"
+            @mouseleave="hoveredAgentStep = null"
           />
-          <span class="legend-name">{{ roleShortLabel(step) }}</span>
-          <span class="legend-val">{{ formatCompactTokens(step.totalTokens) }}</span>
-        </button>
-      </div>
+        </div>
+        <!-- Repli à l'état initial avant tout appel sous-agent -->
+        <div v-else class="context-bar-track">
+          <div
+            class="context-bar-fill"
+            :style="{ width: `${store.contextPercent}%` }"
+            :class="{
+              'fill-ok': store.contextPercent < 70,
+              'fill-warn': store.contextPercent >= 70 && store.contextPercent < 85,
+              'fill-danger': store.contextPercent >= 85,
+            }"
+          />
+        </div>
+
+        <!-- Mini pastilles légende interactives (déclenchent aussi la bulle détaillée) -->
+        <div v-if="store.turnTokenSteps.length > 0" class="stacked-legend">
+          <button
+            v-for="(step, idx) in store.turnTokenSteps"
+            :key="`leg-${step.subagent}-${idx}`"
+            type="button"
+            class="legend-pill"
+            :class="{
+              'is-active': hoveredAgentStep && hoveredAgentStep.subagent === step.subagent,
+            }"
+            @mouseenter="hoveredAgentStep = step"
+            @mouseleave="hoveredAgentStep = null"
+          >
+            <span
+              class="legend-dot"
+              :style="{ backgroundColor: roleColor(step) }"
+            />
+            <span class="legend-name">{{ roleShortLabel(step) }}</span>
+            <span class="legend-val">{{ formatCompactTokens(step.totalTokens) }}</span>
+          </button>
+        </div>
+      </template>
+
+      <!-- Mode Global : Barre unique globale -->
+      <template v-else>
+        <div class="context-bar-track">
+          <div
+            class="context-bar-fill"
+            :style="{ width: `${store.contextPercent}%` }"
+            :class="{
+              'fill-ok': store.contextPercent < 70,
+              'fill-warn': store.contextPercent >= 70 && store.contextPercent < 85,
+              'fill-danger': store.contextPercent >= 85,
+            }"
+          />
+        </div>
+        <div class="hud-api-caption">
+          <span>{{ formatCompactTokens(store.contextTokensUsed) }} / {{ formatCompactTokens(store.contextTokensMax) }} tok</span>
+          <span>Fenêtre max</span>
+        </div>
+      </template>
 
       <!-- Infobulle détaillée au hover d'un segment ou d'une pastille -->
       <div
@@ -400,100 +418,104 @@ function selectArtifact(id: string) {
       </div>
     </div>
 
-    <div class="hud-divider" />
-
     <!-- Entity 1: Modified lines counter (clickable -> Review) -->
-    <button
-      class="hud-row hud-row-btn"
-      title="Cliquer pour inspecter les fichiers modifiés dans le code"
-      @click="store.openReview(undefined, null, null)"
-    >
-      <span class="hud-entity">
-        <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="6" cy="6" r="2.5" />
-          <circle cx="6" cy="18" r="2.5" />
-          <circle cx="18" cy="18" r="2.5" />
-          <path d="M6 8.5v7" />
-          <path d="M18 15.5V9a2 2 0 0 0-2-2h-4" />
-        </svg>
-        <span class="hud-label">Lignes</span>
-      </span>
-      <span class="hud-val diff-vals">
-        <span class="add">+{{ linesAdded }}</span>
-        <span class="del">-{{ linesRemoved }}</span>
-      </span>
-    </button>
+    <template v-if="store.hudShowGlobalDiffEffective">
+      <div class="hud-divider" />
+      <button
+        class="hud-row hud-row-btn"
+        title="Cliquer pour inspecter les fichiers modifiés dans le code"
+        @click="store.openReview(undefined, null, null)"
+      >
+        <span class="hud-entity">
+          <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="6" cy="6" r="2.5" />
+            <circle cx="6" cy="18" r="2.5" />
+            <circle cx="18" cy="18" r="2.5" />
+            <path d="M6 8.5v7" />
+            <path d="M18 15.5V9a2 2 0 0 0-2-2h-4" />
+          </svg>
+          <span class="hud-label">Lignes</span>
+        </span>
+        <span class="hud-val diff-vals">
+          <span class="add">+{{ linesAdded }}</span>
+          <span class="del">-{{ linesRemoved }}</span>
+        </span>
+      </button>
+    </template>
 
-    <div class="hud-divider" />
+    <!-- Entity 2-5: Local Resources (CPU / GPU / MEM / Temp) -->
+    <template v-if="store.hudShowLocalResourcesEffective">
+      <div class="hud-divider" />
 
-    <!-- Entity 2: CPU usage -->
-    <div class="hud-row" title="Utilisation CPU">
-      <span class="hud-entity">
-        <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="6" y="6" width="12" height="12" rx="2" />
-          <rect x="9.5" y="9.5" width="5" height="5" rx="0.5" />
-          <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
-        </svg>
-        <span class="hud-label">CPU</span>
-      </span>
-      <strong class="hud-val">{{ store.telemetry.cpuUsage.toFixed(0) }}%</strong>
-    </div>
+      <!-- Entity 2: CPU usage -->
+      <div class="hud-row" title="Utilisation CPU">
+        <span class="hud-entity">
+          <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="6" y="6" width="12" height="12" rx="2" />
+            <rect x="9.5" y="9.5" width="5" height="5" rx="0.5" />
+            <path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3" />
+          </svg>
+          <span class="hud-label">CPU</span>
+        </span>
+        <strong class="hud-val">{{ store.telemetry.cpuUsage.toFixed(0) }}%</strong>
+      </div>
 
-    <!-- Entity 3: GPU usage -->
-    <div class="hud-row" title="Utilisation GPU">
-      <span class="hud-entity">
-        <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="13 2 4 14 11 14 10 22 20 10 13 10 13 2" />
-        </svg>
-        <span class="hud-label">GPU</span>
-      </span>
-      <strong class="hud-val" :class="{ gpu: store.telemetry.gpuUsage !== null }">
-        {{
-          store.telemetry.gpuUsage !== null
-            ? `${store.telemetry.gpuUsage.toFixed(0)}%`
-            : "N/A"
-        }}
-      </strong>
-    </div>
+      <!-- Entity 3: GPU usage -->
+      <div class="hud-row" title="Utilisation GPU">
+        <span class="hud-entity">
+          <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 4 14 11 14 10 22 20 10 13 10 13 2" />
+          </svg>
+          <span class="hud-label">GPU</span>
+        </span>
+        <strong class="hud-val" :class="{ gpu: store.telemetry.gpuUsage !== null }">
+          {{
+            store.telemetry.gpuUsage !== null
+              ? `${store.telemetry.gpuUsage.toFixed(0)}%`
+              : "N/A"
+          }}
+        </strong>
+      </div>
 
-    <!-- Entity 4: Memory usage -->
-    <div
-      class="hud-row"
-      :title="`Mémoire : ${store.telemetry.memUsedGb.toFixed(1)} / ${store.telemetry.memTotalGb.toFixed(1)} Go (${store.telemetry.memPercent.toFixed(0)}%)`"
-    >
-      <span class="hud-entity">
-        <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="7" width="18" height="10" rx="2" />
-          <path d="M7 11v2M11 11v2M15 11v2M7 17v2M12 17v2M17 17v2" />
-        </svg>
-        <span class="hud-label">MEM</span>
-      </span>
-      <strong class="hud-val">
-        {{
-          store.telemetry.memTotalGb > 0
-            ? `${store.telemetry.memUsedGb.toFixed(1)}G`
-            : "--"
-        }}
-      </strong>
-    </div>
+      <!-- Entity 4: Memory usage -->
+      <div
+        class="hud-row"
+        :title="`Mémoire : ${store.telemetry.memUsedGb.toFixed(1)} / ${store.telemetry.memTotalGb.toFixed(1)} Go (${store.telemetry.memPercent.toFixed(0)}%)`"
+      >
+        <span class="hud-entity">
+          <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="7" width="18" height="10" rx="2" />
+            <path d="M7 11v2M11 11v2M15 11v2M7 17v2M12 17v2M17 17v2" />
+          </svg>
+          <span class="hud-label">MEM</span>
+        </span>
+        <strong class="hud-val">
+          {{
+            store.telemetry.memTotalGb > 0
+              ? `${store.telemetry.memUsedGb.toFixed(1)}G`
+              : "--"
+          }}
+        </strong>
+      </div>
 
-    <!-- Entity 5: System temperature -->
-    <div class="hud-row" title="Température système">
-      <span class="hud-entity">
-        <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0Z" />
-          <circle cx="11.5" cy="17.5" r="1.5" fill="currentColor" stroke="none" />
-        </svg>
-        <span class="hud-label">Temp</span>
-      </span>
-      <strong class="hud-val">
-        {{
-          store.telemetry.tempCelsius !== null
-            ? `${store.telemetry.tempCelsius.toFixed(0)}°C`
-            : "--°C"
-        }}
-      </strong>
-    </div>
+      <!-- Entity 5: System temperature -->
+      <div class="hud-row" title="Température système">
+        <span class="hud-entity">
+          <svg class="hud-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0Z" />
+            <circle cx="11.5" cy="17.5" r="1.5" fill="currentColor" stroke="none" />
+          </svg>
+          <span class="hud-label">Temp</span>
+        </span>
+        <strong class="hud-val">
+          {{
+            store.telemetry.tempCelsius !== null
+              ? `${store.telemetry.tempCelsius.toFixed(0)}°C`
+              : "--°C"
+          }}
+        </strong>
+      </div>
+    </template>
 
     <div class="hud-divider" />
 

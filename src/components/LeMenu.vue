@@ -162,36 +162,8 @@ function handleDeleteProject(proj: Project) {
       </div>
     </div>
 
-    <!-- Stack health + Settings button -->
+    <!-- MCP + Settings buttons -->
     <div class="le-menu-footer">
-      <div class="stack-card">
-        <div class="stack-row">
-          <span class="stack-label">Ollama</span>
-          <span
-            class="stack-status"
-            :class="store.stackStatus.ollamaRunning ? 'ok' : 'warn'"
-          >
-            {{ store.stackStatus.ollamaRunning ? "En ligne" : "Arrêté" }}
-          </span>
-        </div>
-        <div class="stack-row">
-          <span class="stack-label">Moteur Natif</span>
-          <span
-            class="stack-status"
-            :class="store.stackStatus.nativeEngineReady ? 'ok' : 'muted'"
-          >
-            {{ store.stackStatus.nativeEngineReady ? "Prêt" : "Indisponible" }}
-          </span>
-        </div>
-        <button
-          v-if="!store.stackStatus.ollamaRunning && store.stackStatus.ollamaInstalled"
-          class="start-ollama-btn"
-          @click="store.startOllama"
-        >
-          Démarrer Ollama
-        </button>
-      </div>
-
       <button class="mcp-menu-btn" @click="store.mcpModalOpen = true">
         <span class="mcp-menu-left">
           <span>🔌</span>
@@ -217,7 +189,6 @@ function handleDeleteProject(proj: Project) {
           </svg>
           <span>Paramètres</span>
         </span>
-        <span class="settings-model">{{ store.settings.ollamaModel }}</span>
       </button>
     </div>
   </aside>
@@ -504,54 +475,6 @@ function handleDeleteProject(proj: Project) {
   gap: 8px;
 }
 
-.stack-card {
-  border: 1px solid var(--border-subtle);
-  background: var(--hover-bg);
-  border-radius: 10px;
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-}
-
-.stack-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.stack-label {
-  color: var(--text-muted);
-}
-
-.stack-status {
-  font-weight: 500;
-}
-
-.stack-status.ok {
-  color: var(--diff-add-bar);
-}
-
-.stack-status.warn {
-  color: #f59e0b;
-}
-
-.stack-status.muted {
-  color: var(--text-dim);
-}
-
-.start-ollama-btn {
-  margin-top: 4px;
-  border: 1px solid var(--border-subtle);
-  background: var(--active-bg);
-  color: var(--accent);
-  border-radius: 7px;
-  padding: 4px 8px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
 .mcp-menu-btn {
   width: 100%;
   border: 1px solid var(--border-subtle);
@@ -613,15 +536,5 @@ function handleDeleteProject(proj: Project) {
   display: flex;
   align-items: center;
   gap: 7px;
-}
-
-.settings-model {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 96px;
 }
 </style>

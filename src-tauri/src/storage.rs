@@ -70,12 +70,14 @@ pub async fn load_state() -> AppStateData {
     if let Ok(raw) = tokio::fs::read_to_string(&path).await {
         if let Ok(mut parsed) = serde_json::from_str::<AppStateData>(&raw) {
             if !parsed.projects.is_empty() {
+                parsed.settings.sanitize();
                 sanitize_conversations(&mut parsed);
                 return parsed;
             }
         }
     }
-    let seed = create_seed_state();
+    let mut seed = create_seed_state();
+    seed.settings.sanitize();
     let _ = save_state(&seed).await;
     seed
 }

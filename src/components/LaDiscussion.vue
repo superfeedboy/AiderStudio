@@ -8,6 +8,7 @@ import type {
   AttachedFile,
   ChatMessage,
   FileChangeSummary,
+  ProcessStep,
   ProjectRuleItem,
 } from "../types/studio";
 import AppLogo from "./AppLogo.vue";
@@ -93,6 +94,136 @@ async function toggleThinking(msgId: string) {
   ensureElementVisibleInStream(document.getElementById(`thinking-block-${msgId}`));
 }
 
+// Process Timeline state & helpers (fermé par défaut en mode dropdown)
+const openProcessTimelineIds = ref<Set<string>>(new Set());
+const openStepDetailIds = ref<Set<string>>(new Set());
+const isLiveProcessTimelineOpen = ref<boolean>(false);
+
+function isProcessTimelineOpen(msgId: string): boolean {
+  return openProcessTimelineIds.value.has(msgId);
+}
+
+async function toggleProcessTimeline(msgId: string) {
+  if (openProcessTimelineIds.value.has(msgId)) {
+    openProcessTimelineIds.value.delete(msgId);
+    return;
+  }
+  openProcessTimelineIds.value.add(msgId);
+  await nextTick();
+  ensureElementVisibleInStream(document.getElementById(`process-timeline-${msgId}`));
+}
+
+function toggleLiveProcessTimeline() {
+  isLiveProcessTimelineOpen.value = !isLiveProcessTimelineOpen.value;
+}
+
+function getLiveTimelineBadgeLabel(steps: ProcessStep[]): string {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i].status === "running") {
+      return `Exécution en cours : ${steps[i].tool}`;
+    }
+  }
+  if (steps.length > 0) {
+    return `Exécution en cours : ${steps[steps.length - 1].tool}`;
+  }
+  return "Exécution en cours : analyse";
+}
+
+function isStepDetailOpen(msgId: string, stepId: string): boolean {
+  return openStepDetailIds.value.has(`${msgId}::${stepId}`);
+}
+
+function toggleStepDetail(msgId: string, stepId: string) {
+  const key = `${msgId}::${stepId}`;
+  if (openStepDetailIds.value.has(key)) {
+    openStepDetailIds.value.delete(key);
+  } else {
+    openStepDetailIds.value.add(key);
+  }
+}
+
+function getMessageProcessSteps(msg: ChatMessage): ProcessStep[] {
+  if (msg.processSteps && msg.processSteps.length > 0) {
+    return msg.processSteps;
+  }
+  if (msg.thinking && msg.thinking.includes("### Contrôles & Outils exécutés en local")) {
+    const lines = msg.thinking.split("\n");
+    const steps: ProcessStep[] = [];
+    let inTools = false;
+    let idx = 1;
+    for (const l of lines) {
+      if (l.startsWith("### Contrôles & Outils exécutés en local")) {
+        inTools = true;
+        continue;
+      }
+      if (inTools && l.startsWith("### ")) {
+        break;
+      }
+      if (inTools && l.trim().startsWith("• 🛠️")) {
+        const text = l.replace("• 🛠️", "").trim();
+        const isErr = text.toLowerCase().includes("erreur") || text.toLowerCase().includes("échec");
+        steps.push({
+          id: `legacy-${idx++}`,
+          tool: text.startsWith("`") ? "run_command" : "tool",
+          title: text.length > 80 ? text.slice(0, 80) + "..." : text,
+          status: isErr ? "error" : "success",
+          detail: text,
+        });
+      }
+    }
+    if (steps.length > 0) return steps;
+  }
+  return [];
+}
+
+function countProcessSuccess(steps: ProcessStep[]): number {
+  return steps.filter((s) => s.status === "success").length;
+}
+
+function countProcessError(steps: ProcessStep[]): number {
+  return steps.filter((s) => s.status === "error").length;
+}
+
+function hasProcessError(steps: ProcessStep[]): boolean {
+  return steps.some((s) => s.status === "error");
+}
+
+function formatProcessSubtitle(steps: ProcessStep[]): string {
+  const fileSteps = steps.filter((s) =>
+    ["write_file", "create_file", "edit_file", "patch_file", "delete_file"].includes(s.tool)
+  ).length;
+  const cmdSteps = steps.filter((s) =>
+    ["run_command", "bash", "shell", "exec", "execute_command"].includes(s.tool)
+  ).length;
+  const otherSteps = steps.length - fileSteps - cmdSteps;
+
+  const parts: string[] = [];
+  if (fileSteps > 0) parts.push(`${fileSteps} fichier${fileSteps > 1 ? "s" : ""} modifié${fileSteps > 1 ? "s" : ""}`);
+  if (cmdSteps > 0) parts.push(`${cmdSteps} commande${cmdSteps > 1 ? "s" : ""} shell`);
+  if (otherSteps > 0) parts.push(`${otherSteps} autre${otherSteps > 1 ? "s" : ""} action${otherSteps > 1 ? "s" : ""}`);
+
+  return parts.length > 0 ? parts.join(" · ") : `${steps.length} action${steps.length > 1 ? "s" : ""}`;
+}
+
+function getProcessTotalDuration(steps: ProcessStep[]): string | null {
+  const totalMs = steps.reduce((acc, s) => acc + (s.durationMs || 0), 0);
+  if (totalMs <= 0) return null;
+  return formatStepDuration(totalMs);
+}
+
+function formatStepDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function getProcessToolCategory(tool: string): "terminal" | "create" | "edit" | "search" | "mcp" | "file" {
+  if (["run_command", "bash", "shell", "exec", "execute_command"].includes(tool)) return "terminal";
+  if (["write_file", "create_file"].includes(tool)) return "create";
+  if (["edit_file", "patch_file"].includes(tool)) return "edit";
+  if (["search_code", "search_web", "web_search"].includes(tool)) return "search";
+  if (tool.startsWith("mcp") || tool.includes("::")) return "mcp";
+  return "file";
+}
 
 // Slash commands system (/)
 interface SlashCommandItem {
@@ -931,32 +1062,52 @@ function guessFilename(lang: string, body: string, explicitHint?: string): strin
   }
 
   const cleanLang = (lang || "").toLowerCase().trim();
-  const extMap: Record<string, string> = {
-    vue: "Component.vue",
-    ts: "script.ts",
-    typescript: "script.ts",
-    js: "script.js",
-    javascript: "script.js",
-    rs: "main.rs",
-    rust: "main.rs",
-    py: "script.py",
-    python: "script.py",
-    html: "index.html",
-    css: "styles.css",
-    scss: "styles.scss",
-    sql: "query.sql",
-    json: "data.json",
-    yaml: "config.yaml",
-    yml: "config.yaml",
-    toml: "config.toml",
-    sh: "script.sh",
-    bash: "script.sh",
-    zsh: "script.sh",
-    md: "document.md",
-    markdown: "document.md",
+  const canonicalExtMap: Record<string, string> = {
+    vue: "vue",
+    svelte: "svelte",
+    ts: "ts",
+    typescript: "ts",
+    tsx: "tsx",
+    js: "js",
+    javascript: "js",
+    jsx: "jsx",
+    rs: "rs",
+    rust: "rs",
+    py: "py",
+    python: "py",
+    go: "go",
+    golang: "go",
+    java: "java",
+    c: "c",
+    cpp: "cpp",
+    cs: "cs",
+    csharp: "cs",
+    php: "php",
+    rb: "rb",
+    ruby: "rb",
+    swift: "swift",
+    kt: "kt",
+    kotlin: "kt",
+    html: "html",
+    css: "css",
+    scss: "scss",
+    sass: "sass",
+    less: "less",
+    sql: "sql",
+    json: "json",
+    yaml: "yaml",
+    yml: "yaml",
+    toml: "toml",
+    xml: "xml",
+    sh: "sh",
+    bash: "sh",
+    zsh: "sh",
+    md: "md",
+    markdown: "md",
   };
 
-  return extMap[cleanLang] || `code.${cleanLang || "txt"}`;
+  const ext = canonicalExtMap[cleanLang] || cleanLang || "txt";
+  return `snippet.${ext}`;
 }
 
 const HLJS_LANG_ALIASES: Record<string, string> = {
@@ -1102,16 +1253,275 @@ function extractPrecedingPathHint(proseLines: string[]): string | undefined {
   return undefined;
 }
 
-function sanitizeLiveContent(raw: string): string {
+const KNOWN_TOOL_NAMES = new Set([
+  "read_file",
+  "read",
+  "view_file",
+  "write_file",
+  "create_file",
+  "write",
+  "edit_file",
+  "patch_file",
+  "replace_in_file",
+  "delete_file",
+  "remove_file",
+  "run_command",
+  "bash",
+  "shell",
+  "exec",
+  "execute_command",
+  "terminal",
+  "search_code",
+  "grep",
+  "ripgrep",
+  "list_files",
+  "ls",
+  "web_search",
+  "search_web",
+  "fetch_url",
+  "read_url",
+  "mcp_call",
+]);
+
+function isKnownToolName(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  return KNOWN_TOOL_NAMES.has(lower) || lower.startsWith("mcp_") || lower.startsWith("mcp:");
+}
+
+function isKnownToolNamePrefix(partial: string): boolean {
+  const lower = partial.trim().toLowerCase();
+  if (!lower) return true;
+  if ("mcp_".startsWith(lower) || "mcp:".startsWith(lower) || lower.startsWith("mcp_") || lower.startsWith("mcp:")) {
+    return true;
+  }
+  for (const name of KNOWN_TOOL_NAMES) {
+    if (name.startsWith(lower)) return true;
+  }
+  return false;
+}
+
+function isToolCallJsonObject(text: string, allowIncomplete = false): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+
+  if (/"tool_calls"\s*:\s*\[/.test(trimmed)) return true;
+  if (/"function"\s*:\s*\{\s*"name"\s*:/.test(trimmed)) return true;
+
+  // Clés de payload d'outil pouvant apparaître AVANT `"name"` (ordre de clés variable selon les modèles)
+  if (/^\[?\s*\{\s*"(?:arguments|parameters|args|tool_calls|function|tool_name)"\s*:/.test(trimmed)) {
+    return true;
+  }
+
+  const toolNameMatch = /"tool_name"\s*:\s*"([^"]+)"/.exec(trimmed);
+  if (toolNameMatch && (isKnownToolName(toolNameMatch[1]) || /"(?:arguments|parameters|args|input)"\s*:/.test(trimmed))) {
+    return true;
+  }
+
+  const nameMatch = /"(?:name|tool)"\s*:\s*"([^"]+)"/.exec(trimmed);
+  if (nameMatch) {
+    const isKnown = isKnownToolName(nameMatch[1]);
+    const hasArgs = /"(?:arguments|parameters|args|input)"\s*:/.test(trimmed);
+    if (isKnown && (hasArgs || allowIncomplete)) return true;
+    if (hasArgs && !/"version"\s*:/.test(trimmed) && !/"dependencies"\s*:/.test(trimmed)) {
+      return true;
+    }
+  }
+
+  if (allowIncomplete) {
+    // 1. Tout début du JSON avant même que le nom de l'outil soit complet
+    if (
+      trimmed.length <= 28 &&
+      /^\[?\s*\{\s*(?:"(?:n|na|nam|name|t|to|too|tool|tool_n|tool_na|tool_nam|tool_name|tool_c|tool_ca|tool_cal|tool_call|tool_calls|a|ar|arg|args|argu|argum|argume|argumen|argument|arguments|p|pa|par|para|param|parame|paramet|paramete|parameter|parameters|f|fu|fun|func|funct|functi|functio|function)?"?\s*:?\s*"?)?$/.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+    // 2. Nom d'outil en cours de frappe entre guillemets (ex: `{"name":"write_`, `{"name":"run_c`)
+    const partialNameMatch = /^\[?\s*\{\s*"(?:name|tool|tool_name)"\s*:\s*"([a-z_:-]*)$/i.exec(trimmed);
+    if (partialNameMatch && isKnownToolNamePrefix(partialNameMatch[1])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isToolCallCodeBlock(lang: string, body: string, isStreamingUnclosed = false): boolean {
+  const langLow = (lang || "").trim().toLowerCase();
+  if (langLow === "tool_call" || langLow === "json:tool_call" || langLow === "tool") {
+    return true;
+  }
+  if (langLow === "" || langLow === "json" || langLow === "text" || langLow === "txt") {
+    if (isStreamingUnclosed && body.trim() === "") return true;
+    return isToolCallJsonObject(body, isStreamingUnclosed);
+  }
+  return false;
+}
+
+function stripBareJsonToolCalls(raw: string, isStreaming = false): string {
+  if (!raw || (!raw.includes("{") && !raw.includes("["))) return raw;
+
+  let out = "";
+  let i = 0;
+  let inFence = false;
+  let fenceTicks = 0;
+
+  while (i < raw.length) {
+    const atLineStart = i === 0 || raw[i - 1] === "\n";
+    if (atLineStart) {
+      let j = i;
+      while (j < raw.length && (raw[j] === " " || raw[j] === "\t")) j++;
+      if (raw[j] === "`") {
+        let ticks = 0;
+        while (j + ticks < raw.length && raw[j + ticks] === "`") ticks++;
+        if (ticks >= 3) {
+          const lineEnd = raw.indexOf("\n", j + ticks);
+          const nextIdx = lineEnd === -1 ? raw.length : lineEnd + 1;
+          const restOfLine = raw.slice(j + ticks, lineEnd === -1 ? raw.length : lineEnd).trim();
+          if (!inFence && !restOfLine.includes("`")) {
+            inFence = true;
+            fenceTicks = ticks;
+          } else if (inFence && ticks >= fenceTicks && restOfLine === "") {
+            inFence = false;
+            fenceTicks = 0;
+          }
+          out += raw.slice(i, nextIdx);
+          i = nextIdx;
+          continue;
+        }
+      }
+    }
+
+    if (!inFence && (raw[i] === "{" || raw[i] === "[")) {
+      const prevCh = i > 0 ? raw[i - 1] : "\n";
+      if (prevCh === "\n" || prevCh === " " || prevCh === "\t" || prevCh === "\r") {
+        const openCh = raw[i];
+        const closeCh = openCh === "{" ? "}" : "]";
+        let depth = 0;
+        let inStr = false;
+        let escaped = false;
+        let endIdx = -1;
+
+        for (let k = i; k < raw.length; k++) {
+          const ch = raw[k];
+          if (inStr) {
+            if (escaped) {
+              escaped = false;
+            } else if (ch === "\\") {
+              escaped = true;
+            } else if (ch === "\"") {
+              inStr = false;
+            }
+          } else {
+            if (ch === "\"") {
+              inStr = true;
+            } else if (ch === openCh) {
+              depth++;
+            } else if (ch === closeCh) {
+              depth--;
+              if (depth === 0) {
+                endIdx = k + 1;
+                break;
+              }
+            }
+          }
+        }
+
+        if (endIdx !== -1) {
+          const candidate = raw.slice(i, endIdx);
+          if (isToolCallJsonObject(candidate, false)) {
+            i = endIdx;
+            continue;
+          }
+        } else if (isStreaming) {
+          const candidate = raw.slice(i);
+          if (isToolCallJsonObject(candidate, true)) {
+            break;
+          }
+        }
+      }
+    }
+
+    out += raw[i];
+    i++;
+  }
+
+  return out;
+}
+
+function sanitizeMessageContent(raw: string, isStreaming = false): string {
   if (!raw) return "";
-  return raw
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+  let text = raw
+    .replace(/<tool_call(?:\s[^>]*)?>[\s\S]*?<\/tool_call>/g, "")
     .replace(/<tool_call(?:\s[^>]*)?>[\s\S]*$/g, "")
-    .replace(/<tool(?:_c(?:a(?:l(?:l)?)?)?)?$/g, "")
-    .replace(/^\s*```(?:json:)?tool_call\b[^\n]*\n[\s\S]*?^\s*```\s*$/gm, "")
-    .replace(/^\s*```(?:json:)?tool_call\b[^\n]*(?:\n[\s\S]*)?$/m, "")
+    .replace(/<function=[^>]+>[\s\S]*?<\/function>/g, "")
+    .replace(/<function=[^>]+>[\s\S]*$/g, "")
+    .replace(/\[TOOL_CALLS\]/g, "")
+    .replace(/\[Appel d'outils?(?:\s+natifs?)?\s*:[^\]]+\]/gi, "");
+
+  if (isStreaming) {
+    text = text
+      .replace(/<(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l(?:l)?)?)?)?)?)?)?)?|f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)$/i, "")
+      .replace(/\[T(?:O(?:O(?:L(?:_(?:C(?:A(?:L(?:L(?:S)?)?)?)?)?)?)?)?)?$/, "")
+      .replace(/\n\s*`{1,3}(?:j(?:s(?:o(?:n)?)?)?)?$/i, "");
+  }
+
+  // Filtrer les blocs Markdown clôturés ou ouverts en direct contenant des appels d'outils
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const filteredLines: string[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const openMatch = /^\s*(`{3,})(.*)$/.exec(lines[i]);
+    if (openMatch && !openMatch[2].includes("`")) {
+      const openTicks = openMatch[1].length;
+      const { lang } = parseFenceInfo(openMatch[2]);
+      const codeLines: string[] = [];
+      let closed = false;
+      const fenceStartIdx = i;
+      i++;
+
+      while (i < lines.length) {
+        const closeMatch = /^\s*(`{3,})\s*$/.exec(lines[i]);
+        if (closeMatch && closeMatch[1].length >= openTicks) {
+          closed = true;
+          i++;
+          break;
+        }
+        codeLines.push(lines[i]);
+        i++;
+      }
+
+      const body = codeLines.join("\n");
+      if (isToolCallCodeBlock(lang, body, isStreaming && !closed)) {
+        // Ignorer complètement ce bloc de code car c'est un appel d'outil
+        continue;
+      }
+
+      // Conserver le bloc de code normal
+      filteredLines.push(lines[fenceStartIdx]);
+      for (const cl of codeLines) {
+        filteredLines.push(cl);
+      }
+      if (closed) {
+        filteredLines.push("`".repeat(openTicks));
+      }
+      continue;
+    }
+
+    filteredLines.push(lines[i]);
+    i++;
+  }
+
+  const withoutFencedTools = filteredLines.join("\n");
+  return stripBareJsonToolCalls(withoutFencedTools, isStreaming)
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function sanitizeLiveContent(raw: string): string {
+  return sanitizeMessageContent(raw, true);
 }
 
 const markdownBlocksCache = new Map<string, MarkdownBlock[]>();
@@ -1119,12 +1529,14 @@ const MAX_MD_CACHE_ENTRIES = 400;
 
 function parseMarkdownMessage(content: string, isStreaming = false): MarkdownBlock[] {
   if (!content) return [];
-  if (!isStreaming && markdownBlocksCache.has(content)) {
-    return markdownBlocksCache.get(content)!;
+  const sanitized = sanitizeMessageContent(content, isStreaming);
+  if (!sanitized) return [];
+  if (!isStreaming && markdownBlocksCache.has(sanitized)) {
+    return markdownBlocksCache.get(sanitized)!;
   }
 
   const blocks: MarkdownBlock[] = [];
-  const normalized = (content || "").replace(/\r\n/g, "\n");
+  const normalized = sanitized.replace(/\r\n/g, "\n");
   const lines = normalized.split("\n");
   let proseLines: string[] = [];
   let i = 0;
@@ -1167,6 +1579,9 @@ function parseMarkdownMessage(content: string, isStreaming = false): MarkdownBlo
       }
 
       const body = codeLines.join("\n");
+      if (isToolCallCodeBlock(lang, body, isStreaming && !closed)) {
+        continue;
+      }
       const filename = guessFilename(lang, body, precedingHint);
       blocks.push({
         kind: "code",
@@ -1194,6 +1609,10 @@ function parseMarkdownMessage(content: string, isStreaming = false): MarkdownBlo
 
   return blocks;
 }
+
+const liveContentBlocks = computed<MarkdownBlock[]>(() =>
+  parseMarkdownMessage(sanitizeLiveContent(store.liveContent), true)
+);
 
 function formatRelativeTime(dateString: string): string {
   const ts = new Date(dateString).getTime();
@@ -1866,6 +2285,9 @@ async function copyCodeBlock(key: string, code: string) {
               msg.agentTrace?.length,
               msg.turnDiffs?.length,
               msg.filesSummary?.length,
+              msg.processSteps?.length,
+              openProcessTimelineIds.has(msg.id),
+              openStepDetailIds.size,
               openThinkingIds.has(msg.id),
               openFilesDropdown[msg.id],
               expandedQuestionIds.has(msg.id),
@@ -2209,6 +2631,122 @@ async function copyCodeBlock(key: string, code: string) {
                       />
                     </p>
                   </template>
+                </div>
+              </div>
+            </div>
+
+            <!-- Process Timeline Dropdown -->
+            <div
+              v-if="getMessageProcessSteps(msg).length > 0"
+              :id="'process-timeline-' + msg.id"
+              class="process-timeline-block halo-hud"
+              :class="{ 'is-collapsed': !isProcessTimelineOpen(msg.id) }"
+            >
+              <button
+                type="button"
+                class="process-timeline-header"
+                :title="isProcessTimelineOpen(msg.id) ? 'Replier la timeline des actions' : 'Déplier la timeline des actions'"
+                @click="toggleProcessTimeline(msg.id)"
+              >
+                <div class="timeline-header-left">
+                  <div
+                    class="timeline-status-icon-wrap"
+                    :class="hasProcessError(getMessageProcessSteps(msg)) ? 'has-error' : 'is-success'"
+                  >
+                    <svg class="timeline-bolt-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                    </svg>
+                  </div>
+                  <div class="timeline-header-info">
+                    <div class="timeline-title-row">
+                      <span class="timeline-main-title">Process Timeline</span>
+                      <span class="timeline-steps-badge">
+                        {{ getMessageProcessSteps(msg).length }} action{{ getMessageProcessSteps(msg).length > 1 ? 's' : '' }}
+                      </span>
+                    </div>
+                    <div class="timeline-sub-title">
+                      {{ formatProcessSubtitle(getMessageProcessSteps(msg)) }}
+                    </div>
+                  </div>
+                </div>
+
+                <div class="timeline-header-right">
+                  <span class="timeline-stat-tag is-success" title="Actions réussies">
+                    <svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    {{ countProcessSuccess(getMessageProcessSteps(msg)) }}
+                  </span>
+                  <span
+                    v-if="countProcessError(getMessageProcessSteps(msg)) > 0"
+                    class="timeline-stat-tag is-error"
+                    title="Actions en échec"
+                  >
+                    <svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    {{ countProcessError(getMessageProcessSteps(msg)) }}
+                  </span>
+                  <span v-if="getProcessTotalDuration(getMessageProcessSteps(msg))" class="timeline-stat-duration">
+                    {{ getProcessTotalDuration(getMessageProcessSteps(msg)) }}
+                  </span>
+                  <svg
+                    class="timeline-chevron-icon"
+                    :class="{ rotated: isProcessTimelineOpen(msg.id) }"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </div>
+              </button>
+
+              <!-- Corps déroulant de la timeline -->
+              <div v-if="isProcessTimelineOpen(msg.id)" class="process-timeline-body custom-scroll">
+                <div class="timeline-track-rail" />
+                <div
+                  v-for="(step, sIdx) in getMessageProcessSteps(msg)"
+                  :key="step.id || sIdx"
+                  class="timeline-step-row"
+                >
+                  <!-- Puce de statut -->
+                  <div class="timeline-step-bullet" :class="`is-${step.status}`">
+                    <span v-if="step.status === 'running'" class="pulse-dot" />
+                    <svg v-else-if="step.status === 'success'" class="bullet-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    <svg v-else class="bullet-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </div>
+
+                  <!-- Carte de l'étape -->
+                  <div class="timeline-step-card" :class="`is-${step.status}`">
+                    <div class="step-card-header">
+                      <div class="step-card-left">
+                        <span class="step-tool-badge" :class="`is-${getProcessToolCategory(step.tool)}`">
+                          <svg v-if="getProcessToolCategory(step.tool) === 'terminal'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                          <svg v-else-if="getProcessToolCategory(step.tool) === 'create' || getProcessToolCategory(step.tool) === 'file'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                          <svg v-else-if="getProcessToolCategory(step.tool) === 'edit'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                          <svg v-else-if="getProcessToolCategory(step.tool) === 'search'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                          <svg v-else class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>
+                          {{ step.tool }}
+                        </span>
+                        <span class="step-card-title font-code" :title="step.title">{{ step.title }}</span>
+                        <span v-if="step.status === 'error'" class="step-error-tag">Échec</span>
+                      </div>
+                      <div class="step-card-right">
+                        <span v-if="step.durationMs" class="step-duration font-code">+{{ formatStepDuration(step.durationMs) }}</span>
+                        <button
+                          v-if="step.detail"
+                          type="button"
+                          class="step-log-btn"
+                          @click="toggleStepDetail(msg.id, step.id)"
+                        >
+                          <span>{{ isStepDetailOpen(msg.id, step.id) ? 'Masquer log' : 'Détail log' }}</span>
+                          <svg class="log-chevron" :class="{ rotated: isStepDetailOpen(msg.id, step.id) }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                    <!-- Détail / Log repliable de l'étape -->
+                    <div v-if="step.detail && isStepDetailOpen(msg.id, step.id)" class="step-log-panel custom-scroll">
+                      <pre class="step-log-pre font-code">{{ step.detail }}</pre>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2722,10 +3260,130 @@ async function copyCodeBlock(key: string, code: string) {
               </div>
             </div>
 
+            <!-- Live Process Timeline Dropdown -->
+            <div
+              v-if="store.liveProcessSteps.length > 0"
+              class="process-timeline-block is-live halo-hud"
+              :class="{ 'is-collapsed': !isLiveProcessTimelineOpen }"
+            >
+              <button
+                type="button"
+                class="process-timeline-header"
+                :title="isLiveProcessTimelineOpen ? 'Replier la timeline' : 'Déplier la timeline'"
+                @click="toggleLiveProcessTimeline()"
+              >
+                <div class="timeline-header-left">
+                  <div
+                    class="timeline-status-icon-wrap"
+                    :class="hasProcessError(store.liveProcessSteps) ? 'has-error' : 'is-running'"
+                  >
+                    <svg class="timeline-bolt-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                    </svg>
+                  </div>
+                  <div class="timeline-header-info">
+                    <div class="timeline-title-row">
+                      <span class="timeline-main-title">Process Timeline</span>
+                      <span class="timeline-steps-badge">
+                        {{ store.liveProcessSteps.length }} action{{ store.liveProcessSteps.length > 1 ? 's' : '' }}
+                      </span>
+                      <span class="timeline-live-tag">
+                        <span class="pulse-dot" />
+                        {{ getLiveTimelineBadgeLabel(store.liveProcessSteps) }}
+                      </span>
+                    </div>
+                    <div class="timeline-sub-title">
+                      {{ formatProcessSubtitle(store.liveProcessSteps) }}
+                    </div>
+                  </div>
+                </div>
+
+                <div class="timeline-header-right">
+                  <span class="timeline-stat-tag is-success" title="Actions réussies">
+                    <svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    {{ countProcessSuccess(store.liveProcessSteps) }}
+                  </span>
+                  <span
+                    v-if="countProcessError(store.liveProcessSteps) > 0"
+                    class="timeline-stat-tag is-error"
+                    title="Actions en échec"
+                  >
+                    <svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    {{ countProcessError(store.liveProcessSteps) }}
+                  </span>
+                  <span v-if="getProcessTotalDuration(store.liveProcessSteps)" class="timeline-stat-duration">
+                    {{ getProcessTotalDuration(store.liveProcessSteps) }}
+                  </span>
+                  <svg
+                    class="timeline-chevron-icon"
+                    :class="{ rotated: isLiveProcessTimelineOpen }"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </div>
+              </button>
+
+              <!-- Corps déroulant de la timeline en direct -->
+              <div v-if="isLiveProcessTimelineOpen" class="process-timeline-body custom-scroll">
+                <div class="timeline-track-rail" />
+                <div
+                  v-for="(step, sIdx) in store.liveProcessSteps"
+                  :key="'live-' + (step.id || sIdx)"
+                  class="timeline-step-row"
+                >
+                  <!-- Puce de statut -->
+                  <div class="timeline-step-bullet" :class="`is-${step.status}`">
+                    <span v-if="step.status === 'running'" class="pulse-dot" />
+                    <svg v-else-if="step.status === 'success'" class="bullet-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                    <svg v-else class="bullet-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                  </div>
+
+                  <!-- Carte de l'étape -->
+                  <div class="timeline-step-card" :class="`is-${step.status}`">
+                    <div class="step-card-header">
+                      <div class="step-card-left">
+                        <span class="step-tool-badge" :class="`is-${getProcessToolCategory(step.tool)}`">
+                          <svg v-if="getProcessToolCategory(step.tool) === 'terminal'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                          <svg v-else-if="getProcessToolCategory(step.tool) === 'create' || getProcessToolCategory(step.tool) === 'file'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                          <svg v-else-if="getProcessToolCategory(step.tool) === 'edit'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                          <svg v-else-if="getProcessToolCategory(step.tool) === 'search'" class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                          <svg v-else class="tool-mini-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>
+                          {{ step.tool }}
+                        </span>
+                        <span class="step-card-title font-code" :title="step.title">{{ step.title }}</span>
+                        <span v-if="step.status === 'error'" class="step-error-tag">Échec</span>
+                        <span v-else-if="step.status === 'running'" class="step-running-tag">En cours...</span>
+                      </div>
+                      <div class="step-card-right">
+                        <span v-if="step.durationMs" class="step-duration font-code">+{{ formatStepDuration(step.durationMs) }}</span>
+                        <button
+                          v-if="step.detail"
+                          type="button"
+                          class="step-log-btn"
+                          @click="toggleStepDetail('live', step.id)"
+                        >
+                          <span>{{ isStepDetailOpen('live', step.id) ? 'Masquer log' : 'Détail log' }}</span>
+                          <svg class="log-chevron" :class="{ rotated: isStepDetailOpen('live', step.id) }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                    <!-- Détail / Log repliable de l'étape -->
+                    <div v-if="step.detail && isStepDetailOpen('live', step.id)" class="step-log-panel custom-scroll">
+                      <pre class="step-log-pre font-code">{{ step.detail }}</pre>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- Live Content streaming right after thinking -->
-            <div v-if="sanitizeLiveContent(store.liveContent)" class="md-content live-content">
+            <div v-if="liveContentBlocks.length > 0" class="md-content live-content">
               <template
-                v-for="(block, bIdx) in parseMarkdownMessage(sanitizeLiveContent(store.liveContent), true)"
+                v-for="(block, bIdx) in liveContentBlocks"
                 :key="bIdx"
               >
                 <h1 v-if="block.kind === 'heading' && block.level === 1" class="md-h1">
@@ -5609,5 +6267,411 @@ async function copyCodeBlock(key: string, code: string) {
 .tool-approval-btn.is-approve:hover {
   opacity: 0.92;
   transform: translateY(-1px);
+}
+
+/* --- PROCESS TIMELINE DROPDOWN --- */
+.process-timeline-block {
+  margin: 10px 0 14px 0;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  overflow: hidden;
+  transition: all 0.2s ease;
+}
+
+.process-timeline-block.is-live {
+  border-color: rgba(245, 158, 11, 0.4);
+  box-shadow: 0 0 16px rgba(245, 158, 11, 0.1);
+}
+
+.process-timeline-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s ease;
+}
+
+.process-timeline-header:hover {
+  background: var(--hover-bg);
+}
+
+.timeline-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.timeline-status-icon-wrap {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.timeline-status-icon-wrap.is-success {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.timeline-status-icon-wrap.has-error {
+  background: rgba(244, 63, 94, 0.15);
+  color: #fb7185;
+  border: 1px solid rgba(244, 63, 94, 0.35);
+}
+
+.timeline-status-icon-wrap.is-running {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.timeline-bolt-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.timeline-header-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.timeline-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.timeline-main-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+  letter-spacing: 0.01em;
+}
+
+.timeline-steps-badge {
+  font-size: 10px;
+  font-family: var(--font-code);
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--hover-bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border-subtle);
+}
+
+.timeline-live-tag {
+  font-size: 10px;
+  font-weight: 500;
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 9999px;
+  padding: 1px 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.timeline-sub-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.timeline-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.timeline-stat-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-family: var(--font-code);
+}
+
+.timeline-stat-tag.is-success {
+  color: #34d399;
+}
+
+.timeline-stat-tag.is-error {
+  color: #fb7185;
+}
+
+.timeline-stat-duration {
+  font-size: 11px;
+  font-family: var(--font-code);
+  color: var(--text-muted);
+  border-left: 1px solid var(--border-subtle);
+  padding-left: 8px;
+}
+
+.timeline-chevron-icon {
+  width: 15px;
+  height: 15px;
+  color: var(--text-muted);
+  transition: transform 0.2s ease;
+}
+
+.timeline-chevron-icon.rotated {
+  transform: rotate(180deg);
+}
+
+.process-timeline-body {
+  padding: 10px 14px 12px 14px;
+  position: relative;
+  max-height: 380px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.timeline-track-rail {
+  position: absolute;
+  left: 25px;
+  top: 18px;
+  bottom: 18px;
+  width: 2px;
+  background: var(--border-subtle);
+  pointer-events: none;
+}
+
+.timeline-step-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 8px;
+  z-index: 1;
+}
+
+.timeline-step-row:last-child {
+  margin-bottom: 0;
+}
+
+.timeline-step-bullet {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
+.timeline-step-bullet.is-success {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.45);
+  color: #34d399;
+}
+
+.timeline-step-bullet.is-error {
+  background: rgba(244, 63, 94, 0.15);
+  border: 1px solid rgba(244, 63, 94, 0.45);
+  color: #fb7185;
+}
+
+.timeline-step-bullet.is-running {
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+}
+
+.bullet-icon {
+  width: 12px;
+  height: 12px;
+}
+
+.timeline-step-card {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--hover-bg);
+  padding: 6px 9px;
+  transition: all 0.15s ease;
+}
+
+.timeline-step-card.is-error {
+  border-color: rgba(244, 63, 94, 0.35);
+  background: rgba(244, 63, 94, 0.05);
+}
+
+.timeline-step-card.is-running {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.05);
+}
+
+.step-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.step-card-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.step-tool-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-family: var(--font-code);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.step-tool-badge.is-terminal {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.step-tool-badge.is-create {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.step-tool-badge.is-edit {
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.step-tool-badge.is-search {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.step-tool-badge.is-mcp {
+  background: rgba(236, 72, 153, 0.15);
+  color: #f472b6;
+  border: 1px solid rgba(236, 72, 153, 0.3);
+}
+
+.step-tool-badge.is-file {
+  background: rgba(148, 163, 184, 0.15);
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.tool-mini-icon {
+  width: 11px;
+  height: 11px;
+}
+
+.step-card-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-error-tag {
+  font-size: 9px;
+  font-family: var(--font-code);
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(244, 63, 94, 0.2);
+  color: #fb7185;
+  border: 1px solid rgba(244, 63, 94, 0.35);
+}
+
+.step-running-tag {
+  font-size: 10px;
+  color: #fbbf24;
+}
+
+.step-card-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.step-duration {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.step-log-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.step-log-btn:hover {
+  background: var(--hover-bg);
+  color: var(--text-main);
+}
+
+.log-chevron {
+  width: 10px;
+  height: 10px;
+  transition: transform 0.2s ease;
+}
+
+.log-chevron.rotated {
+  transform: rotate(180deg);
+}
+
+.step-log-panel {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-subtle);
+  max-height: 160px;
+  overflow: auto;
+}
+
+.step-log-pre {
+  margin: 0;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-muted);
+  line-height: 1.4;
 }
 </style>

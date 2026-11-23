@@ -1120,7 +1120,9 @@ onBeforeUnmount(() => {
       #ff0055 100%
     )
       border-box !important;
-  animation: rotateRainbow 2.2s linear infinite;
+  animation: vaixRotateRainbow 2.2s linear infinite;
+  transform: translateZ(0);
+  will-change: background, box-shadow;
   box-shadow: 0 0 24px -2px rgba(168, 85, 247, 0.4), 0 0 12px 0 rgba(56, 189, 248, 0.25) !important;
 }
 

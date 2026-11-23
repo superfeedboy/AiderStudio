@@ -33,6 +33,613 @@ pub struct ApplyEditsOutcome {
     pub results: Vec<ToolExecutionResult>,
 }
 
+/// Normalise les alias de noms d'outils émis par différents modèles locaux ou cloud.
+pub fn normalize_tool_name(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "read_file" | "read" | "view_file" => Some("read_file"),
+        "write_file" | "create_file" | "write" => Some("write_file"),
+        "edit_file" | "patch_file" | "replace_in_file" => Some("edit_file"),
+        "delete_file" | "remove_file" => Some("delete_file"),
+        "run_command" | "bash" | "shell" | "exec" | "execute_command" | "terminal" => {
+            Some("run_command")
+        }
+        "search_code" | "grep" | "ripgrep" => Some("search_code"),
+        "list_files" | "ls" => Some("list_files"),
+        "web_search" | "search_web" => Some("web_search"),
+        "fetch_url" | "read_url" => Some("fetch_url"),
+        "mcp_call" => Some("mcp_call"),
+        _ => None,
+    }
+}
+
+/// Normalise les alias de clés d'arguments d'outils (ex. `cmd` -> `command`, `file_path` -> `path`).
+pub fn normalize_tool_arguments(
+    canonical_name: &str,
+    raw_args: serde_json::Value,
+) -> serde_json::Value {
+    let resolved = match raw_args {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                parsed
+            } else {
+                match canonical_name {
+                    "run_command" => serde_json::json!({ "command": trimmed }),
+                    "web_search" => serde_json::json!({ "query": trimmed }),
+                    "fetch_url" => serde_json::json!({ "url": trimmed }),
+                    "read_file" | "delete_file" => serde_json::json!({ "path": trimmed }),
+                    _ => serde_json::json!({}),
+                }
+            }
+        }
+        other => other,
+    };
+
+    let serde_json::Value::Object(mut map) = resolved else {
+        return serde_json::json!({});
+    };
+
+    match canonical_name {
+        "run_command" => {
+            let has_cmd = map
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_cmd {
+                let mut found_cmd: Option<String> = None;
+                for alias in ["command", "cmd", "script", "shell", "command_line", "commandLine"] {
+                    if let Some(val) = map.get(alias) {
+                        if let Some(s) = val.as_str() {
+                            if !s.trim().is_empty() {
+                                found_cmd = Some(s.trim().to_string());
+                                break;
+                            }
+                        } else if let Some(arr) = val.as_array() {
+                            let joined: Vec<String> = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(str::trim))
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            if !joined.is_empty() {
+                                found_cmd = Some(joined.join(" "));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = found_cmd {
+                    map.insert("command".to_string(), serde_json::Value::String(c));
+                }
+            }
+        }
+        "read_file" | "write_file" | "edit_file" | "delete_file" => {
+            let has_path = map
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_path {
+                for alias in ["file_path", "filePath", "file", "filename", "target", "target_file"] {
+                    if let Some(s) = map.get(alias).and_then(|v| v.as_str()) {
+                        if !s.trim().is_empty() {
+                            map.insert(
+                                "path".to_string(),
+                                serde_json::Value::String(s.trim().to_string()),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            if canonical_name == "write_file" && !map.contains_key("content") {
+                for alias in ["text", "code", "body", "contents", "file_content", "new_content"] {
+                    if let Some(s) = map.get(alias).and_then(|v| v.as_str()) {
+                        map.insert(
+                            "content".to_string(),
+                            serde_json::Value::String(s.to_string()),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        "web_search" => {
+            if !map.contains_key("query") {
+                for alias in ["q", "search", "keywords"] {
+                    if let Some(s) = map.get(alias).and_then(|v| v.as_str()) {
+                        map.insert(
+                            "query".to_string(),
+                            serde_json::Value::String(s.to_string()),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        "search_code" => {
+            if !map.contains_key("query") {
+                for alias in ["pattern", "regex", "search", "text"] {
+                    if let Some(s) = map.get(alias).and_then(|v| v.as_str()) {
+                        map.insert(
+                            "query".to_string(),
+                            serde_json::Value::String(s.to_string()),
+                        );
+                        break;
+                    }
+                }
+            }
+            if !map.contains_key("path_filter") {
+                for alias in ["path", "dir", "directory"] {
+                    if let Some(s) = map.get(alias).and_then(|v| v.as_str()) {
+                        map.insert(
+                            "path_filter".to_string(),
+                            serde_json::Value::String(s.to_string()),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    serde_json::Value::Object(map)
+}
+
+/// Extrait zéro, un ou plusieurs appels d'outils normalisés à partir d'une valeur JSON.
+pub fn parse_json_tool_call_value(val: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                out.extend(parse_json_tool_call_value(item));
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(arr) = map
+                .get("tool_calls")
+                .or_else(|| map.get("calls"))
+                .and_then(|v| v.as_array())
+            {
+                for item in arr {
+                    out.extend(parse_json_tool_call_value(item));
+                }
+                if !out.is_empty() {
+                    return out;
+                }
+            }
+
+            if let Some(fn_obj) = map.get("function").and_then(|v| v.as_object()) {
+                if let Some(raw_name) = fn_obj.get("name").and_then(|v| v.as_str()) {
+                    if let Some(canon) = normalize_tool_name(raw_name) {
+                        let raw_args = fn_obj
+                            .get("arguments")
+                            .or_else(|| fn_obj.get("parameters"))
+                            .or_else(|| fn_obj.get("args"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        out.push((canon.to_string(), normalize_tool_arguments(canon, raw_args)));
+                        return out;
+                    }
+                }
+            }
+
+            let raw_name_opt = map
+                .get("name")
+                .or_else(|| map.get("tool"))
+                .or_else(|| map.get("tool_name"))
+                .or_else(|| map.get("action"))
+                .and_then(|v| v.as_str());
+
+            if let Some(raw_name) = raw_name_opt {
+                if let Some(canon) = normalize_tool_name(raw_name) {
+                    if canon == "mcp_call"
+                        && map.contains_key("server")
+                        && map.contains_key("tool")
+                    {
+                        let inner_args = map
+                            .get("arguments")
+                            .or_else(|| map.get("parameters"))
+                            .or_else(|| map.get("args"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        out.push((
+                            "mcp_call".to_string(),
+                            serde_json::json!({
+                                "server": map.get("server").cloned().unwrap_or_else(|| serde_json::json!("")),
+                                "tool": map.get("tool").cloned().unwrap_or_else(|| serde_json::json!("")),
+                                "arguments": inner_args
+                            }),
+                        ));
+                        return out;
+                    }
+
+                    let raw_args = if let Some(explicit) = map
+                        .get("arguments")
+                        .or_else(|| map.get("parameters"))
+                        .or_else(|| map.get("args"))
+                        .or_else(|| map.get("input"))
+                    {
+                        explicit.clone()
+                    } else {
+                        let mut flat = map.clone();
+                        flat.remove("name");
+                        flat.remove("tool");
+                        flat.remove("tool_name");
+                        flat.remove("action");
+                        flat.remove("type");
+                        flat.remove("id");
+                        serde_json::Value::Object(flat)
+                    };
+                    out.push((canon.to_string(), normalize_tool_arguments(canon, raw_args)));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Échappe les caractères de contrôle bruts (`\n`, `\r`, `\t`, etc.) à l'intérieur des littéraux de chaîne JSON.
+pub fn escape_raw_control_chars_in_json_strings(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for c in raw.chars() {
+        if !in_string {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+            continue;
+        }
+
+        if escaped {
+            if (c as u32) < 0x20 {
+                match c {
+                    '\r' => {
+                        // Conserve `escaped = true` pour absorber un éventuel `\n` (CRLF) après `\`
+                        continue;
+                    }
+                    '\n' => {
+                        out.push('n');
+                    }
+                    '\t' => {
+                        out.push('t');
+                    }
+                    _ => {
+                        // Remplace un caractère de contrôle inattendu après `\` par un échappement neutre
+                        out.push('\\');
+                    }
+                }
+                escaped = false;
+            } else {
+                out.push(c);
+                escaped = false;
+            }
+            continue;
+        }
+
+        match c {
+            '\\' => {
+                escaped = true;
+                out.push('\\');
+            }
+            '"' => {
+                in_string = false;
+                out.push('"');
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {}
+            _ => out.push(c),
+        }
+    }
+
+    out
+}
+
+/// Supprime les virgules finales (`trailing commas`) avant `}` ou `]` hors chaînes JSON.
+pub fn remove_json_trailing_commas(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let chars: Vec<char> = raw.chars().collect();
+    let len = chars.len();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+
+    while i < len {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        if c == ',' {
+            let mut j = i + 1;
+            while j < len && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < len && (chars[j] == '}' || chars[j] == ']') {
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    out
+}
+
+fn strip_outer_markdown_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed;
+    }
+    let Some(first_nl) = trimmed.find('\n') else {
+        return trimmed;
+    };
+    let body = &trimmed[first_nl + 1..];
+    if let Some(last_fence) = body.rfind("\n```") {
+        let after = body[last_fence + 4..].trim();
+        if after.is_empty() {
+            return body[..last_fence].trim();
+        }
+    }
+    if let Some(stripped) = body.strip_suffix("```") {
+        return stripped.trim();
+    }
+    trimmed
+}
+
+/// Répare automatiquement les erreurs courantes de syntaxe JSON (caractères de contrôle non échappés,
+/// virgules finales, balise Markdown englobante) puis valide via `serde_json` avant écriture sur disque.
+pub fn repair_and_validate_json_str(raw: &str) -> Result<String, String> {
+    let candidate = strip_outer_markdown_fence(raw);
+    if candidate.is_empty() {
+        return Err("Contenu JSON vide".to_string());
+    }
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+        return serde_json::to_string_pretty(&val)
+            .map(|s| format!("{s}\n"))
+            .map_err(|e| e.to_string());
+    }
+
+    // Remplace les retours ligne/tabulations bruts dans les chaînes par des séquences sûres + retire les virgules finales
+    let repaired = remove_json_trailing_commas(&escape_raw_control_chars_in_json_strings(candidate));
+    match serde_json::from_str::<serde_json::Value>(&repaired) {
+        Ok(val) => serde_json::to_string_pretty(&val)
+            .map(|s| format!("{s}\n"))
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Analyse un bloc brut (contenu d'une balise `<tool_call>` ou d'un bloc JSON) pour en extraire tous les appels d'outils.
+pub fn extract_json_tool_calls_from_block(raw: &str) -> Vec<(String, serde_json::Value)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let parsed = parse_json_tool_call_value(&val);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    let mut out = Vec::new();
+    let stream = serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+    for item in stream {
+        match item {
+            Ok(val) => out.extend(parse_json_tool_call_value(&val)),
+            Err(_) => break,
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // Repli déterministe si le LLM a laissé des retours ligne/tabulations bruts ou des virgules finales dans son JSON d'outil
+    let repaired = remove_json_trailing_commas(&escape_raw_control_chars_in_json_strings(trimmed));
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&repaired) {
+        let parsed = parse_json_tool_call_value(&val);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let repaired_stream =
+        serde_json::Deserializer::from_str(&repaired).into_iter::<serde_json::Value>();
+    for item in repaired_stream {
+        match item {
+            Ok(val) => out.extend(parse_json_tool_call_value(&val)),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Indique si un bloc Markdown clôturé correspond à un appel d'outil (et ne doit donc pas être affiché ni écrit comme un fichier).
+pub fn is_tool_call_fence(info: &str, body: &str) -> bool {
+    let info_low = info.trim().to_ascii_lowercase();
+    if matches!(info_low.as_str(), "tool_call" | "json:tool_call" | "tool") {
+        return true;
+    }
+    if !extract_json_tool_calls_from_block(body).is_empty() {
+        return true;
+    }
+
+    // Filet anti-fuite pour les blocs JSON d'appels d'outils tronqués/incomplets
+    let body_trim = body.trim();
+    if (body_trim.starts_with('{') || body_trim.starts_with('['))
+        && Regex::new(
+            r#"^\s*[\[{]\s*"(?:name|tool|tool_name|function)"\s*:\s*"(?:read_file|write_file|create_file|edit_file|delete_file|run_command|search_code|list_files|web_search|fetch_url|mcp_call|bash|shell|exec|execute_command|patch_file)""#,
+        )
+        .map(|re| re.is_match(body_trim))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    false
+}
+
+fn find_fenced_byte_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut pos = 0usize;
+    let mut in_fence: Option<(usize, usize)> = None;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let tick_count = trimmed.bytes().take_while(|&b| b == b'`').count();
+        if let Some((start_pos, open_ticks)) = in_fence {
+            let close_trim = line.trim();
+            let close_ticks = close_trim.bytes().take_while(|&b| b == b'`').count();
+            if close_ticks >= open_ticks && close_trim[close_ticks..].trim().is_empty() {
+                ranges.push((start_pos, pos + line.len()));
+                in_fence = None;
+            }
+        } else if tick_count >= 3 {
+            in_fence = Some((pos, tick_count));
+        }
+        pos += line.len();
+    }
+    if let Some((start_pos, _)) = in_fence {
+        ranges.push((start_pos, text.len()));
+    }
+    ranges
+}
+
+fn collect_bare_json_tool_spans(text: &str) -> Vec<(usize, usize, Vec<(String, serde_json::Value)>)> {
+    let fence_ranges = find_fenced_byte_ranges(text);
+    let mut spans = Vec::new();
+    let mut skip_until = 0usize;
+
+    let is_inside_fence = |idx: usize| -> bool {
+        fence_ranges.iter().any(|&(s, e)| idx >= s && idx < e)
+    };
+
+    for (idx, ch) in text.char_indices() {
+        if idx < skip_until || is_inside_fence(idx) {
+            continue;
+        }
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+
+        let prev_ok = if idx == 0 {
+            true
+        } else {
+            text[..idx]
+                .chars()
+                .next_back()
+                .map(|c| c.is_whitespace() || c == ':' || c == '>')
+                .unwrap_or(true)
+        };
+        if !prev_ok {
+            continue;
+        }
+
+        let open_ch = ch;
+        let close_ch = if open_ch == '{' { '}' } else { ']' };
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut end_idx: Option<usize> = None;
+
+        for (rel_off, c) in text[idx..].char_indices() {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else if c == '"' {
+                in_str = true;
+            } else if c == open_ch {
+                depth += 1;
+            } else if c == close_ch {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_idx = Some(idx + rel_off + c.len_utf8());
+                    break;
+                }
+            }
+        }
+
+        if let Some(end) = end_idx {
+            let slice = &text[idx..end];
+            let parsed_val = serde_json::from_str::<serde_json::Value>(slice).or_else(|_| {
+                let repaired = remove_json_trailing_commas(
+                    &escape_raw_control_chars_in_json_strings(slice),
+                );
+                serde_json::from_str::<serde_json::Value>(&repaired)
+            });
+            if let Ok(val) = parsed_val {
+                let calls = parse_json_tool_call_value(&val);
+                if !calls.is_empty() {
+                    spans.push((idx, end, calls));
+                    skip_until = end;
+                }
+            }
+        }
+    }
+
+    spans
+}
+
+/// Extrait les appels d'outils JSON nus présents en dehors des blocs de code clôturés.
+pub fn extract_bare_json_tool_calls(text: &str) -> Vec<(String, serde_json::Value)> {
+    collect_bare_json_tool_spans(text)
+        .into_iter()
+        .flat_map(|(_, _, calls)| calls)
+        .collect()
+}
+
+/// Supprime les objets/tableaux JSON d'appels d'outils nus présents hors des fences Markdown.
+pub fn strip_bare_json_tool_calls_from_prose(text: &str) -> String {
+    let spans = collect_bare_json_tool_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end, _) in spans {
+        if start >= cursor {
+            out.push_str(&text[cursor..start]);
+            cursor = end;
+        }
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    out
+}
+
 /// Nettoie et valide un chemin relatif au projet.
 /// Rejette tout chemin absolu, traversal `..`, URL, `.git/` ou `.env*`.
 pub fn sanitize_rel_path(raw: &str) -> Option<String> {
@@ -209,13 +816,161 @@ fn lang_matches_path(lang: &str, path: &str) -> bool {
         ("css" | "scss" | "sass" | "less", "css" | "scss" | "sass" | "less")
             | ("html" | "htm", "html" | "htm")
             | ("ts" | "typescript" | "tsx", "ts" | "tsx")
-            | ("js" | "javascript" | "jsx", "js" | "jsx")
+            | ("js" | "javascript" | "jsx" | "mjs" | "cjs", "js" | "jsx" | "mjs" | "cjs")
+            | ("vue", "vue")
+            | ("svelte", "svelte")
             | ("rs" | "rust", "rs")
             | ("py" | "python", "py")
-            | ("json" | "jsonc", "json")
+            | ("go" | "golang", "go")
+            | ("c" | "h", "c" | "h")
+            | ("cpp" | "cxx" | "cc" | "hpp", "cpp" | "cxx" | "cc" | "hpp")
+            | ("cs" | "csharp", "cs")
+            | ("java", "java")
+            | ("kt" | "kotlin" | "kts", "kt" | "kts")
+            | ("php", "php")
+            | ("rb" | "ruby", "rb")
+            | ("swift", "swift")
+            | ("zig", "zig")
+            | ("lua", "lua")
+            | ("dart", "dart")
+            | ("ex" | "exs" | "elixir", "ex" | "exs")
+            | ("sh" | "bash" | "zsh", "sh" | "bash" | "zsh")
+            | ("sql", "sql")
+            | ("json" | "jsonc", "json" | "jsonc")
+            | ("toml", "toml")
+            | ("xml" | "svg", "xml" | "svg")
             | ("yaml" | "yml", "yaml" | "yml")
             | ("md" | "markdown", "md")
     )
+}
+
+/// Indique si l'extension du fichier correspond à un actif binaire (image, police, archive, binaire compilé, base SQLite...)
+/// dans lequel aucun texte brut ou code Markdown ne doit être écrit.
+pub fn is_binary_or_non_text_path(path: &str) -> bool {
+    let ext = path
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "bmp"
+            | "tiff"
+            | "avif"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+            | "mp3"
+            | "mp4"
+            | "wav"
+            | "ogg"
+            | "webm"
+            | "mov"
+            | "avi"
+            | "pdf"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "tgz"
+            | "7z"
+            | "rar"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "bin"
+            | "dmg"
+            | "pkg"
+            | "sqlite"
+            | "sqlite3"
+            | "db"
+            | "wasm"
+            | "pyc"
+            | "class"
+            | "o"
+            | "a"
+    )
+}
+
+/// Vérifie si un chemin candidat extrait d'un en-tête ou de la prose ressemble à un vrai chemin relatif
+/// de code projet et non à une mention de bibliothèque/runtime (ex: `Vue.js`, `Node.js`, `FastAPI.py`, `Axum.rs`)
+/// ou à une chaîne de propriétés d'objet (ex: `build.rollupOptions.external`).
+fn is_plausible_code_path(path: &str) -> bool {
+    let clean = path.trim().replace('\\', "/");
+    let clean = clean.strip_prefix("./").unwrap_or(&clean);
+    if clean.is_empty() || is_binary_or_non_text_path(clean) {
+        return false;
+    }
+
+    // Tout chemin contenant un séparateur de sous-dossier (ex: `src/App.vue`, `lib/math.rs`, `pkg/api.go`)
+    // est un chemin de code légitime.
+    if clean.contains('/') {
+        return true;
+    }
+
+    // Fichiers manifestes ou scripts racine standards (sans extension ou avec syntaxe standard)
+    let low = clean.to_lowercase();
+    if matches!(
+        low.as_str(),
+        "makefile"
+            | "justfile"
+            | "dockerfile"
+            | "gemfile"
+            | "procfile"
+            | "rakefile"
+            | "cmakelists.txt"
+            | "requirements.txt"
+            | "cargo.toml"
+            | "readme.md"
+            | "license"
+            | "licence"
+    ) {
+        return true;
+    }
+
+    let dot_count = clean.matches('.').count();
+    if dot_count == 0 {
+        return false;
+    }
+
+    // Chaîne de propriétés ou identifiants avec plusieurs points sans être un format de config/test reconnu
+    // (ex: rejette `build.rollupOptions.external`, `app.state.counter`)
+    if dot_count > 1
+        && !low.contains(".config.")
+        && !low.ends_with(".d.ts")
+        && !low.contains(".test.")
+        && !low.contains(".spec.")
+    {
+        return false;
+    }
+
+    // À la racine du projet, les fichiers réels sont en minuscules (ex: `main.rs`, `index.html`, `app.py`).
+    // Les mentions de frameworks ou bibliothèques dans la prose commencent par une majuscule
+    // (ex: `Vue.js`, `Node.js`, `React.js`, `Three.js`, `FastAPI.py`, `Axum.rs`, `Tailwind.css`).
+    // Les composants capitalisés résident légitimement dans un sous-dossier (ex: `src/App.vue`).
+    let first_char = clean.chars().next().unwrap_or(' ');
+    if first_char.is_ascii_uppercase() {
+        return false;
+    }
+
+    true
+}
+
+fn accept_extracted_candidate_path(p: String) -> Option<String> {
+    if is_plausible_code_path(&p) {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 fn extract_path_from_text_line(line: &str) -> Option<String> {
@@ -225,11 +980,23 @@ fn extract_path_from_text_line(line: &str) -> Option<String> {
     }
     let low = trimmed.to_lowercase();
     if low.starts_with("$ ")
-        || low.starts_with("npm ")
-        || low.starts_with("npx ")
+        || low.starts_with("> ")
+        || low.starts_with("% ")
         || low.starts_with("cd ")
-        || low.starts_with("cargo ")
         || low.starts_with("git ")
+        || low.starts_with("npm ")
+        || low.starts_with("pnpm ")
+        || low.starts_with("yarn ")
+        || low.starts_with("bun ")
+        || low.starts_with("npx ")
+        || low.starts_with("cargo ")
+        || low.starts_with("pip ")
+        || low.starts_with("python ")
+        || low.starts_with("python3 ")
+        || low.starts_with("go ")
+        || low.starts_with("make ")
+        || low.starts_with("docker ")
+        || low.starts_with("composer ")
     {
         return None;
     }
@@ -239,7 +1006,7 @@ fn extract_path_from_text_line(line: &str) -> Option<String> {
         for cap in md_link_re.captures_iter(trimmed) {
             if let Some(href_m) = cap.get(1) {
                 let raw_href = href_m.as_str().split('#').next().unwrap_or("");
-                if let Some(p) = sanitize_rel_path(raw_href) {
+                if let Some(p) = sanitize_rel_path(raw_href).and_then(accept_extracted_candidate_path) {
                     return Some(p);
                 }
             }
@@ -257,14 +1024,14 @@ fn extract_path_from_text_line(line: &str) -> Option<String> {
         .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '*' | ':'))
         .trim();
     if !direct_clean.contains(' ') {
-        if let Some(p) = sanitize_rel_path(direct_clean) {
+        if let Some(p) = sanitize_rel_path(direct_clean).and_then(accept_extracted_candidate_path) {
             return Some(p);
         }
     }
 
     if let Some(cap) = path_re.captures(trimmed) {
         if let Some(m) = cap.get(1) {
-            if let Some(p) = sanitize_rel_path(m.as_str()) {
+            if let Some(p) = sanitize_rel_path(m.as_str()).and_then(accept_extracted_candidate_path) {
                 return Some(p);
             }
         }
@@ -272,10 +1039,105 @@ fn extract_path_from_text_line(line: &str) -> Option<String> {
     None
 }
 
-fn detect_path_from_preceding_lines(lines: &[&str], fence_line_idx: usize) -> Option<String> {
+fn is_explicit_file_label_line(line: &str) -> bool {
+    let low = line
+        .trim()
+        .trim_start_matches(['#', '-', '*', '>', ' ', '\t'])
+        .trim_start_matches(['*', '_', '`'])
+        .to_lowercase();
+    [
+        "fichier",
+        "file",
+        "chemin",
+        "path",
+        "cible",
+        "target",
+        "créer",
+        "creer",
+        "create",
+        "modifier",
+        "update",
+    ]
+    .iter()
+    .any(|kw| {
+        low.starts_with(kw)
+            && low[kw.len()..]
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace() || c == ':')
+                .unwrap_or(false)
+    })
+}
+
+fn is_standalone_header_or_link(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.contains("](") {
+        return true;
+    }
+    let direct_clean = trimmed
+        .trim_start_matches(['#', '-', '*', '>', ' ', '\t'])
+        .trim()
+        .trim_matches(['`', '\'', '"', '*', '_', ':'])
+        .trim();
+    !direct_clean.is_empty() && !direct_clean.contains(' ')
+}
+
+fn path_matches_existing_files(
+    candidate: &str,
+    allowed_targets: &[String],
+    all_project_files: &[String],
+) -> bool {
+    let clean = candidate.trim().replace('\\', "/");
+    let clean = clean.strip_prefix("./").unwrap_or(&clean);
+    let lower = clean.to_lowercase();
+    let suffix = format!("/{lower}");
+    let is_basename = !lower.contains('/');
+
+    let check_slice = |list: &[String]| -> bool {
+        list.iter().any(|p| {
+            let p_low = p.to_lowercase();
+            p_low == lower
+                || p_low.ends_with(&suffix)
+                || (is_basename && p_low.rsplit('/').next().unwrap_or("") == lower)
+        })
+    };
+
+    check_slice(allowed_targets) || check_slice(all_project_files)
+}
+
+fn is_likely_dotted_property_or_symbol(
+    candidate: &str,
+    allowed_targets: &[String],
+    all_project_files: &[String],
+) -> bool {
+    if path_matches_existing_files(candidate, allowed_targets, all_project_files) {
+        return false;
+    }
+    if candidate.contains('/') || candidate.contains('\\') {
+        return false;
+    }
+    let segments: Vec<&str> = candidate.split('.').collect();
+    if segments.len() >= 3 {
+        // Ex. `build.rollupOptions.external` : chaîne de propriétés camelCase sans `/`
+        if segments.iter().any(|seg| {
+            seg.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                && seg.chars().any(|c| c.is_ascii_uppercase())
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn detect_path_from_preceding_lines(
+    lines: &[&str],
+    fence_line_idx: usize,
+    allowed_targets: &[String],
+    all_project_files: &[String],
+) -> Option<String> {
     let mut checked = 0usize;
     let mut idx = fence_line_idx;
-    while idx > 0 && checked < 3 {
+    while idx > 0 && checked < 2 {
         idx -= 1;
         let line = lines[idx].trim();
         if line.is_empty() {
@@ -283,7 +1145,12 @@ fn detect_path_from_preceding_lines(lines: &[&str], fence_line_idx: usize) -> Op
         }
         checked += 1;
         if let Some(p) = extract_path_from_text_line(line) {
-            return Some(p);
+            if is_standalone_header_or_link(line)
+                || is_explicit_file_label_line(line)
+                || path_matches_existing_files(&p, allowed_targets, all_project_files)
+            {
+                return Some(p);
+            }
         }
     }
     None
@@ -332,99 +1199,29 @@ fn detect_path_from_info(info: &str) -> (String, Option<String>) {
     (first_tok.to_lowercase(), None)
 }
 
-fn heuristic_fallback_path(
-    code: &str,
-    user_prompt: &str,
-    already_seen: &HashSet<String>,
+/// Si aucun chemin n'est explicitement spécifié pour un bloc de code et qu'il n'y a pas d'en-tête,
+/// vérifie si l'espace de travail comporte un et un seul fichier correspondant à ce langage
+/// (ex. un unique `src/main.rs`, ou un unique `app.py`, ou un unique `src/App.vue`).
+/// Cette inférence est 100 % déterministe et agnostique à toute stack.
+fn unique_workspace_target_for_lang(
+    lang: &str,
     all_project_files: &[String],
+    already_seen: &HashSet<String>,
 ) -> Option<String> {
-    let lower_prompt = user_prompt.to_lowercase();
-    let is_html = code.contains("<!DOCTYPE html>") || code.contains("<html");
-    let is_css = code.contains('{')
-        && code.contains('}')
-        && (code.contains("margin:")
-            || code.contains("padding:")
-            || code.contains("color:")
-            || code.contains("background")
-            || code.contains("font-family:"));
-    let is_js = code.contains("function ")
-        || code.contains("const ")
-        || code.contains("let ")
-        || code.contains("import ");
-
-    if is_html
-        && (lower_prompt.contains("index.html")
-            || lower_prompt.contains("site web")
-            || lower_prompt.contains("page html")
-            || lower_prompt.contains("vitrine")
-            || lower_prompt.contains("site")
-            || lower_prompt.contains("page")
-            || lower_prompt.contains("fond"))
-        && !already_seen.contains("index.html")
-    {
-        return Some(
-            all_project_files
-                .iter()
-                .find(|f| f.eq_ignore_ascii_case("index.html"))
-                .cloned()
-                .unwrap_or_else(|| "index.html".to_string()),
-        );
+    let clean_lang = lang.trim();
+    if clean_lang.is_empty() {
+        return None;
     }
+    let candidates: Vec<&String> = all_project_files
+        .iter()
+        .filter(|f| !already_seen.contains(*f) && lang_matches_path(clean_lang, f))
+        .collect();
 
-    let wants_css_or_visual = lower_prompt.contains("css")
-        || lower_prompt.contains("style")
-        || lower_prompt.contains("fond")
-        || lower_prompt.contains("arrière-plan")
-        || lower_prompt.contains("arriere-plan")
-        || lower_prompt.contains("background")
-        || lower_prompt.contains("couleur")
-        || lower_prompt.contains("gris")
-        || lower_prompt.contains("page");
-
-    if is_css && wants_css_or_visual {
-        let css_candidates = [
-            "src/style.css",
-            "src/styles.css",
-            "src/styles/main.css",
-            "src/assets/main.css",
-            "src/index.css",
-            "src/main.css",
-            "src/app.css",
-            "style.css",
-            "styles.css",
-        ];
-        for cand in css_candidates {
-            if let Some(found) = all_project_files.iter().find(|f| f.eq_ignore_ascii_case(cand)) {
-                if !already_seen.contains(found) {
-                    return Some(found.clone());
-                }
-            }
-        }
-        if let Some(any_css) = all_project_files
-            .iter()
-            .filter(|f| {
-                let l = f.to_lowercase();
-                (l.ends_with(".css") || l.ends_with(".scss")) && !already_seen.contains(*f)
-            })
-            .min_by_key(|f| (f.matches('/').count(), f.len()))
-        {
-            return Some(any_css.clone());
-        }
-        if (lower_prompt.contains("css") || lower_prompt.contains("style"))
-            && !already_seen.contains("style.css")
-            && !already_seen.contains("styles.css")
-        {
-            return Some("styles.css".to_string());
-        }
+    if candidates.len() == 1 {
+        Some(candidates[0].clone())
+    } else {
+        None
     }
-    if is_js
-        && (lower_prompt.contains("script.js") || lower_prompt.contains("app.js"))
-        && !already_seen.contains("app.js")
-        && !already_seen.contains("script.js")
-    {
-        return Some("app.js".to_string());
-    }
-    None
 }
 
 /// Extrait tous les couples `(SEARCH, REPLACE)` contenus dans un texte de patch.
@@ -468,7 +1265,7 @@ pub fn parse_edit_blocks(
     text: &str,
     allowed_targets: &[String],
     all_project_files: &[String],
-    user_prompt: &str,
+    _user_prompt: &str,
 ) -> Vec<EditBlock> {
     let norm = text.replace("\r\n", "\n");
     let lines: Vec<&str> = norm.split('\n').collect();
@@ -509,11 +1306,8 @@ pub fn parse_edit_blocks(
             }
 
             let info_low = info.to_lowercase();
-            if info_low == "tool_call" || info_low == "json:tool_call" {
-                continue;
-            }
             let body_trim = body.trim();
-            if body_trim.starts_with("{\"name\"") && body_trim.contains("\"arguments\"") {
+            if is_tool_call_fence(&info_low, body_trim) {
                 continue;
             }
 
@@ -521,7 +1315,14 @@ pub fn parse_edit_blocks(
             let has_sr_markers = body_has_search_replace_pair(&body);
 
             let explicit_or_context_path = info_path
-                .or_else(|| detect_path_from_preceding_lines(&lines, fence_start_idx))
+                .or_else(|| {
+                    detect_path_from_preceding_lines(
+                        &lines,
+                        fence_start_idx,
+                        allowed_targets,
+                        all_project_files,
+                    )
+                })
                 .or_else(|| detect_path_from_first_code_line(&body));
 
             let mut implicit_target = false;
@@ -537,11 +1338,10 @@ pub fn parse_edit_blocks(
                 }
             }
             if detected_path.is_none() && !has_sr_markers {
-                if let Some(fb) = heuristic_fallback_path(
-                    &body,
-                    user_prompt,
-                    &seen_whole_paths,
+                if let Some(fb) = unique_workspace_target_for_lang(
+                    &lang,
                     all_project_files,
+                    &seen_whole_paths,
                 ) {
                     detected_path = Some(fb);
                     implicit_target = true;
@@ -552,6 +1352,17 @@ pub fn parse_edit_blocks(
                 continue;
             };
             let path = resolve_project_rel_path(&raw_path, allowed_targets, all_project_files);
+
+            if !is_plausible_code_path(&path)
+                || (!has_sr_markers
+                    && is_likely_dotted_property_or_symbol(
+                        &path,
+                        allowed_targets,
+                        all_project_files,
+                    ))
+            {
+                continue;
+            }
 
             if is_shell_lang(&lang) && !is_shell_script_path(&path) && !has_sr_markers {
                 continue;
@@ -598,8 +1409,13 @@ pub fn parse_edit_blocks(
                 i += 1;
             }
             if closed {
-                let detected = detect_path_from_preceding_lines(&lines, sr_start_idx).or_else(
-                    || {
+                let detected = detect_path_from_preceding_lines(
+                    &lines,
+                    sr_start_idx,
+                    allowed_targets,
+                    all_project_files,
+                )
+                .or_else(|| {
                         if allowed_targets.len() == 1 {
                             sanitize_rel_path(&allowed_targets[0])
                         } else {
@@ -813,12 +1629,12 @@ pub fn apply_search_replace_fuzzy(
         }
     };
 
-    if search_norm.is_empty() {
-        if orig_norm.is_empty() {
+    if search_norm.trim().is_empty() {
+        if orig_norm.trim().is_empty() {
             return Ok(restore_eol(rep_norm, had_crlf));
         }
         return Err(make_err(
-            "Le bloc SEARCH est vide pour un fichier existant non vide.",
+            "Le bloc SEARCH est vide ou ne contient que des espaces pour un fichier existant non vide. Utilise `write_file` pour réécrire le fichier complet.",
             None,
             None,
         ));
@@ -830,9 +1646,34 @@ pub fn apply_search_replace_fuzzy(
         return Ok(restore_eol(updated, had_crlf));
     }
 
+    // Niveau 1b : Correspondance du fichier entier (en ignorant les sauts de ligne / espaces aux extrémités)
+    let search_trimmed = search_norm.trim();
+    if orig_norm.trim() == search_trimmed {
+        return Ok(restore_eol(rep_norm.trim().to_string(), had_crlf));
+    }
+
+    // Niveau 1c : Correspondance exacte du bloc émondé si unique dans le fichier
+    if !search_trimmed.is_empty()
+        && search_trimmed.len() >= 6
+        && orig_norm.contains(search_trimmed)
+        && orig_norm.matches(search_trimmed).count() == 1
+    {
+        let updated = orig_norm.replacen(search_trimmed, rep_norm.trim(), 1);
+        return Ok(restore_eol(updated, had_crlf));
+    }
+
     let orig_lines: Vec<&str> = orig_norm.split('\n').collect();
+    let search_trimmed_lines: Vec<&str> = search_trimmed.split('\n').collect();
     let search_lines: Vec<&str> = search_norm.split('\n').collect();
-    let m = search_lines.len();
+
+    let eff_search_lines: Vec<&str> = if search_lines.len() > orig_lines.len()
+        && search_trimmed_lines.len() <= orig_lines.len()
+    {
+        search_trimmed_lines
+    } else {
+        search_lines
+    };
+    let m = eff_search_lines.len();
 
     if m > orig_lines.len() {
         let (snippet, ln) = format_closest_snippet(&orig_lines, 0, orig_lines.len().min(8));
@@ -846,7 +1687,7 @@ pub fn apply_search_replace_fuzzy(
     // Niveau 2 : Espaces en fin de ligne ignorés (.trim_end())
     let mut level2_matches = Vec::new();
     for i in 0..=orig_lines.len() - m {
-        let matched = (0..m).all(|k| orig_lines[i + k].trim_end() == search_lines[k].trim_end());
+        let matched = (0..m).all(|k| orig_lines[i + k].trim_end() == eff_search_lines[k].trim_end());
         if matched {
             level2_matches.push(i);
         }
@@ -867,7 +1708,7 @@ pub fn apply_search_replace_fuzzy(
     }
 
     // Niveau 3 : Indentation flexible (dédentation commune + réindentation à l'origine)
-    let (ded_search, search_indent) = dedent_lines(&search_lines);
+    let (ded_search, search_indent) = dedent_lines(&eff_search_lines);
     let mut level3_matches: Vec<(usize, String)> = Vec::new();
     for i in 0..=orig_lines.len() - m {
         let win = &orig_lines[i..i + m];
@@ -891,8 +1732,33 @@ pub fn apply_search_replace_fuzzy(
         ));
     }
 
+    // Niveau 3b : Tolérance syntaxique (guillemets simples/doubles et ponctuation de fin de ligne ',' ou ';')
+    let normalize_syntax_line = |line: &str| -> String {
+        let mut s = line.trim().replace('"', "'");
+        while s.ends_with(';') || s.ends_with(',') {
+            s.pop();
+        }
+        s.trim_end().to_string()
+    };
+    let norm_search: Vec<String> = eff_search_lines.iter().map(|l| normalize_syntax_line(l)).collect();
+    let mut level3b_matches = Vec::new();
+    for i in 0..=orig_lines.len().saturating_sub(m) {
+        let matched = (0..m).all(|k| {
+            normalize_syntax_line(orig_lines[i + k]) == norm_search[k]
+        });
+        if matched {
+            level3b_matches.push(i);
+        }
+    }
+    if level3b_matches.len() == 1 {
+        let idx = level3b_matches[0];
+        let rep_lines = rep_norm.split('\n').map(|s| s.to_string()).collect();
+        let updated = replace_line_range(&orig_lines, idx, idx + m, rep_lines);
+        return Ok(restore_eol(updated, had_crlf));
+    }
+
     // Niveau 4a : Gestion des ellipses "..." isolées sur une ligne
-    if let Some(ellipsis_pos) = search_lines.iter().position(|l| l.trim() == "...") {
+    if let Some(ellipsis_pos) = eff_search_lines.iter().position(|l| l.trim() == "...") {
         if rep_norm.split('\n').any(|l| l.trim() == "...") {
             return Err(make_err(
                 "Le bloc REPLACE ne doit pas contenir de ligne '...' (fournissez le code complet).",
@@ -900,8 +1766,8 @@ pub fn apply_search_replace_fuzzy(
                 None,
             ));
         }
-        let prefix = &search_lines[..ellipsis_pos];
-        let suffix = &search_lines[ellipsis_pos + 1..];
+        let prefix = &eff_search_lines[..ellipsis_pos];
+        let suffix = &eff_search_lines[ellipsis_pos + 1..];
         if !prefix.is_empty() && !suffix.is_empty() {
             let p_matches = find_matching_windows_flex(&orig_lines, prefix);
             let s_matches = find_matching_windows_flex(&orig_lines, suffix);
@@ -930,7 +1796,7 @@ pub fn apply_search_replace_fuzzy(
     let mut win_sizes = vec![m];
     if m >= 4 {
         win_sizes.push(m - 1);
-        if m + 1 <= orig_lines.len() {
+        if m < orig_lines.len() {
             win_sizes.push(m + 1);
         }
     }
@@ -1080,6 +1946,9 @@ pub async fn apply_edits_from_response(
                 content,
                 implicit_target,
             } => {
+                if is_binary_or_non_text_path(&path) {
+                    continue;
+                }
                 if truncated_files.contains(&path) {
                     outcome.failures.push(PatchFailure {
                         path: path.clone(),
@@ -1120,6 +1989,33 @@ pub async fn apply_edits_from_response(
                     }
                 }
 
+                let raw_final_content = if body_has_search_replace_pair(&content) {
+                    extract_clean_replace_code(&content)
+                } else {
+                    content
+                };
+
+                let final_content = if path.to_lowercase().ends_with(".json") {
+                    match repair_and_validate_json_str(&raw_final_content) {
+                        Ok(valid) => valid,
+                        Err(err_msg) => {
+                            outcome.failures.push(PatchFailure {
+                                path: path.clone(),
+                                search_snippet: String::new(),
+                                closest_match: None,
+                                closest_line: None,
+                                reason: format!(
+                                    "Contenu JSON invalide pour '{}' ({}). Réécris un JSON strictement valide avec write_file.",
+                                    path, err_msg
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    raw_final_content
+                };
+
                 if let Some(parent) = target_path.parent() {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
                         outcome.failures.push(PatchFailure {
@@ -1132,12 +2028,6 @@ pub async fn apply_edits_from_response(
                         continue;
                     }
                 }
-
-                let final_content = if body_has_search_replace_pair(&content) {
-                    extract_clean_replace_code(&content)
-                } else {
-                    content
-                };
 
                 if let Err(e) = tokio::fs::write(&target_path, &final_content).await {
                     outcome.failures.push(PatchFailure {
@@ -1169,6 +2059,9 @@ pub async fn apply_edits_from_response(
                 search,
                 replace,
             } => {
+                if is_binary_or_non_text_path(&path) {
+                    continue;
+                }
                 let target_path = project_root.join(&path);
                 let orig = if target_path.exists() {
                     tokio::fs::read_to_string(&target_path)
@@ -1180,10 +2073,30 @@ pub async fn apply_edits_from_response(
 
                 match apply_search_replace_fuzzy(&orig, &search, &replace) {
                     Ok(patched) => {
+                        let final_patched = if path.to_lowercase().ends_with(".json") {
+                            match repair_and_validate_json_str(&patched) {
+                                Ok(valid) => valid,
+                                Err(err_msg) => {
+                                    outcome.failures.push(PatchFailure {
+                                        path: path.clone(),
+                                        search_snippet: search,
+                                        closest_match: None,
+                                        closest_line: None,
+                                        reason: format!(
+                                            "Contenu JSON invalide pour '{}' ({}). Réécris un JSON strictement valide avec write_file.",
+                                            path, err_msg
+                                        ),
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            patched
+                        };
                         if let Some(parent) = target_path.parent() {
                             let _ = tokio::fs::create_dir_all(parent).await;
                         }
-                        if let Err(e) = tokio::fs::write(&target_path, &patched).await {
+                        if let Err(e) = tokio::fs::write(&target_path, &final_patched).await {
                             outcome.failures.push(PatchFailure {
                                 path,
                                 search_snippet: search,
@@ -1213,8 +2126,10 @@ pub async fn apply_edits_from_response(
     }
 
     if !outcome.applied_files.is_empty() && project_root.exists() {
+        let mut add_args = vec!["add", "-A", "--", "."];
+        add_args.extend(crate::git_diff::GIT_EXCLUDE_PATHSPECS);
         let _ = tokio::process::Command::new("git")
-            .args(["add", "-A", "--", "."])
+            .args(&add_args)
             .current_dir(project_root)
             .output()
             .await;
@@ -1477,15 +2392,26 @@ fn cleanup_before_removed_block(
 /// Nettoie la réponse finale pour l'affichage utilisateur en conservant les explications
 /// et les commandes shell utiles, tout en masquant les tool_calls et blocs déjà appliqués.
 pub fn strip_edit_blocks_for_display(text: &str, applied_files: &[String]) -> String {
-    let tool_xml_re = Regex::new(r"<tool_call>[\s\S]*?</tool_call>").expect("valid xml regex");
+    let tool_xml_re = Regex::new(r"<tool_call(?:\s[^>]*)?>[\s\S]*?</tool_call>").expect("valid xml regex");
     let no_xml = tool_xml_re.replace_all(text, "");
+    let open_xml_re = Regex::new(r"<tool_call(?:\s[^>]*)?>[\s\S]*$").expect("valid open xml regex");
+    let no_xml = open_xml_re.replace_all(&no_xml, "");
+    let fn_xml_re = Regex::new(r"<function=[^>]+>[\s\S]*?</function>").expect("valid fn xml regex");
+    let no_xml = fn_xml_re.replace_all(&no_xml, "");
+    let open_fn_re = Regex::new(r"<function=[^>]+>[\s\S]*$").expect("valid open fn regex");
+    let no_xml = open_fn_re.replace_all(&no_xml, "");
+    let mistral_re = Regex::new(r"\[TOOL_CALLS\]").expect("valid mistral regex");
+    let no_xml = mistral_re.replace_all(&no_xml, "");
+    let native_tool_re = Regex::new(r"\[Appel d'outils?(?:\s+natifs?)?\s*:[^\]]+\]").expect("valid native tool regex");
+    let no_xml = native_tool_re.replace_all(&no_xml, "");
+    let no_bare = strip_bare_json_tool_calls_from_prose(&no_xml);
 
     let applied_set: HashSet<String> = applied_files
         .iter()
         .filter_map(|p| sanitize_rel_path(p).or_else(|| Some(p.trim().to_string())))
         .collect();
 
-    let norm = no_xml.replace("\r\n", "\n");
+    let norm = no_bare.replace("\r\n", "\n");
     let lines: Vec<&str> = norm.split('\n').collect();
     let mut out_lines: Vec<String> = Vec::new();
     let mut i = 0usize;
@@ -1516,9 +2442,7 @@ pub fn strip_edit_blocks_for_display(text: &str, applied_files: &[String]) -> St
 
             let body = body_lines.join("\n");
             let info_low = info.to_lowercase();
-            let is_tool_fence = info_low == "tool_call"
-                || info_low == "json:tool_call"
-                || (body.trim().starts_with("{\"name\"") && body.contains("\"arguments\""));
+            let is_tool_fence = is_tool_call_fence(&info_low, &body);
             let has_sr = body_has_any_search_or_replace_marker(&body);
 
             let (lang, info_path) = detect_path_from_info(info);
@@ -1529,7 +2453,7 @@ pub fn strip_edit_blocks_for_display(text: &str, applied_files: &[String]) -> St
                     .unwrap_or(false);
 
             let detected_path = info_path
-                .or_else(|| detect_path_from_preceding_lines(&lines, fence_start))
+                .or_else(|| detect_path_from_preceding_lines(&lines, fence_start, applied_files, &[]))
                 .or_else(|| detect_path_from_first_code_line(&body));
 
             let targets_applied = detected_path
@@ -1658,6 +2582,25 @@ mod tests {
         let orig = "line1\r\nline2\r\nline3\r\n";
         let res = apply_search_replace_fuzzy(orig, "line2", "line2_mod").unwrap();
         assert_eq!(res, "line1\r\nline2_mod\r\nline3\r\n");
+    }
+
+    #[test]
+    fn test_fuzzy_level3b_quotes_and_trailing_punctuation() {
+        let orig = "module.exports = {\n  content: [\n    \"./index.html\",\n    \"./src/**/*.{vue,js,ts}\",\n  ],\n};\n";
+        // Search has single quotes and misses a trailing semicolon
+        let search = "content: [\n    './index.html',\n    './src/**/*.{vue,js,ts}'\n  ]";
+        let replace = "content: [\n    './index.html',\n    './src/**/*.{vue,js,ts,jsx,tsx}'\n  ]";
+        let res = apply_search_replace_fuzzy(orig, search, replace).unwrap();
+        assert!(res.contains("./src/**/*.{vue,js,ts,jsx,tsx}"));
+    }
+
+    #[test]
+    fn test_fuzzy_level1b_trimmed_file_match() {
+        let orig = "\n\nmodule.exports = {\n  darkMode: 'class'\n};\n\n";
+        let search = "module.exports = {\n  darkMode: 'class'\n};";
+        let replace = "module.exports = {\n  darkMode: 'media'\n};";
+        let res = apply_search_replace_fuzzy(orig, search, replace).unwrap();
+        assert!(res.contains("darkMode: 'media'"));
     }
 
     #[test]
@@ -1967,5 +2910,152 @@ body { background: #2f3136; }
         assert_eq!(std::fs::read_to_string(dir.join("src/index.css")).unwrap(), big_css);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_universal_json_tool_call_filtering_and_package_json_preservation() {
+        let pkg_json = r#"{"name": "my-site", "version": "1.0.0", "scripts": {"build": "vite build"}}"#;
+        assert!(!is_tool_call_fence("json", pkg_json));
+
+        let indented_tool = r#"{
+  "name": "run_command",
+  "arguments": {
+    "cmd": "pnpm init"
+  }
+}"#;
+        assert!(is_tool_call_fence("json", indented_tool));
+        let parsed = extract_json_tool_calls_from_block(indented_tool);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "run_command");
+        assert_eq!(parsed[0].1["command"], "pnpm init");
+
+        let reply = r#"Je prépare le projet :
+
+```json
+{
+  "tool": "run_command",
+  "parameters": {
+    "command": "pnpm init"
+  }
+}
+```
+
+{"name":"write_file","file_path":"index.html","code":"<h1>Hello</h1>"}
+
+Tout est prêt."#;
+        let blocks = parse_edit_blocks(reply, &[], &[], "initialise le site");
+        assert!(blocks.is_empty());
+
+        let cleaned = strip_edit_blocks_for_display(reply, &[]);
+        assert!(!cleaned.contains("pnpm init"));
+        assert!(!cleaned.contains("write_file"));
+        assert!(cleaned.contains("Tout est prêt."));
+    }
+
+    #[test]
+    fn test_repair_and_validate_json_str_control_chars_and_trailing_commas() {
+        let broken_pkg = "{\n  \"name\": \"site-demo\",\n  \"description\": \"Ligne 1\nLigne 2\tavec tab\",\n  \"scripts\": {\n    \"build\": \"vite build\",\n  },\n}";
+        let repaired = repair_and_validate_json_str(broken_pkg).expect("should repair broken json");
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).expect("valid pretty json");
+        assert_eq!(parsed["name"], "site-demo");
+        assert_eq!(parsed["scripts"]["build"], "vite build");
+        assert_eq!(parsed["description"], "Ligne 1\nLigne 2\tavec tab");
+
+        let wrapped = "```json\n{\"ok\": true,}\n```";
+        let repaired_wrapped = repair_and_validate_json_str(wrapped).expect("should unwrap fence");
+        let parsed_wrapped: serde_json::Value =
+            serde_json::from_str(&repaired_wrapped).expect("valid wrapped json");
+        assert_eq!(parsed_wrapped["ok"], true);
+    }
+
+    #[test]
+    fn test_extract_json_tool_calls_with_raw_newlines_in_content() {
+        let raw_block = "{\n  \"name\": \"write_file\",\n  \"arguments\": {\n    \"path\": \"index.html\",\n    \"content\": \"<!DOCTYPE html>\n<html>\n<body>Bonjour</body>\n</html>\"\n  }\n}";
+        assert!(is_tool_call_fence("json", raw_block));
+        let calls = extract_json_tool_calls_from_block(raw_block);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "write_file");
+        assert_eq!(calls[0].1["path"], "index.html");
+        assert_eq!(
+            calls[0].1["content"],
+            "<!DOCTYPE html>\n<html>\n<body>Bonjour</body>\n</html>"
+        );
+    }
+
+    #[test]
+    fn test_reject_binary_and_runtime_paths_in_patcher() {
+        assert!(is_binary_or_non_text_path("assets/logo.png"));
+        assert!(is_binary_or_non_text_path("favicon.ico"));
+        assert!(!is_binary_or_non_text_path("assets/logo.svg"));
+        assert_eq!(extract_path_from_text_line("### assets/logo.png"), None);
+        assert_eq!(extract_path_from_text_line("### Node.js"), None);
+        assert_eq!(extract_path_from_text_line("### Vue.js"), None);
+        assert_eq!(extract_path_from_text_line("### FastAPI.py"), None);
+        assert_eq!(extract_path_from_text_line("### Axum.rs"), None);
+        assert_eq!(extract_path_from_text_line("### Gin.go"), None);
+        assert_eq!(extract_path_from_text_line("### Three.js"), None);
+        assert_eq!(
+            extract_path_from_text_line("### src/App.vue").as_deref(),
+            Some("src/App.vue")
+        );
+        assert_eq!(
+            extract_path_from_text_line("### src/main.rs").as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            extract_path_from_text_line("### lib/server.py").as_deref(),
+            Some("lib/server.py")
+        );
+    }
+
+    #[test]
+    fn test_reject_dotted_property_or_prose_mention_as_phantom_file() {
+        let reply_prose = r#"Pour corriger l'erreur Rollup, ajoute `/tailwind.css` dans `build.rollupOptions.external` :
+
+```js
+export default {
+  build: {
+    rollupOptions: {
+      external: ['/tailwind.css']
+    }
+  }
+}
+```"#;
+        let blocks = parse_edit_blocks(reply_prose, &[], &[], "corrige le build");
+        assert!(
+            blocks.is_empty(),
+            "Prose mentioning build.rollupOptions.external must not create a phantom file: {:?}",
+            blocks
+        );
+
+        let reply_header_dotted = r#"### build.rollupOptions.external
+```js
+external: ['/tailwind.css']
+```"#;
+        let blocks2 = parse_edit_blocks(reply_header_dotted, &[], &[], "corrige");
+        assert!(
+            blocks2.is_empty(),
+            "Explicit header with camelCase dotted property must not create a phantom file"
+        );
+
+        let reply_real = r#"### tailwind.config.cjs
+```js
+module.exports = { content: ['./index.html'] };
+```
+
+### src/App.vue
+```vue
+<template><div>OK</div></template>
+```"#;
+        let blocks3 = parse_edit_blocks(reply_real, &[], &[], "init");
+        assert_eq!(blocks3.len(), 2);
+        match &blocks3[0] {
+            EditBlock::WholeFile { path, .. } => assert_eq!(path, "tailwind.config.cjs"),
+            _ => panic!("Expected WholeFile for tailwind.config.cjs"),
+        }
+        match &blocks3[1] {
+            EditBlock::WholeFile { path, .. } => assert_eq!(path, "src/App.vue"),
+            _ => panic!("Expected WholeFile for src/App.vue"),
+        }
     }
 }

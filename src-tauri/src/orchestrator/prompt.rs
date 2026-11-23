@@ -25,17 +25,22 @@ OUTILS DISPONIBLES POUR LES AGENTS :
 - "read_file", "edit_file" (patch court), "write_file" (création/réécriture complète sans limite de lignes), "delete_file", "run_command", "web_search", "fetch_url", "search_code", "list_files"
 
 RÈGLES D'ORCHESTRATION IMPÉRATIVES :
-1. UNIFICATION DIAGNOSTIC + CORRECTION : Ne sépare JAMAIS « Diagnostic / Lecture » et « Correction / Écriture » en deux tâches distinctes ! Un agent "coder" ou "designer" sait lire les fichiers, diagnostiquer la cause racine (y compris fichiers manquants ou références cassées) et appliquer les créations/modifications dans la même session continue.
-2. Si la tâche peut être menée par un seul agent spécialisé (la grande majorité des bugs, erreurs d'exécution, features ou installations) : crée UNE SEULE étape unifiée avec `depends_on: []`.
-3. N'utilise un DAG multi-étapes que pour des chantiers véritablement multi-domaines ou parallélisables sur des fichiers disjoints. Dans ce cas, indique dans le `goal` de chaque étape tout ce qu'elle doit transmettre à l'étape suivante.
-4. Si la demande concerne l'ajout ou la mise à jour d'une règle (mention `@rules` ou consigne projet) : planifie une tâche "coder" ciblant le fichier approprié dans `.agents/rules/*.md` ou `AGENTS.md`.
-5. Si des chemins déclarés sont signalés introuvables dans l'instantané du projet ou si la structure du manifeste racine révèle des éléments manquants : mentionne explicitement dans le `goal` de vérifier la chaîne de démarrage complète du projet.
-6. `validationCommand` (optionnel) : commande terminale non-interactive déterministe (sans serveur continu/watch bloquant) déduite des manifestes du projet pour valider le code après exécution (ex: script de compilation, d'analyse statique ou de test déduit du manifeste racine), ou `null` si aucune commande n'est applicable.
-7. RÉPONDS UNIQUEMENT AVEC LE BLOC JSON SUIVANT, SANS AUCUN BAVARDAGE NI TEXTE AUTOUR :
+1. PILOTAGE 100 % PAR LE PROJET : Toute décision technique (langage, framework, gestionnaire de paquets, architecture) doit être STRICTEMENT pilotée par : (a) la demande utilisateur, (b) `[Contexte global]` et `[Architecture & Conventions]` (`AGENTS.md` / `.agents/rules/`), et (c) l'instantané réel (`WorkspaceSnapshot`). N'impose aucune stack non demandée.
+2. UNIFICATION DIAGNOSTIC + CORRECTION : Ne sépare JAMAIS « Diagnostic / Lecture » et « Correction / Écriture » en deux tâches distinctes ! Un agent "coder" ou "designer" sait lire les fichiers, diagnostiquer la cause racine (y compris fichiers manquants ou références cassées) et appliquer les créations/modifications dans la même session continue.
+3. PROJET VIERGE / INITIALISATION / CRÉATION (`intent: "init"` ou projet signalé `PROJET VIERGE / NON INITIALISÉ`) :
+   - Lorsque le projet est vide/non initialisé ou que l'utilisateur demande d'initialiser ou de créer un projet/site/application/API, planifie les commandes shell non-interactives de préparation et d'installation des dépendances via `run_command` (selon les outils standards non-interactifs du langage/projet et de la demande) ET la création complète des fichiers de configuration et sources via `write_file`.
+   - Ne crée JAMAIS une tâche qui s'arrête après `init` sans livrer le code demandé : inclue toujours `run_command` ET `write_file` dans les outils de l'étape (ou chaînage `step_1` préparation -> `step_2` code si le volume le justifie) afin que le projet soit complet et fonctionnel.
+4. Si la tâche peut être menée par un seul agent spécialisé (la grande majorité des bugs, erreurs d'exécution, features ou installations) : crée UNE SEULE étape unifiée avec `depends_on: []`.
+5. N'utilise un DAG multi-étapes que pour des chantiers véritablement multi-domaines ou parallélisables sur des fichiers disjoints. Dans ce cas, indique dans le `goal` de chaque étape tout ce qu'elle doit transmettre à l'étape suivante.
+6. Si la demande concerne l'ajout ou la mise à jour d'une règle (mention `@rules` ou consigne projet) : planifie une tâche "coder" ciblant le fichier approprié dans `.agents/rules/*.md` ou `AGENTS.md`.
+7. Si des chemins déclarés sont signalés introuvables dans l'instantané du projet ou si la structure du manifeste racine révèle des éléments manquants : mentionne explicitement dans le `goal` de vérifier la chaîne de démarrage complète du projet.
+8. CONTINUITÉ & COHÉRENCE SESSION : Lorsque `[Session récente]` contient un `[Objectif initial de la session]` et un `[Dernier échange immédiat]`, toute demande de relance ou de correction (ex: « Corrige toi-même », « Fais-le », « Ça ne fonctionne pas ») DOIT impérativement préserver les exigences techniques et fonctionnelles de l'objectif initial tout en corrigeant les erreurs signalées dans le dernier échange et dans l'instantané du projet (`WorkspaceSnapshot`).
+9. `validationCommand` (optionnel) : commande terminale non-interactive déterministe (sans serveur continu/watch bloquant) déduite des manifestes du projet pour valider le code après exécution (ex: script de compilation, d'analyse statique ou de test déduit du manifeste racine), ou `null` si aucune commande n'est applicable.
+10. RÉPONDS UNIQUEMENT AVEC LE BLOC JSON SUIVANT, SANS AUCUN BAVARDAGE NI TEXTE AUTOUR :
 
 ```json
 {{
-  "intent": "bugfix|feature|install|refactor|doc|question",
+  "intent": "init|feature|bugfix|install|refactor|doc|question",
   "summary": "Résumé concis du plan",
   "validationCommand": null,
   "tasks": [
@@ -43,7 +48,7 @@ RÈGLES D'ORCHESTRATION IMPÉRATIVES :
       "id": "step_1",
       "title": "Titre court de l'étape",
       "role": "coder|designer|terminal|refactoring|tester|research|general",
-      "goal": "Instructions très précises de ce que cet agent doit diagnostiquer, créer/modifier et vérifier",
+      "goal": "Instructions très précises de ce que cet agent doit diagnostiquer, préparer/installer, créer/modifier et vérifier",
       "files": ["fichier1.ext"],
       "tools": ["read_file", "write_file", "edit_file", "run_command"],
       "depends_on": []

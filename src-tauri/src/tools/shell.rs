@@ -52,10 +52,18 @@ pub fn build_enriched_path() -> String {
         }
 
         if let Some(home) = dirs::home_dir() {
+            // Dossiers binaires utilisateur standards multi-écosystèmes
             for rel in [
                 ".cargo/bin",
                 ".local/bin",
                 ".bun/bin",
+                ".deno/bin",
+                "go/bin",
+                ".poetry/bin",
+                ".composer/vendor/bin",
+                ".config/composer/vendor/bin",
+                ".rbenv/shims",
+                ".sdkman/candidates/java/current/bin",
                 ".volta/bin",
                 "Library/pnpm",
                 ".local/share/pnpm",
@@ -188,8 +196,76 @@ pub fn is_destructive_command(cmd: &str) -> Option<&'static str> {
     None
 }
 
-pub fn is_daemon_or_dev_server_command(cmd: &str) -> Option<&'static str> {
-    let norm = cmd
+fn split_shell_subcommands(cmd: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if c == '\\' && !in_single {
+            cur.push(c);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            if (c == '&' && chars.get(i + 1) == Some(&'&'))
+                || (c == '|' && chars.get(i + 1) == Some(&'|'))
+            {
+                let trimmed = cur.trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+                cur.clear();
+                i += 2;
+                continue;
+            }
+            if c == ';' || c == '\n' {
+                let trimmed = cur.trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+                cur.clear();
+                i += 1;
+                continue;
+            }
+        }
+        cur.push(c);
+        i += 1;
+    }
+
+    let trimmed = cur.trim().to_string();
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+    parts
+}
+
+fn is_single_daemon_or_watch_subcommand(sub: &str) -> Option<&'static str> {
+    let norm = sub
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -198,30 +274,70 @@ pub fn is_daemon_or_dev_server_command(cmd: &str) -> Option<&'static str> {
         return None;
     }
 
-    // Commandes de serveurs de développement ou processus persistants qui ne terminent jamais
-    if norm.starts_with("npm run dev")
-        || norm.starts_with("pnpm run dev")
-        || norm.starts_with("pnpm dev")
-        || norm.starts_with("yarn dev")
-        || norm.starts_with("bun dev")
-        || norm.starts_with("npx vite dev")
-        || norm.starts_with("vite dev")
-        || norm == "vite"
-        || norm.starts_with("vite --")
-        || norm.starts_with("npm start")
-        || norm.starts_with("pnpm start")
-        || norm.starts_with("yarn start")
-        || norm.starts_with("cargo run")
-        || norm.starts_with("python -m http.server")
-        || norm.starts_with("python3 -m http.server")
-        || norm.starts_with("tauri dev")
-        || norm.starts_with("cargo tauri dev")
-        || norm.starts_with("npm run tauri dev")
-        || norm.starts_with("pnpm tauri dev")
-    {
-        return Some("Cette commande démarre un processus serveur ou d'écoute continu bloquant le moteur. Utilise uniquement une commande de compilation, d'analyse statique ou de test non-interactive qui se termine d'elle-même selon les manifestes du projet.");
+    let tokens: Vec<&str> = norm.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
     }
 
+    // 1. Flags universels de rechargement/observation en continu
+    let has_watch_flag = tokens.iter().any(|tok| {
+        *tok == "--watch"
+            || tok.starts_with("--watch=")
+            || *tok == "-w"
+            || *tok == "--live-reload"
+            || *tok == "--reload"
+            || *tok == "--poll"
+    });
+
+    // 2. Mots-clés de serveurs ou démons interactifs sans fin
+    let is_server_or_daemon = tokens.iter().any(|tok| {
+        matches!(
+            *tok,
+            "http.server"
+                | "live-server"
+                | "lite-server"
+                | "webpack-dev-server"
+                | "uvicorn"
+                | "gunicorn"
+                | "nodemon"
+        )
+    });
+
+    // 3. Sous-commandes de dev / serve / watch / start interactif
+    let is_dev_or_serve_cmd = if tokens.len() == 1 {
+        matches!(tokens[0], "vite" | "nodemon")
+    } else if tokens[0] == "vite" && tokens[1] != "build" {
+        true
+    } else if (tokens[0] == "npm" || tokens[0] == "pnpm" || tokens[0] == "yarn" || tokens[0] == "bun")
+        && (tokens.contains(&"dev")
+            || tokens.contains(&"start")
+            || tokens.contains(&"serve")
+            || tokens.contains(&"watch"))
+    {
+        true
+    } else if (tokens[0] == "cargo" || tokens[0] == "tauri")
+        && (tokens.contains(&"dev") || (tokens[0] == "cargo" && tokens.get(1) == Some(&"run")))
+    {
+        true
+    } else if tokens.contains(&"http.server") {
+        true
+    } else {
+        false
+    };
+
+    if has_watch_flag || is_server_or_daemon || is_dev_or_serve_cmd {
+        return Some("Cette commande démarre un processus serveur ou d'écoute continu (`--watch` / dev server) bloquant le moteur. Utilise uniquement une commande de compilation, d'analyse statique ou de test non-interactive qui se termine d'elle-même selon les manifestes du projet.");
+    }
+
+    None
+}
+
+pub fn is_daemon_or_dev_server_command(cmd: &str) -> Option<&'static str> {
+    for sub in split_shell_subcommands(cmd) {
+        if let Some(reason) = is_single_daemon_or_watch_subcommand(&sub) {
+            return Some(reason);
+        }
+    }
     None
 }
 
@@ -303,6 +419,11 @@ where
         .env("PAGER", "cat")
         .env("npm_config_yes", "true")
         .env("DEBIAN_FRONTEND", "noninteractive")
+        .env("PIP_NO_INPUT", "1")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .env("COMPOSER_NO_INTERACTION", "1")
+        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        .env("CARGO_TERM_COLOR", "never")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -516,6 +637,11 @@ mod tests {
         assert!(is_daemon_or_dev_server_command("vite --port 3000").is_some());
         assert!(is_daemon_or_dev_server_command("cargo run").is_some());
         assert!(is_daemon_or_dev_server_command("python -m http.server 8000").is_some());
+        assert!(is_daemon_or_dev_server_command(
+            "npm run build && npx tailwindcss -i ./src/input.css -o ./dist/tailwind.css --watch"
+        )
+        .is_some());
+        assert!(is_daemon_or_dev_server_command("cargo test; vite --port 3000").is_some());
 
         // Safe deterministic commands should NOT be flagged
         assert!(is_daemon_or_dev_server_command("npm run build").is_none());
