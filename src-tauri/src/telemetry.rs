@@ -8,14 +8,20 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(target_os = "macos")]
+static CORES: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+#[cfg(target_os = "macos")]
+static MEM_TOTAL_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 async fn run_cmd_output(program: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
+    cmd.kill_on_drop(true);
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let output = tokio::time::timeout(
-        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_millis(800),
         cmd.output(),
     )
     .await
@@ -53,23 +59,20 @@ pub async fn collect_hardware_telemetry() -> HardwareTelemetry {
 
 #[cfg(target_os = "macos")]
 async fn collect_macos() -> HardwareTelemetry {
-    let cores = run_cmd_output("sysctl", &["-n", "hw.logicalcpu"])
-        .await
-        .and_then(|s| s.trim().parse::<f32>().ok())
-        .unwrap_or(8.0)
-        .max(1.0);
+    let cores = *CORES.get_or_init(|| {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.logicalcpu"])
+            .output()
+            .ok()
+            .and_then(|s| String::from_utf8(s.stdout).ok())
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(8.0)
+            .max(1.0)
+    });
 
-    // Try `top -l 1 -n 0` first for real CPU utilization, then fall back to `vm.loadavg`
+    // Use fast sysctl `vm.loadavg` (instantaneous, zero overhead, no child leaks)
     let mut cpu_usage = 0.0_f32;
-    if let Some(top_out) = run_cmd_output("top", &["-l", "1", "-n", "0"]).await {
-        if let Ok(re) = Regex::new(r"CPU usage:\s*([\d.]+)%\s*user,\s*([\d.]+)%\s*sys") {
-            if let Some(cap) = re.captures(&top_out) {
-                let user = cap.get(1).and_then(|m| m.as_str().parse::<f32>().ok()).unwrap_or(0.0);
-                let sys = cap.get(2).and_then(|m| m.as_str().parse::<f32>().ok()).unwrap_or(0.0);
-                cpu_usage = (user + sys).clamp(0.0, 100.0);
-            }
-        }
-    } else if let Some(load_out) = run_cmd_output("sysctl", &["-n", "vm.loadavg"]).await {
+    if let Some(load_out) = run_cmd_output("sysctl", &["-n", "vm.loadavg"]).await {
         let first = load_out
             .trim()
             .trim_matches(|c| c == '{' || c == '}')
@@ -80,11 +83,16 @@ async fn collect_macos() -> HardwareTelemetry {
         cpu_usage = ((first / cores) * 100.0).clamp(0.0, 100.0);
     }
 
-    // Memory via `sysctl hw.memsize` & `vm_stat`
-    let mem_total_bytes = run_cmd_output("sysctl", &["-n", "hw.memsize"])
-        .await
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(16 * 1024 * 1024 * 1024);
+    // Memory via cached `sysctl hw.memsize` & `vm_stat`
+    let mem_total_bytes = *MEM_TOTAL_BYTES.get_or_init(|| {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|s| String::from_utf8(s.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(16 * 1024 * 1024 * 1024)
+    });
     let mem_total_gb = (mem_total_bytes as f32) / 1_073_741_824.0;
 
     let mut mem_used_gb = 0.0_f32;

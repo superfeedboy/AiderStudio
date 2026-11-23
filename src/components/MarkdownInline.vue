@@ -84,45 +84,17 @@ function getToolCategory(toolName: string): "terminal" | "search" | "edit" | "de
         @open-file="emit('open-file', $event)"
       />
     </strong>
-    <em v-else-if="tok.kind === 'italic'">{{ tok.text }}</em>
-    <span v-else-if="tok.kind === 'tool-call'" class="md-tool-call-group">
-      <span
-        v-for="tool in tok.tools"
-        :key="tool"
-        class="md-tool-call-pill"
-        :class="[`is-${getToolCategory(tool)}`, { 'is-thinking': variant === 'thinking' }]"
-        :title="`Appel d'outil natif exécuté : ${tool}`"
-      >
-        <span class="tool-icon">
-          <svg v-if="getToolCategory(tool) === 'terminal'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <polyline points="4 17 10 11 4 5" />
-            <line x1="12" y1="19" x2="20" y2="19" />
-          </svg>
-          <svg v-else-if="getToolCategory(tool) === 'search'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-          <svg v-else-if="getToolCategory(tool) === 'edit'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <path d="M12 20h9" />
-            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-          </svg>
-          <svg v-else-if="getToolCategory(tool) === 'delete'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <polyline points="3 6 5 6 21 6" />
-            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-          </svg>
-          <svg v-else-if="getToolCategory(tool) === 'mcp'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <path d="M12 2v6m0 8v6M4.93 4.93l4.24 4.24m5.66 5.66l4.24 4.24M2 12h6m8 0h6M4.93 19.07l4.24-4.24m5.66-5.66l4.24-4.24" />
-          </svg>
-          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-            <polyline points="14 2 14 8 20 8" />
-          </svg>
-        </span>
-        <span class="tool-tag">Outil</span>
-        <code class="tool-name">{{ tool }}</code>
-        <span class="tool-pulse-dot" />
-      </span>
-    </span>
+    <em v-else-if="tok.kind === 'italic'">
+      <MarkdownInline
+        :tokens="tok.children"
+        :available-paths="availablePaths"
+        :project-root="projectRoot"
+        :variant="variant"
+        @open-file="emit('open-file', $event)"
+      />
+    </em>
+    <!-- Les appels d'outils sont exclusivement affichés dans la Process Timeline au-dessus -->
+    <template v-else-if="tok.kind === 'tool-call'" />
     <template v-else-if="tok.kind === 'link'">
       <a
         v-if="isExternalHref(tok.href)"

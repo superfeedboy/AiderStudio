@@ -39,6 +39,8 @@ pub struct ProviderConfig {
     pub available_models: Vec<String>,
     #[serde(default = "default_daily_token_limit")]
     pub daily_token_limit: usize,
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,8 @@ pub struct AgentModelSlot {
     pub provider: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub fallbacks: Vec<AgentModelSlot>,
 }
 
 impl Default for AgentModelSlot {
@@ -55,6 +59,7 @@ impl Default for AgentModelSlot {
         Self {
             provider: default_ollama_provider(),
             model: String::new(),
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -105,6 +110,14 @@ impl Default for ApiUsageState {
     }
 }
 
+fn default_hud_context_view() -> String {
+    "agent".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -122,11 +135,21 @@ pub struct AppSettings {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub agent_routing: AgentRoutingConfig,
+    #[serde(default = "default_hud_context_view")]
+    pub hud_context_view: String, // "agent" | "global"
+    #[serde(default)]
+    pub hud_show_token_usage: Option<bool>,
+    #[serde(default)]
+    pub hud_show_local_resources: Option<bool>,
+    #[serde(default = "default_true")]
+    pub hud_show_global_diff: bool,
+    #[serde(default = "default_true")]
+    pub hud_auto_artifact_evolution_report: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             theme: "system".to_string(),
             ollama_url: "http://127.0.0.1:11434".to_string(),
             ollama_model: "qwen2.5-coder:3b".to_string(),
@@ -136,7 +159,46 @@ impl Default for AppSettings {
             active_target: "agent".to_string(),
             providers: crate::providers::default_providers(),
             agent_routing: AgentRoutingConfig::default(),
+            hud_context_view: "agent".to_string(),
+            hud_show_token_usage: None,
+            hud_show_local_resources: None,
+            hud_show_global_diff: true,
+            hud_auto_artifact_evolution_report: true,
+        };
+        s.sanitize();
+        s
+    }
+}
+
+impl AppSettings {
+    pub fn sanitize(&mut self) {
+        if self.hud_context_view.trim().is_empty() {
+            self.hud_context_view = "agent".to_string();
         }
+        if self.hud_show_token_usage.is_none() {
+            let has_external = self
+                .providers
+                .iter()
+                .any(|p| p.validated || !p.api_key.trim().is_empty());
+            self.hud_show_token_usage = Some(has_external);
+        }
+        if self.hud_show_local_resources.is_none() {
+            let u = self.ollama_url.to_lowercase();
+            let is_local = u.contains("127.0.0.1") || u.contains("localhost");
+            self.hud_show_local_resources = Some(is_local);
+        }
+    }
+}
+
+pub fn slot_for_role<'a>(role: &str, settings: &'a AppSettings) -> &'a AgentModelSlot {
+    match role {
+        "architect" => &settings.agent_routing.architect,
+        "cartographer" => &settings.agent_routing.cartographer,
+        "designer" => &settings.agent_routing.designer,
+        "refactoring" => &settings.agent_routing.refactoring,
+        "tester" => &settings.agent_routing.tester,
+        "synthesizer" => &settings.agent_routing.synthesizer,
+        _ => &settings.agent_routing.coder,
     }
 }
 
@@ -240,6 +302,26 @@ pub struct AgentTraceEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProcessStep {
+    pub id: String,
+    pub tool: String,
+    pub title: String,
+    pub status: String, // "running" | "success" | "error"
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessStepEvent {
+    pub conversation_id: String,
+    pub step: ProcessStep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
     pub role: String, // "user" | "assistant" | "system"
@@ -268,6 +350,8 @@ pub struct ChatMessage {
     pub turn_diffs: Vec<ModifiedFileDiff>,
     #[serde(default)]
     pub pre_turn_tree: Option<String>,
+    #[serde(default)]
+    pub process_steps: Vec<ProcessStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,6 +736,7 @@ mod tests {
                     commit_summary: None,
                     turn_diffs: vec![],
                     pre_turn_tree: None,
+                    process_steps: vec![],
                 },
                 ChatMessage {
                     id: "a1".to_string(),
@@ -676,6 +761,7 @@ mod tests {
                     commit_summary: Some("Ajout composant Logo".to_string()),
                     turn_diffs: vec![],
                     pre_turn_tree: None,
+                    process_steps: vec![],
                 },
             ],
             artifacts: vec![],

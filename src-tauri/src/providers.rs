@@ -19,6 +19,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "gemini-2.0-flash".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
         ProviderConfig {
             id: "openai".to_string(),
@@ -33,6 +34,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "gpt-4o".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
         ProviderConfig {
             id: "anthropic".to_string(),
@@ -46,6 +48,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "claude-3-5-haiku-20241022".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
         ProviderConfig {
             id: "deepseek".to_string(),
@@ -58,6 +61,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "deepseek-reasoner".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
         ProviderConfig {
             id: "openrouter".to_string(),
@@ -76,6 +80,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "qwen/qwen-2.5-coder-32b-instruct".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
         ProviderConfig {
             id: "groq".to_string(),
@@ -90,6 +95,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "llama-3.1-8b-instant".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
         ProviderConfig {
             id: "cerebras".to_string(),
@@ -103,6 +109,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "qwen-3-32b".to_string(),
             ],
             daily_token_limit: 1_000_000,
+            color: None,
         },
         ProviderConfig {
             id: "mistral".to_string(),
@@ -116,6 +123,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "mistral-large-latest".to_string(),
             ],
             daily_token_limit: 500_000,
+            color: None,
         },
     ]
 }
@@ -127,6 +135,7 @@ pub fn merge_with_default_providers(existing: &[ProviderConfig]) -> Vec<Provider
             slot.api_key = saved.api_key.clone();
             slot.base_url = saved.base_url.clone();
             slot.validated = saved.validated;
+            slot.color = saved.color.clone();
             if !saved.available_models.is_empty() {
                 slot.available_models = saved.available_models.clone();
             }
@@ -1971,6 +1980,8 @@ where
 
     let effective_messages = if provider == "ollama" {
         prune_messages_for_local_model(&messages_with_lang)
+    } else if matches!(provider, "groq" | "cerebras") {
+        prune_messages_preserving_tail(&messages_with_lang, 10, 6, 3000, 320)
     } else {
         messages_with_lang
     };
@@ -2447,12 +2458,17 @@ fn clip_chars_utf8(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// Ancrage du prompt initial + synthèse compacte des tours intermédiaires + dernier tour + requête courante sur modèle local (Ollama).
-pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+pub fn prune_messages_preserving_tail(
+    messages: &[LlmMessage],
+    max_non_sys: usize,
+    keep_tail: usize,
+    max_summary_chars: usize,
+    snippet_chars: usize,
+) -> Vec<LlmMessage> {
     let sys_msg = messages.iter().find(|m| m.role == "system").cloned();
     let non_sys: Vec<&LlmMessage> = messages.iter().filter(|m| m.role != "system").collect();
 
-    if non_sys.len() <= 4 {
+    if non_sys.len() <= max_non_sys || non_sys.len() <= keep_tail + 1 {
         let mut out = Vec::with_capacity(non_sys.len() + usize::from(sys_msg.is_some()));
         if let Some(sys) = sys_msg {
             out.push(sys);
@@ -2462,14 +2478,15 @@ pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage
     }
 
     let initial_user = non_sys[0].clone();
-    let tail_start = non_sys.len() - 2;
+    let tail_start = non_sys.len() - keep_tail;
     let middle_slice = &non_sys[1..tail_start];
 
     let mut summary_lines: Vec<String> = Vec::new();
     let mut summary_chars = 0usize;
     let header = "[Synthèse des étapes intermédiaires déjà exécutées]";
+    let soft_limit = max_summary_chars.saturating_sub(header.len() + 20);
     for msg in middle_slice {
-        if summary_chars >= 540 {
+        if summary_chars >= soft_limit {
             break;
         }
         let tag = if msg.role == "assistant" {
@@ -2482,10 +2499,10 @@ pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .take(3)
+            .take(4)
             .collect::<Vec<_>>()
             .join(" | ");
-        let snippet = clip_chars_utf8(&snippet_raw, 140);
+        let snippet = clip_chars_utf8(&snippet_raw, snippet_chars);
         if !snippet.is_empty() {
             let line = format!("- {tag} : {snippet}");
             summary_chars += line.chars().count();
@@ -2494,20 +2511,32 @@ pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage
     }
 
     let middle_summary = if summary_lines.is_empty() {
-        format!("{header}\n- ({} échange(s) intermédiaire(s) compacté(s))", middle_slice.len())
+        format!(
+            "{header}\n- ({} échange(s) intermédiaire(s) compacté(s))",
+            middle_slice.len()
+        )
     } else {
-        clip_chars_utf8(&format!("{header}\n{}", summary_lines.join("\n")), 600)
+        clip_chars_utf8(
+            &format!("{header}\n{}", summary_lines.join("\n")),
+            max_summary_chars,
+        )
     };
 
-    let mut out = Vec::with_capacity(5);
+    let mut out = Vec::with_capacity(keep_tail + 3);
     if let Some(sys) = sys_msg {
         out.push(sys);
     }
     out.push(initial_user);
     out.push(LlmMessage::assistant(middle_summary));
-    out.push(non_sys[tail_start].clone());
-    out.push(non_sys[tail_start + 1].clone());
+    for m in &non_sys[tail_start..] {
+        out.push((*m).clone());
+    }
     out
+}
+
+/// Ancrage du prompt initial + synthèse compacte des tours intermédiaires + 2 derniers tours complets sur modèle local (Ollama).
+pub fn prune_messages_for_local_model(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+    prune_messages_preserving_tail(messages, 6, 4, 1800, 240)
 }
 
 pub fn is_quota_or_fallback_error(err_msg: &str) -> bool {
@@ -2616,6 +2645,31 @@ pub fn build_fallback_candidates(
     // Si le fournisseur principal n'est pas en quarantaine, il est notre 1er candidat
     if !primary_in_cooldown {
         out.push((primary_provider.to_string(), primary_model.to_string()));
+    }
+
+    // Si l'agent a une route de repli explicite configurée
+    let slot = crate::models::slot_for_role(role, settings);
+    if !slot.fallbacks.is_empty() {
+        for fb in &slot.fallbacks {
+            let pid = fb.provider.trim();
+            if pid.is_empty() || is_provider_in_cooldown(pid) {
+                continue;
+            }
+            let mdl = if fb.model.trim().is_empty() {
+                if pid == "ollama" {
+                    settings.ollama_model.clone()
+                } else if let Some(cfg) = find_provider_config(settings, pid) {
+                    pick_preferred_model_for_fallback(cfg).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                fb.model.clone()
+            };
+            if !mdl.is_empty() && !out.iter().any(|(p, m)| p == pid && m == &mdl) {
+                out.push((pid.to_string(), mdl));
+            }
+        }
     }
 
     let priority: &[&str] = match role {
@@ -2973,6 +3027,7 @@ mod tests {
             validated: true,
             available_models: vec!["gemini-2.5-pro".to_string()],
             daily_token_limit: 900_000,
+            color: None,
         }];
         let merged = merge_with_default_providers(&saved);
         assert_eq!(merged.len(), 8);
@@ -3148,23 +3203,39 @@ mod tests {
 
     #[test]
     fn test_prune_messages_for_local_model() {
-        let msgs = vec![
+        let short_msgs = vec![
             LlmMessage::system("System instructions"),
             LlmMessage::user("Demande initiale"),
             LlmMessage::assistant("Reponse 1"),
-            LlmMessage::user("Question 2 (Tour N-1)"),
-            LlmMessage::assistant("Reponse 2 (Tour N-1)"),
-            LlmMessage::user("Question 3 (Requete N)"),
+            LlmMessage::user("Question 2"),
+            LlmMessage::assistant("Reponse 2"),
+            LlmMessage::user("Question 3"),
+        ];
+        // <= 6 non-system messages : conservés intacts sans perte
+        let kept = prune_messages_for_local_model(&short_msgs);
+        assert_eq!(kept.len(), 6);
+
+        let long_msgs = vec![
+            LlmMessage::system("System instructions"),
+            LlmMessage::user("Demande initiale"),
+            LlmMessage::assistant("Reponse 1"),
+            LlmMessage::user("Question 2"),
+            LlmMessage::assistant("Reponse 2 (Tour N-2)"),
+            LlmMessage::user("Question 3 (Tour N-2)"),
+            LlmMessage::assistant("Reponse 3 (Tour N-1)"),
+            LlmMessage::user("Question 4 (Requete N)"),
         ];
 
-        let pruned = prune_messages_for_local_model(&msgs);
-        assert_eq!(pruned.len(), 5);
+        let pruned = prune_messages_for_local_model(&long_msgs);
+        assert_eq!(pruned.len(), 7);
         assert_eq!(pruned[0].role, "system");
         assert_eq!(pruned[0].content, "System instructions");
         assert_eq!(pruned[1].content, "Demande initiale");
         assert!(pruned[2].content.contains("Synthèse des étapes intermédiaires"));
-        assert_eq!(pruned[3].content, "Reponse 2 (Tour N-1)");
-        assert_eq!(pruned[4].content, "Question 3 (Requete N)");
+        assert_eq!(pruned[3].content, "Reponse 2 (Tour N-2)");
+        assert_eq!(pruned[4].content, "Question 3 (Tour N-2)");
+        assert_eq!(pruned[5].content, "Reponse 3 (Tour N-1)");
+        assert_eq!(pruned[6].content, "Question 4 (Requete N)");
     }
 
     #[test]
@@ -3183,14 +3254,34 @@ mod tests {
         ];
 
         let pruned = prune_messages_for_local_model(&msgs);
-        assert_eq!(pruned.len(), 5);
+        assert_eq!(pruned.len(), 7);
         assert_eq!(pruned[0].role, "system");
         assert_eq!(
             pruned[1].content,
             "WorkspaceSnapshot + Demande utilisateur initiale"
         );
         assert!(pruned[2].content.contains("read_file"));
-        assert_eq!(pruned[3].content, "[Appel d'outils natifs : run_command]");
-        assert_eq!(pruned[4].content, "[Résultats des outils] build OK");
+        assert_eq!(pruned[3].content, "[Appel d'outils natifs : write_file]");
+        assert_eq!(pruned[4].content, "[Résultats des outils] fichier B écrit");
+        assert_eq!(pruned[5].content, "[Appel d'outils natifs : run_command]");
+        assert_eq!(pruned[6].content, "[Résultats des outils] build OK");
+    }
+
+    #[test]
+    fn test_prune_messages_preserving_tail_for_cloud_tight_quota() {
+        let mut msgs = vec![
+            LlmMessage::system("Sys"),
+            LlmMessage::user("Initial"),
+        ];
+        for i in 1..=7 {
+            msgs.push(LlmMessage::assistant(format!("Assistant {i}")));
+            msgs.push(LlmMessage::user(format!("Tool {i}")));
+        }
+        let pruned = prune_messages_preserving_tail(&msgs, 10, 6, 3000, 320);
+        // sys + initial + middle_summary + 6 tail = 9
+        assert_eq!(pruned.len(), 9);
+        assert_eq!(pruned[1].content, "Initial");
+        assert!(pruned[2].content.contains("Assistant 1"));
+        assert_eq!(pruned[8].content, "Tool 7");
     }
 }

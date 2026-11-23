@@ -61,6 +61,7 @@ async fn save_settings(
     if settings.active_target.trim().is_empty() {
         settings.active_target = "agent".to_string();
     }
+    settings.sanitize();
     let mut guard = state.0.lock().await;
     guard.settings = settings.clone();
     storage::save_state(&guard)
@@ -681,11 +682,20 @@ async fn get_hardware_telemetry() -> HardwareTelemetry {
 }
 
 #[tauri::command]
-async fn check_stack_status(state: State<'_, ManagedState>) -> Result<StackStatus, String> {
-    let settings = {
+async fn check_stack_status(
+    state: State<'_, ManagedState>,
+    url: Option<String>,
+) -> Result<StackStatus, String> {
+    let mut settings = {
         let guard = state.0.lock().await;
         guard.settings.clone()
     };
+    if let Some(u) = url {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            settings.ollama_url = trimmed.to_string();
+        }
+    }
     Ok(engine::check_stack_status(&settings).await)
 }
 

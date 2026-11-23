@@ -225,3 +225,18 @@ pre,
 .ln-code {
   font-family: var(--font-code) !important;
 }
+
+@property --rainbow-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes vaixRotateRainbow {
+  0% {
+    --rainbow-angle: 0deg;
+  }
+  100% {
+    --rainbow-angle: 360deg;
+  }
+}

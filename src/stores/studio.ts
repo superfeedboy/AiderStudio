@@ -1,5 +1,5 @@
 import { computed, ref } from "vue";
-import { defineStore } from "pinia";
+import { acceptHMRUpdate, defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
@@ -16,6 +16,8 @@ import type {
   HardwareTelemetry,
   McpServerConfig,
   McpToolInfo,
+  ProcessStep,
+  ProcessStepEvent,
   Project,
   ProjectRuleItem,
   PromptStageEvent,
@@ -140,13 +142,13 @@ export function defaultProvidersList(): ProviderConfig[] {
 
 export function defaultAgentRouting(): AgentRoutingConfig {
   return {
-    architect: { provider: "ollama", model: "" },
-    cartographer: { provider: "ollama", model: "" },
-    designer: { provider: "ollama", model: "" },
-    coder: { provider: "ollama", model: "" },
-    refactoring: { provider: "ollama", model: "" },
-    tester: { provider: "ollama", model: "" },
-    synthesizer: { provider: "ollama", model: "" },
+    architect: { provider: "ollama", model: "", fallbacks: [] },
+    cartographer: { provider: "ollama", model: "", fallbacks: [] },
+    designer: { provider: "ollama", model: "", fallbacks: [] },
+    coder: { provider: "ollama", model: "", fallbacks: [] },
+    refactoring: { provider: "ollama", model: "", fallbacks: [] },
+    tester: { provider: "ollama", model: "", fallbacks: [] },
+    synthesizer: { provider: "ollama", model: "", fallbacks: [] },
   };
 }
 
@@ -155,10 +157,16 @@ const defaultSettings: AppSettings = {
   ollamaUrl: "http://127.0.0.1:11434",
   ollamaModel: "qwen2.5-coder:3b",
   autoStartOllama: true,
+  contextWindowTokens: 8192,
   aiderEditFormat: "auto",
   activeTarget: "agent",
   providers: defaultProvidersList(),
   agentRouting: defaultAgentRouting(),
+  hudContextView: "agent",
+  hudShowTokenUsage: false,
+  hudShowLocalResources: true,
+  hudShowGlobalDiff: true,
+  hudAutoArtifactEvolutionReport: true,
 };
 
 export const useStudioStore = defineStore("studio", () => {
@@ -236,6 +244,7 @@ export const useStudioStore = defineStore("studio", () => {
   const liveThinking = ref<string>("");
   const liveContent = ref<string>("");
   const liveAgentTrace = ref<AgentTraceStep[]>([]);
+  const liveProcessSteps = ref<ProcessStep[]>([]);
   const pendingToolApprovals = ref<ToolApprovalRequest[]>([]);
 
   // System dark/light tracking
@@ -415,6 +424,26 @@ export const useStudioStore = defineStore("studio", () => {
     return Math.min(100, Math.round((localUsed / denom) * 100));
   });
 
+  const hudShowTokenUsageEffective = computed<boolean>(() => {
+    return settings.value.hudShowTokenUsage ?? false;
+  });
+
+  const hudShowLocalResourcesEffective = computed<boolean>(() => {
+    return settings.value.hudShowLocalResources ?? false;
+  });
+
+  const hudShowGlobalDiffEffective = computed<boolean>(() => {
+    return settings.value.hudShowGlobalDiff ?? true;
+  });
+
+  const hudContextViewEffective = computed<"agent" | "global">(() => {
+    return settings.value.hudContextView === "global" ? "global" : "agent";
+  });
+
+  const hudAutoArtifactEvolutionReportEffective = computed<boolean>(() => {
+    return settings.value.hudAutoArtifactEvolutionReport ?? true;
+  });
+
   const activeTargetLabel = computed<{
     isAgent: boolean;
     providerId: string;
@@ -462,18 +491,55 @@ export const useStudioStore = defineStore("studio", () => {
   }
 
   function applyStateData(data: AppStateData) {
+    const rawSettings = data.settings || ({} as Partial<AppSettings>);
+    const providersList =
+      rawSettings.providers && rawSettings.providers.length > 0
+        ? rawSettings.providers
+        : defaultProvidersList();
+
+    const hasExternal = providersList.some(
+      (p) => p.validated || (p.apiKey && p.apiKey.trim().length > 0)
+    );
+    const ollamaUrl = (rawSettings.ollamaUrl || "http://127.0.0.1:11434").toLowerCase();
+    const isLocalOllama = ollamaUrl.includes("127.0.0.1") || ollamaUrl.includes("localhost");
+
+    const resolvedHudShowTokenUsage: boolean =
+      typeof rawSettings.hudShowTokenUsage === "boolean"
+        ? rawSettings.hudShowTokenUsage
+        : hasExternal;
+
+    const resolvedHudShowLocalResources: boolean =
+      typeof rawSettings.hudShowLocalResources === "boolean"
+        ? rawSettings.hudShowLocalResources
+        : isLocalOllama;
+
+    const resolvedHudShowGlobalDiff: boolean =
+      typeof rawSettings.hudShowGlobalDiff === "boolean"
+        ? rawSettings.hudShowGlobalDiff
+        : true;
+
+    const resolvedHudAutoArtifactEvolutionReport: boolean =
+      typeof rawSettings.hudAutoArtifactEvolutionReport === "boolean"
+        ? rawSettings.hudAutoArtifactEvolutionReport
+        : true;
+
+    const resolvedHudContextView: "agent" | "global" =
+      rawSettings.hudContextView === "global" ? "global" : "agent";
+
     settings.value = {
       ...defaultSettings,
-      ...data.settings,
-      activeTarget: data.settings.activeTarget || "agent",
-      providers:
-        data.settings.providers && data.settings.providers.length > 0
-          ? data.settings.providers
-          : defaultProvidersList(),
+      ...rawSettings,
+      activeTarget: rawSettings.activeTarget || "agent",
+      providers: providersList,
       agentRouting: {
         ...defaultAgentRouting(),
-        ...(data.settings.agentRouting ?? {}),
+        ...(rawSettings.agentRouting ?? {}),
       },
+      hudContextView: resolvedHudContextView,
+      hudShowTokenUsage: resolvedHudShowTokenUsage,
+      hudShowLocalResources: resolvedHudShowLocalResources,
+      hudShowGlobalDiff: resolvedHudShowGlobalDiff,
+      hudAutoArtifactEvolutionReport: resolvedHudAutoArtifactEvolutionReport,
     };
     projects.value = data.projects;
     conversations.value = data.conversations;
@@ -490,6 +556,46 @@ export const useStudioStore = defineStore("studio", () => {
 
   let initialized = false;
   let telemetryTimer: number | null = null;
+  let pendingLiveContent: string | null = null;
+  let pendingLiveThinking: string | null = null;
+  let pendingLiveStreamLines: string[] | null = null;
+  let liveFlushRafId: number | null = null;
+
+  function clearPendingLiveBuffers() {
+    if (liveFlushRafId !== null && typeof window !== "undefined") {
+      window.cancelAnimationFrame(liveFlushRafId);
+      liveFlushRafId = null;
+    }
+    pendingLiveContent = null;
+    pendingLiveThinking = null;
+    pendingLiveStreamLines = null;
+  }
+
+  function flushLiveBuffers() {
+    liveFlushRafId = null;
+    if (pendingLiveStreamLines !== null) {
+      liveStreamLines.value = pendingLiveStreamLines;
+      pendingLiveStreamLines = null;
+    }
+    if (pendingLiveThinking !== null) {
+      liveThinking.value = pendingLiveThinking;
+      pendingLiveThinking = null;
+    }
+    if (pendingLiveContent !== null) {
+      liveContent.value = pendingLiveContent;
+      pendingLiveContent = null;
+    }
+  }
+
+  function scheduleLiveFlush() {
+    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+      flushLiveBuffers();
+      return;
+    }
+    if (liveFlushRafId === null) {
+      liveFlushRafId = window.requestAnimationFrame(flushLiveBuffers);
+    }
+  }
 
   async function init() {
     if (initialized) return;
@@ -530,6 +636,24 @@ export const useStudioStore = defineStore("studio", () => {
             next.push(payload.step);
           }
           liveAgentTrace.value = next;
+        }
+      });
+
+      await listen<ProcessStepEvent>("aider:process_step", (event) => {
+        const payload = event.payload;
+        if (!payload || !payload.step) return;
+        if (
+          payload.conversationId === activeConversationId.value ||
+          payload.conversationId === processingConversationId.value
+        ) {
+          const next = [...liveProcessSteps.value];
+          const idx = next.findIndex((s) => s.id === payload.step.id);
+          if (idx !== -1) {
+            next[idx] = payload.step;
+          } else {
+            next.push(payload.step);
+          }
+          liveProcessSteps.value = next;
         }
       });
 
@@ -581,21 +705,25 @@ export const useStudioStore = defineStore("studio", () => {
       await listen<[string, string]>("aider:stream", (event) => {
         const [convId, line] = event.payload;
         if (convId === activeConversationId.value) {
-          liveStreamLines.value = [...liveStreamLines.value.slice(-18), line];
+          const base = pendingLiveStreamLines ?? liveStreamLines.value;
+          pendingLiveStreamLines = [...base.slice(-18), line];
+          scheduleLiveFlush();
         }
       });
 
       await listen<[string, string]>("aider:thinking", (event) => {
         const [convId, text] = event.payload;
         if (convId === activeConversationId.value) {
-          liveThinking.value = text;
+          pendingLiveThinking = text;
+          scheduleLiveFlush();
         }
       });
 
       await listen<[string, string]>("aider:live_chunk", (event) => {
         const [convId, text] = event.payload;
         if (convId === activeConversationId.value) {
-          liveContent.value = text;
+          pendingLiveContent = text;
+          scheduleLiveFlush();
         }
       });
 
@@ -629,8 +757,10 @@ export const useStudioStore = defineStore("studio", () => {
       await Promise.all([refreshTelemetry(), refreshStackStatus()]);
 
       telemetryTimer = window.setInterval(() => {
-        void refreshTelemetry();
-      }, 2500);
+        if (hudShowLocalResourcesEffective.value) {
+          void refreshTelemetry();
+        }
+      }, 3000);
     } else {
       // Browser preview fallback when inspecting via `npm run dev`
       const now = new Date().toISOString();
@@ -695,6 +825,7 @@ export const useStudioStore = defineStore("studio", () => {
   }
 
   function dispose() {
+    clearPendingLiveBuffers();
     if (telemetryTimer !== null) {
       clearInterval(telemetryTimer);
       telemetryTimer = null;
@@ -704,12 +835,16 @@ export const useStudioStore = defineStore("studio", () => {
     }
   }
 
+  let refreshingTelemetry = false;
   async function refreshTelemetry() {
-    if (!isTauri()) return;
+    if (!isTauri() || refreshingTelemetry || !hudShowLocalResourcesEffective.value) return;
+    refreshingTelemetry = true;
     try {
       telemetry.value = await invoke<HardwareTelemetry>("get_hardware_telemetry");
     } catch {
       // Ignore transient telemetry errors
+    } finally {
+      refreshingTelemetry = false;
     }
   }
 
@@ -720,6 +855,15 @@ export const useStudioStore = defineStore("studio", () => {
     } catch {
       // Ignore transient probe errors
     }
+  }
+
+  async function testOllamaConnection(url?: string): Promise<StackStatus> {
+    if (!isTauri()) return stackStatus.value;
+    const status = await invoke<StackStatus>("check_stack_status", {
+      url: url || settings.value.ollamaUrl,
+    });
+    stackStatus.value = status;
+    return status;
   }
 
   async function startOllama() {
@@ -1038,15 +1182,7 @@ export const useStudioStore = defineStore("studio", () => {
 
   async function listProjectFiles(projectId?: string): Promise<string[]> {
     if (!isTauri()) {
-      return [
-        "src/App.vue",
-        "src/main.ts",
-        "src/components/LaDiscussion.vue",
-        "src/components/LeHud.vue",
-        "src/components/LeCode.vue",
-        "src/stores/studio.ts",
-        "package.json",
-      ];
+      return ["README.md", "src/main.ts", "src/utils.ts"];
     }
     try {
       return await invoke<string[]>("list_project_files", {
@@ -1231,10 +1367,12 @@ export const useStudioStore = defineStore("studio", () => {
       ...conversationTokenSteps.value,
       [conv.id]: [],
     };
+    clearPendingLiveBuffers();
     liveStreamLines.value = [];
     liveThinking.value = "";
     liveContent.value = "";
     liveAgentTrace.value = [];
+    liveProcessSteps.value = [];
     currentStage.value = {
       conversationId: conv.id,
       stageIndex: 1,
@@ -1291,10 +1429,13 @@ export const useStudioStore = defineStore("studio", () => {
         status: "error",
       };
     } finally {
+      flushLiveBuffers();
+      clearPendingLiveBuffers();
       isProcessing.value = false;
       isCancelling.value = false;
       processingConversationId.value = null;
       liveAgentTrace.value = [];
+      liveProcessSteps.value = [];
       pendingToolApprovals.value = pendingToolApprovals.value.filter(
         (item) => item.conversationId !== conv.id
       );
@@ -1642,6 +1783,7 @@ export const useStudioStore = defineStore("studio", () => {
     liveThinking,
     liveContent,
     liveAgentTrace,
+    liveProcessSteps,
     pendingToolApprovals,
     resolveToolApproval,
     listProjectFiles,
@@ -1651,6 +1793,7 @@ export const useStudioStore = defineStore("studio", () => {
     dispose,
     refreshTelemetry,
     refreshStackStatus,
+    testOllamaConnection,
     startOllama,
     saveSettings,
     validateProviderKey,
@@ -1711,5 +1854,14 @@ export const useStudioStore = defineStore("studio", () => {
     activeContextPercent,
     compactConversation,
     clearConversation,
+    hudShowTokenUsageEffective,
+    hudShowLocalResourcesEffective,
+    hudShowGlobalDiffEffective,
+    hudContextViewEffective,
+    hudAutoArtifactEvolutionReportEffective,
   };
 });
+
+if (import.meta.hot) {
+  import.meta.hot.accept(acceptHMRUpdate(useStudioStore, import.meta.hot));
+}

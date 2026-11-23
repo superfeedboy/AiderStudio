@@ -30,16 +30,15 @@ pub async fn write_file(
         .ok_or("Paramètre 'path' manquant")?;
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let clean_path = sanitize_tool_path(path_str)?;
+    if patcher::is_binary_or_non_text_path(&clean_path) {
+        return Err(format!(
+            "Impossible d'écrire du texte brut dans un fichier binaire ('{clean_path}'). Pour une icône, une illustration ou un logo, crée un fichier vectoriel '.svg' ou utilise du SVG/CSS inline."
+        ));
+    }
     let target_path = project_root.join(&clean_path);
     let existed = target_path.exists();
 
-    if let Some(parent) = target_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    let final_content =
+    let raw_final_content =
         if content.contains("<<<<<<< SEARCH") && content.contains(">>>>>>> REPLACE") {
             if existed {
                 let orig = tokio::fs::read_to_string(&target_path)
@@ -64,6 +63,22 @@ pub async fn write_file(
         } else {
             content.to_string()
         };
+
+    let final_content = if clean_path.to_lowercase().ends_with(".json") {
+        patcher::repair_and_validate_json_str(&raw_final_content).map_err(|err_msg| {
+            format!(
+                "JSON syntaxiquement invalide pour '{clean_path}' ({err_msg}). Corrige la syntaxe JSON et rappelle write_file."
+            )
+        })?
+    } else {
+        raw_final_content
+    };
+
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     tokio::fs::write(&target_path, &final_content)
         .await
@@ -145,6 +160,10 @@ pub async fn edit_file(
     let mut working = original;
 
     for (idx, (search, replace)) in edits.iter().enumerate() {
+        if working.trim() == search.trim() {
+            working = replace.clone();
+            continue;
+        }
         match patcher::apply_search_replace_fuzzy(&working, search, replace) {
             Ok(updated) => {
                 working = updated;
@@ -162,14 +181,27 @@ pub async fn edit_file(
                 if let Some(closest) = fail.closest_match {
                     msg.push_str(&format!("\nExtrait réel du fichier :\n```\n{}\n```", closest));
                 }
-                if orig_line_count <= 120 {
+                if orig_line_count <= 200 || clean_path.contains("config") {
                     msg.push_str(&format!(
-                        "\nAstuce : ce fichier est court ({orig_line_count} lignes). Lis-le avec read_file ou utilise write_file pour le réécrire intégralement."
+                        "\n\nContenu actuel complet de '{}' ({} lignes) :\n```\n{}\n```\nAction recommandée : utilise impérativement `write_file` pour réécrire intégralement ce fichier avec le code corrigé sans tenter de patch partiel.",
+                        clean_path, orig_line_count, working
                     ));
+                } else {
+                    msg.push_str(
+                        "\nAstuce : lis d'abord le fichier avec `read_file` ou utilise `write_file` pour le réécrire."
+                    );
                 }
                 return Err(msg);
             }
         }
+    }
+
+    if clean_path.to_lowercase().ends_with(".json") {
+        working = patcher::repair_and_validate_json_str(&working).map_err(|err_msg| {
+            format!(
+                "Le patch produit un JSON invalide dans '{clean_path}' ({err_msg}). Utilise write_file pour réécrire '{clean_path}' avec un JSON complet et valide."
+            )
+        })?;
     }
 
     tokio::fs::write(&target_path, &working)
